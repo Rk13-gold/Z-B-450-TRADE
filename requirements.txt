@@ -1,0 +1,9 @@
+python-binance
+textual
+rich
+pandas
+python-dotenv
+numpy
+aiohttp
+
+# Telegram Bot (uses aiohttp directly — no extra deps)
