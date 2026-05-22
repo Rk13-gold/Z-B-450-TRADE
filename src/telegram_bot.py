@@ -12,8 +12,11 @@ Architecture:
 """
 
 import asyncio
+from datetime import datetime, timezone
+import io
 import json
 import logging
+import os
 import threading
 import time
 from collections import deque
@@ -22,12 +25,22 @@ from typing import Optional
 
 import aiohttp
 
+# matplotlib headless backend — must be set before any pyplot import
+os.environ["MPLBACKEND"] = "Agg"
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from matplotlib.patches import Rectangle
+from matplotlib.lines import Line2D
+
 from config.settings import settings
 
 log = logging.getLogger("TelegramBot")
 
 API_BASE = "https://api.telegram.org/bot{token}/{method}"
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+BINANCE_FAPI = "https://fapi.binance.com/fapi/v1"
 GEMINI_MODEL = "gemini-2.0-flash"
 
 
@@ -65,6 +78,7 @@ def _reply_kb(*rows, resize=True, persistent=True, one_time=False):
 class AlertState:
     def __init__(self):
         self.sent_crash = False
+        self.sent_pump = False
         self.sent_buy = False
         self.sent_sell = False
         self.sent_volume = False
@@ -72,6 +86,7 @@ class AlertState:
 
     def reset(self):
         self.sent_crash = False
+        self.sent_pump = False
         self.sent_buy = False
         self.sent_sell = False
         self.sent_volume = False
@@ -283,6 +298,7 @@ class TelegramBot:
                 continue
             try:
                 await self._check_crash_alert()
+                await self._check_pump_alert()
                 await self._check_volume_alert()
                 await self._check_rsi_alert()
                 await self._check_trend_alert()
@@ -315,6 +331,33 @@ class TelegramBot:
             await self._send(msg)
         elif drop_pct < settings.ALERT_CRASH_PCT / 2:
             self._alert_state.sent_crash = False
+
+    async def _check_pump_alert(self):
+        """Alert on sharp upward movements (flash pump) - balances the crash alert."""
+        if not self._user_config.get("crash", True):
+            return
+        if len(self._price_history) < 30:
+            return
+        now = time.time()
+        recent = [p for t, p in self._price_history if t >= now - 60]
+        if len(recent) < 10:
+            return
+        current = recent[-1]
+        low_60s = min(recent)
+        pump_pct = (current - low_60s) / max(low_60s, 1) * 100
+        if pump_pct >= settings.ALERT_CRASH_PCT and not self._alert_state.sent_pump:
+            self._alert_state.sent_pump = True
+            msg = (
+                f"\U0001f4a5 *ALERTA: FLASH PUMP* \U0001f4a5\n"
+                f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+                f"  Precio: `${current:,.0f}`\n"
+                f"  Subida: `{pump_pct:.1f}%` en 60s\n"
+                f"  M\u00ednimo: `${low_60s:,.0f}`\n"
+                f"\n\U0001f4a1 Evaluar toma de ganancias parciales"
+            )
+            await self._send(msg)
+        elif pump_pct < settings.ALERT_CRASH_PCT / 2:
+            self._alert_state.sent_pump = False
 
     async def _check_volume_alert(self):
         if not self._user_config.get("volume", True):
@@ -461,6 +504,131 @@ class TelegramBot:
         print(f"[TelegramBot] ❌ {method} falló tras 3 intentos")
         return {"ok": False, "description": "max retries"}
 
+    async def _send_photo(self, photo_bytes: bytes, caption: str = "", parse_mode="Markdown"):
+        """Send a photo using multipart/form-data upload."""
+        url = API_BASE.format(token=self.token, method="sendPhoto")
+        data = aiohttp.FormData()
+        data.add_field("chat_id", self.chat_id)
+        data.add_field("photo", photo_bytes, filename="chart.png", content_type="image/png")
+        if caption:
+            data.add_field("caption", caption)
+            if parse_mode:
+                data.add_field("parse_mode", parse_mode)
+        for attempt in range(3):
+            try:
+                async with self._session.post(url, data=data) as resp:
+                    j = await resp.json()
+                    if not j.get("ok"):
+                        desc = j.get("description", "")
+                        if "can't parse entities" in desc.lower() and parse_mode:
+                            # retry without parse_mode
+                            data2 = aiohttp.FormData()
+                            data2.add_field("chat_id", self.chat_id)
+                            data2.add_field("photo", photo_bytes, filename="chart.png", content_type="image/png")
+                            data2.add_field("caption", caption)
+                            async with self._session.post(url, data=data2) as resp2:
+                                return (await resp2.json()).get("ok", False)
+                        log.warning(f"sendPhoto falló: {desc}")
+                    return j.get("ok", False)
+            except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+                if attempt < 2:
+                    await asyncio.sleep(1.5 ** attempt)
+                else:
+                    log.warning(f"sendPhoto error tras 3 intentos: {e}")
+                    return False
+
+    async def _fetch_klines(self, symbol="BTCUSDT", interval="1m", limit=60):
+        url = f"{BINANCE_FAPI}/klines"
+        params = {"symbol": symbol, "interval": interval, "limit": limit}
+        try:
+            async with self._session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+        except Exception as e:
+            log.warning(f"fetch_klines: {e}")
+        return []
+
+    async def _generate_chart(self, klines, show_indicators=True):
+        """Generate a candlestick chart with volume + optional indicators (VWAP, EMA).
+        Returns PNG bytes."""
+        if not klines or len(klines) < 5:
+            return None
+        times = [mdates.date2num(datetime.fromtimestamp(k[0] / 1000, tz=timezone.utc)) for k in klines]
+        opens = [float(k[1]) for k in klines]
+        highs = [float(k[2]) for k in klines]
+        lows = [float(k[3]) for k in klines]
+        closes = [float(k[4]) for k in klines]
+        volumes = [float(k[5]) for k in klines]
+
+        fig, (ax, axv) = plt.subplots(
+            2, 1, figsize=(10, 6),
+            gridspec_kw={"height_ratios": [3, 1]},
+            sharex=True,
+        )
+        fig.patch.set_facecolor("#0d1117")
+        ax.set_facecolor("#0d1117")
+        axv.set_facecolor("#0d1117")
+
+        # ── Candlesticks ──
+        width = (times[-1] - times[0]) / len(times) * 0.6 if len(times) > 1 else 60
+        for i in range(len(times)):
+            color = "#26a69a" if closes[i] >= opens[i] else "#ef5350"
+            ax.add_patch(Rectangle(
+                (times[i] - width / 2, opens[i]), width,
+                closes[i] - opens[i],
+                facecolor=color, edgecolor=color, linewidth=0.5, zorder=3,
+            ))
+            ax.plot([times[i], times[i]], [lows[i], highs[i]], color=color, linewidth=0.8, zorder=2)
+
+        # ── VWAP ──
+        if show_indicators:
+            tp_v = [(h + l + c) / 3 * v for h, l, c, v in zip(highs, lows, closes, volumes)]
+            cum_v = [sum(volumes[:i+1]) for i in range(len(volumes))]
+            cum_tpv = [sum(tp_v[:i+1]) for i in range(len(tp_v))]
+            vwap = [cum_tpv[i] / cum_v[i] if cum_v[i] > 0 else closes[i] for i in range(len(closes))]
+            ax.plot(times, vwap, color="#f5a623", linewidth=1, alpha=0.8, label="VWAP")
+
+            # EMA 20
+            ema20 = [closes[0]]
+            k = 2 / (20 + 1)
+            for c in closes[1:]:
+                ema20.append(c * k + ema20[-1] * (1 - k))
+            ax.plot(times, ema20, color="#00bcd4", linewidth=1, alpha=0.7, label="EMA 20")
+
+            last = closes[-1]
+            ax.axhline(last, color="#ffffff", linewidth=0.5, linestyle="--", alpha=0.3)
+            ax.text(times[-1], last, f"  {last:.0f}", color="#ffffff", fontsize=8, va="bottom")
+
+        # ── Volume bars ──
+        max_v = max(volumes) if volumes else 1
+        for i in range(len(times)):
+            color = "#26a69a" if closes[i] >= opens[i] else "#ef5350"
+            axv.bar(times[i], volumes[i] / max_v, width=width, color=color, alpha=0.5)
+
+        axv.set_ylim(0, 1.2)
+        axv.set_yticks([])
+        axv.set_facecolor("#0d1117")
+
+        # ── Labels ──
+        ax.set_ylabel("Precio", color="#8b949e", fontsize=9)
+        ax.tick_params(colors="#8b949e", labelsize=8)
+        axv.tick_params(colors="#8b949e", labelsize=8)
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+        plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha="right")
+        ax.grid(True, alpha=0.1, color="#8b949e")
+        axv.grid(True, alpha=0.1, color="#8b949e")
+
+        legend = ax.legend(loc="upper left", fontsize=8, facecolor="#161b22", edgecolor="#30363d", labelcolor="#c9d1d9")
+        for text in legend.get_texts():
+            text.set_color("#c9d1d9")
+
+        plt.tight_layout()
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=120, facecolor=fig.get_facecolor(), bbox_inches="tight")
+        plt.close(fig)
+        buf.seek(0)
+        return buf.read()
+
     async def _typing(self):
         """Show 'bot is typing...' indicator below the bot name in Telegram."""
         if not self._session:
@@ -574,14 +742,22 @@ class TelegramBot:
             f"Timestamp: {s.get('timestamp', '—')}\n"
         )
         system = (
-            "Eres un trader profesional de criptomonedas con 15 años de experiencia. "
-            "Analiza data de mercado en tiempo real y responde en español. "
-            "Sé directo, técnico y accionable. "
-            "1) Indica señal clara: LONG / SHORT / WAIT con nivel de convicción (bajo/medio/alto). "
-            "2) Fundamenta con los datos: RSI, MACD, Order Flow, Microestructura, MTF. "
-            "3) Si recomiendas operar, incluye: entry, stop-loss, take-profit 1 y 2. "
-            "4) Menciona el marco temporal predominante (5m/15m/1h). "
-            "5) Advertencia de riesgo estándar al final."
+            "Eres un trader scalper profesional especializado en temporalidad de 1 minuto. "
+            "Responde SIEMPRE en español con este formato:\n\n"
+            "1) Señal clara: 🟢 LONG / 🔴 SHORT / ⏳ WAIT con nivel de convicción (bajo/medio/alto)\n"
+            "2) Separador ───\n"
+            "3) Análisis del desequilibrio: delta, CVD, imbalance, bid/ask walls, whale walls\n"
+            "4) Tendencia institucional: MTF 5m/15m, confluence score\n"
+            "5) Entry claro + SL técnico (debajo de la vela anterior o wall) + TP1/TP2\n"
+            "6) Advertencia de riesgo (apalancamiento)\n\n"
+            "Reglas:\n"
+            "- Scalpeamos velas de 1 minuto, busca micro-desequilibrios\n"
+            "- Prioriza operar A FAVOR de la tendencia institucional (MTF 5m/15m)\n"
+            "- Si hay whale walls (bid/ask grandes), úsalas como soporte/resistencia\n"
+            "- Usa *negritas* y `código` para valores\n"
+            "- Emojis: 📊💰📈📉🟢🔴⚪🎯🛑✅❌🐋\n"
+            "- Sin _underscores_\n"
+            "- Timestamp al final"
         )
         contents = [{"role": "user", "parts": [{"text": system + "\n\nDATOS DEL MERCADO:\n" + market_context}]}]
         for entry in self._gemini_history[-10:]:
@@ -626,9 +802,9 @@ class TelegramBot:
 
     async def _cmd_start(self):
         kb = _keyboard(
-            _row(_btn("\U0001f4ca Info", "info")),
-            _row(_btn("\U0001f4e1 Signal", "signal"), _btn("\U0001f514 Alerts", "alerts")),
-            _row(_btn("\U0001f504 Refresh", "refresh"), _btn("\U0001f916 AI", "ai")),
+            _row(_btn("\U0001f4ca Info", "info"), _btn("\U0001f4e1 Signal", "signal")),
+            _row(_btn("\U0001f3c3 Scalp", "scalp"), _btn("\U0001f50d Trampas", "trampas")),
+            _row(_btn("\U0001f4f7 Chart", "chart"), _btn("\U0001f916 AI", "ai")),
         )
         msg = (
             "\U0001f916 *BB-450 Trading Bot*\n\n"
@@ -636,17 +812,20 @@ class TelegramBot:
             "Usa los botones o comandos:\n"
             "/info — Todos los indicadores\n"
             "/signal — Señal actual\n"
+            "/scalp — Scalping 1m\n"
+            "/trampas — Trampas / Narrativa\n"
+            "/chart — Gráfico velas\n"
             "/alerts — Configurar alertas\n"
             "/status — Estado del bot\n"
-            "/config — Ajustes\n"
+            "/micro — Microestructura\n"
             "/ai — Consultar a Gemini AI"
         ).format(settings.SYMBOL)
         await self._send(msg, kb=kb)
 
         # Persistent reply keyboard at the bottom of the chat
         rkb = _reply_kb(
-            ("\U0001f4ca Info", "\U0001f4e1 Signal", "\U0001f514 Alertas"),
-            ("\U0001f9f9 Estado", "\U0001f4c8 Micro", "\U0001f916 AI"),
+            ("\U0001f4ca Info", "\U0001f4e1 Signal", "\U0001f3c3 Scalp"),
+            ("\U0001f4f7 Chart", "\U0001f4c8 Micro", "\U0001f50d Insti"),
             ("\U0001f504 Refresh", "\U0001f3b5 \u00daltimo"),
         )
         await self._send(
@@ -746,6 +925,17 @@ class TelegramBot:
         ]
         await self._send("\n".join(lines))
 
+        # Also send a chart with the signal
+        klines = await self._fetch_klines()
+        if klines:
+            png = await self._generate_chart(klines)
+            if png:
+                caption = (
+                    f"\U0001f4e1 *{direction}* ({conf:.0f}%) | RSI `{rsi:.1f}` | "
+                    f"Delta `{delta:+.0f}` | Trend `{trend}`"
+                )
+                await self._send_photo(png, caption=caption)
+
     async def _cmd_alerts(self):
         crash_on = self._user_config.get("crash", True)
         bs_on = self._user_config.get("buy_sell", True)
@@ -768,6 +958,110 @@ class TelegramBot:
             f"{'\u2705' if rsi_on else '\u274c'} RSI: sobrecompra > {settings.ALERT_RSI_OVERBOUGHT:.0f} / sobreventa < {settings.ALERT_RSI_OVERSOLD:.0f}"
         )
         await self._send(msg, kb=kb)
+
+    async def _cmd_trampas(self):
+        s = self._state
+        if not s:
+            await self._send("\u26a0\ufe0f *Sin datos*")
+            return
+
+        p = s.get('price', 0); dh = s.get('day_high', 0); dl = s.get('day_low', 0)
+        delta = s.get('delta', 0); cvd = s.get('cvd', 0)
+        imb = s.get('imbalance', 0); depth = s.get('depth_imb_pct', 0)
+        bb_pos = s.get('bb_position', 50); bb_sq = s.get('bb_squeeze', 'NORMAL')
+        force = s.get('force', 'NONE'); ke = s.get('kaufman_eff', 0.5)
+        trend = s.get('trend', 'NEUTRAL'); sig = s.get('signal_text', 'WAIT')
+        conf = s.get('confidence', 0); rsi = s.get('rsi', 50)
+        ai_dir = s.get('ai_signal', 'NINGUNA'); ai_final = s.get('ai_final', 'WAIT')
+        ai_of = s.get('ai_score_of', 0); ai_mom = s.get('ai_score_mom', 0)
+        ai_trend = s.get('ai_score_trend', 0); ai_win = s.get('ai_win_rate', 0)
+        wall_bid = s.get('wall_bid', 0); wall_ask = s.get('wall_ask', 0)
+        trend_5m = s.get('trend_5m', 'WAIT'); trend_15m = s.get('trend_15m', 'WAIT')
+        macro = s.get('global_macro', 'NEUTRAL'); vwap = s.get('vwap', 0)
+        lz = s.get('liq_zones', 0); bv = s.get('buy_volume', 0); sv = s.get('sell_volume', 0)
+
+        # Detect possible traps
+        traps = []
+        if bb_sq == "SQUEEZE":
+            traps.append("\U0001f4a5 Squeeze BB — posible expansi\u00f3n violenta")
+        if force == "BUY" and delta < 0:
+            traps.append("\U0001f6a9 Fuerza BUY pero Delta negativo — DIVERGENCIA (trampa bajista)")
+        if force == "SELL" and delta > 0:
+            traps.append("\U0001f6a9 Fuerza SELL pero Delta positivo — DIVERGENCIA (trampa alcista)")
+        if abs(bb_pos - 50) > 40:
+            traps.append(f"\U0001f6a9 BB en extremo ({bb_pos:.0f}%) — posible reversi\u00f3n")
+        if rsi > 68 and trend == "ALCISTA" and delta < -50:
+            traps.append(f"\U0001f6a9 RSI alto ({rsi:.0f}) + Delta negativo — TRAMPA ALCISTA")
+        if rsi < 32 and trend == "BAJISTA" and delta > 50:
+            traps.append(f"\U0001f6a9 RSI bajo ({rsi:.0f}) + Delta positivo — TRAMPA BAJISTA")
+        if imb > 0.5 and wall_ask > 0 and wall_ask > wall_bid:
+            traps.append("\U0001f40b Whale Ask wall + Order Book alcista — posible spoofing")
+        if imb < -0.5 and wall_bid > 0 and wall_bid > wall_ask:
+            traps.append("\U0001f40b Whale Bid wall + Order Book bajista — posible spoofing")
+        if not traps:
+            traps.append("\u2705 No se detectan trampas evidentes")
+
+        f_e = "\U0001f7e2" if force == "BUY" else "\U0001f534" if force == "SELL" else "\u26ab"
+        sq_e = "\U0001f4a5" if bb_sq == "SQUEEZE" else "\u26ab"
+        ai_e = "\U0001f7e2" if ai_final == "LONG" else "\U0001f534" if ai_final == "SHORT" else "\u26ab"
+
+        lines = [
+            f"\U0001f50d *NARRATIVA INSTITUCIONAL* \U0001f50d",
+            f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500",
+            f"",
+            f"*PRECIO* \U0001f4b0",
+            f"  `${p:,.0f}` | High `${dh:,.0f}` | Low `${dl:,.0f}`",
+            f"  VWAP `${vwap:,.0f}` | Dist: `{((p-vwap)/max(vwap,1)*100):+.2f}%`",
+            f"",
+            f"*ORDER FLOW* \U0001f4c8",
+            f"  Delta: `{delta:.0f}` | CVD: `{cvd:.0f}`",
+            f"  Buy: `{bv:.1f}` | Sell: `{sv:.1f}` | Imb: `{imb:+.3f}`",
+            f"",
+            f"*WHALE WALLS* \U0001f40b",
+            f"  Bid: `${wall_bid:,.0f}` | Ask: `${wall_ask:,.0f}`",
+            f"  Depth Imb: `{depth:+.1f}%` | Liq Zones: `{lz}`",
+            f"",
+            f"*FUERZA* {f_e}",
+            f"  Force: `{force}` | BB Squeeze {sq_e}: `{bb_sq}`",
+            f"  BB Pos: `{bb_pos:.1f}%` | Kaufman: `{ke:.2f}`",
+            f"",
+            f"*MTF* \U0001f3c6",
+            f"  Trend: `{trend}` | 5m: `{trend_5m}` | 15m: `{trend_15m}`",
+            f"  Macro: `{macro}` | RSI: `{rsi:.1f}`",
+            f"",
+            f"*AI ENGINE* {ai_e}",
+            f"  Signal: `{ai_dir}` | Final: `{ai_final}`",
+            f"  Score OF: `{ai_of:.1f}` | Mom: `{ai_mom:.1f}` | Trend: `{ai_trend:.1f}`",
+            f"  Win Rate: `{ai_win:.1f}%`",
+            f"",
+            f"*DETECCI\u00d3N DE TRAMPAS* \U0001f6a9",
+        ] + [f"  {t}" for t in traps] + [
+            f"",
+            f"\u23f0 `{s.get('timestamp', '')}`",
+        ]
+        await self._send("\n".join(lines))
+
+    async def _cmd_chart(self):
+        """Fetch klines from Binance, generate chart, send as photo."""
+        await self._typing()
+        klines = await self._fetch_klines()
+        if not klines:
+            await self._send("\u26a0\ufe0f *Error* — no se pudieron obtener klines")
+            return
+        png = await self._generate_chart(klines)
+        if not png:
+            await self._send("\u26a0\ufe0f *Error* — no se pudo generar el gráfico")
+            return
+
+        s = self._state
+        price = s.get("price", 0); trend = s.get("trend", "NEUTRAL")
+        sig = s.get("signal_text", "WAIT"); rsi = s.get("rsi", 50)
+        caption = (
+            f"\U0001f4f7 *BTCUSDT — 1m*\n"
+            f"Precio: `${price:,.0f}` | {sig} ({s.get('confidence', 0):.0f}%)\n"
+            f"RSI: `{rsi:.1f}` | Trend: `{trend}` | VWAP/EMA líneas"
+        )
+        await self._send_photo(png, caption=caption)
 
     async def _cmd_micro(self):
         s = self._state
@@ -799,6 +1093,69 @@ class TelegramBot:
             f"*LIQUIDEZ*",
             f"  Delta: `{delta:.0f}` | Imbalance: `{imb:+.3f}`",
             f"  Depth Imb: `{depth:+.1f}%` | Liq Zones: `{lz}`",
+            f"",
+            f"\u23f0 `{s.get('timestamp', '')}`",
+        ]
+        await self._send("\n".join(lines))
+
+    async def _cmd_scalp(self):
+        s = self._state
+        if not s or not s.get("klines_ready"):
+            await self._send("\u23f3 *Cargando datos para scalping...*")
+            return
+
+        p = s.get('price', 0); delta = s.get('delta', 0); cvd = s.get('cvd', 0)
+        imb = s.get('imbalance', 0); depth = s.get('depth_imb_pct', 0)
+        bv = s.get('buy_volume', 0); sv = s.get('sell_volume', 0); ratio = s.get('ba_ratio', 1)
+        rsi = s.get('rsi', 50); trend = s.get('trend', 'NEUTRAL')
+        sig = s.get('signal_text', 'WAIT'); conf = s.get('confidence', 0)
+        ke = s.get('kaufman_eff', 0.5); ts = s.get('tick_speed', 0)
+        force = s.get('force', 'NONE'); bb_sq = s.get('bb_squeeze', 'NORMAL')
+        trend_5m = s.get('trend_5m', 'WAIT'); trend_15m = s.get('trend_15m', 'WAIT')
+        wall_bid = s.get('wall_bid', 0); wall_ask = s.get('wall_ask', 0)
+        bb_pos = s.get('bb_position', 50); macd_h = s.get('macd_hist', 0)
+        atr = s.get('atr', 0); vwap = s.get('vwap', 0); pvd = s.get('price_vwap_dist', 0)
+
+        # Signal direction emojis
+        de = "\U0001f7e2" if delta > 0 else "\U0001f534"
+        im_e = "\U0001f7e2" if imb > 0 else "\U0001f534"
+        f_e = "\U0001f7e2" if force == "BUY" else "\U0001f534" if force == "SELL" else "\u26ab"
+        sq_e = "\U0001f4a5" if bb_sq == "SQUEEZE" else "\u26ab"
+
+        # Scalping bias calculation
+        imbalance_score = (imb * 50) + 50  # -1..+1 → 0..100
+        delta_score = min(100, max(0, (delta / max(abs(delta) + 1, 1) * 50) + 50))
+        vol_score = min(100, (bv / max(bv + sv, 0.001)) * 100)
+        bias = (imbalance_score * 0.35 + delta_score * 0.30 + vol_score * 0.20 + conf * 0.15)
+        scalp_dir = "LONG" if bias > 55 else "SHORT" if bias < 45 else "WAIT"
+        strength = abs(bias - 50) * 2
+
+        te = "\U0001f7e2" if scalp_dir == "LONG" else "\U0001f534" if scalp_dir == "SHORT" else "\u26ab"
+
+        lines = [
+            f"\U0001f3c3 *SCALP 1m* {te}",
+            f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500",
+            f"",
+            f"*DIRECCI\u00d3N:* `{scalp_dir}` | Fuerza: `{strength:.0f}%`",
+            f"  Precio: `${p:,.0f}` | ATR `${atr:.2f}`",
+            f"  VWAP: `${vwap:,.0f}` | Dist: `{pvd:+.2f}%`",
+            f"",
+            f"*ORDER FLOW* \U0001f4c8",
+            f"  Delta {de}: `{delta:.0f}` | CVD: `{cvd:.0f}`",
+            f"  B/A Ratio: `{ratio:.3f}` | Buy/Sell: `{bv:.0f}/{sv:.0f}`",
+            f"  Imbalance {im_e}: `{imb:+.3f}` | Depth: `{depth:+.1f}%`",
+            f"",
+            f"*MICRO* \U0001f52e",
+            f"  Kaufman: `{ke:.2f}` | Tick: `{ts:.1f}/s`",
+            f"  Fuerza {f_e}: `{force}` | BB Squeeze {sq_e}",
+            f"",
+            f"*WHALE WALLS* \U0001f40b",
+            f"  Bid: `${wall_bid:,.0f}` | Ask: `${wall_ask:,.0f}`",
+            f"  BB Pos: `{bb_pos:.1f}%` | MACD Hist: `{macd_h:.4f}`",
+            f"",
+            f"*MTF*",
+            f"  1m Trend: `{trend}` | 5m: `{trend_5m}` | 15m: `{trend_15m}`",
+            f"  RSI 1m: `{rsi:.1f}`",
             f"",
             f"\u23f0 `{s.get('timestamp', '')}`",
         ]
@@ -910,6 +1267,12 @@ class TelegramBot:
             cmd = "/ultimo"
         elif "\U0001f916" in text and "AI" in text:
             cmd = "/ai"
+        elif "\U0001f3c3" in text or "Scalp" in text:
+            cmd = "/scalp"
+        elif "\U0001f50d" in text and "Insti" in text:
+            cmd = "/trampas"
+        elif "\U0001f4f7" in text or "Chart" in text:
+            cmd = "/chart"
         else:
             cmd = text
 
@@ -923,12 +1286,18 @@ class TelegramBot:
                 await self._cmd_signal()
             elif cmd == "/alerts":
                 await self._cmd_alerts()
+            elif cmd == "/trampas":
+                await self._cmd_trampas()
             elif cmd == "/status":
                 await self._cmd_status()
             elif cmd == "/config":
                 await self._cmd_alerts()
             elif cmd == "/micro":
                 await self._cmd_micro()
+            elif cmd == "/chart":
+                await self._cmd_chart()
+            elif cmd == "/scalp":
+                await self._cmd_scalp()
             elif cmd == "/ai" or cmd.startswith("/ai "):
                 user_q = text[4:].strip() if cmd.startswith("/ai ") else ""
                 if not user_q:
@@ -940,7 +1309,7 @@ class TelegramBot:
                     )
                 else:
                     reply = await self._typing_for(self._chat_gemini(user_q))
-                    await self._send(reply, parse_mode=None)
+                    await self._send(reply)
             elif cmd == "/refresh":
                 s = self._state
                 sig = s.get("signal_text", "WAIT")
@@ -970,7 +1339,7 @@ class TelegramBot:
             else:
                 reply = await self._typing_for(self._chat_gemini(text))
                 if reply:
-                    await self._send(reply, parse_mode=None)
+                    await self._send(reply)
         except Exception as e:
             print(f"[TelegramBot] ❌ Error al procesar comando \"{text}\": {e}")
             log.exception("Command handler error")
@@ -1013,6 +1382,12 @@ class TelegramBot:
             await self._cmd_alerts()
         elif data == "ai":
             await self._answer_cb(cb_id, "Escribe tu pregunta para Gemini")
+        elif data == "trampas":
+            await self._answer_cb(cb_id)
+            await self._cmd_trampas()
+        elif data == "chart":
+            await self._answer_cb(cb_id, "\U0001f4f7 Generando gráfico...")
+            await self._cmd_chart()
         elif data.startswith("tog_"):
             key = data.replace("tog_", "")
             if key == "crash":
