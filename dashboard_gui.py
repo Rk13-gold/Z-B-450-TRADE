@@ -2037,46 +2037,87 @@ class OrderFlowBattleBar(QFrame):
     
     def update_battle(self, buy_volume, sell_volume, imbalance,
                       trend='NEUTRAL', rsi=50, cvd=0, prediction_dir='',
-                      prediction_conf=0):
-        """Full synchronization with all market data."""
-        # 1. Volume delta force (0-100 scale, 50 = neutral)
+                      prediction_conf=0, confluence_score=50,
+                      trend_1h='NEUTRAL', trend_4h='NEUTRAL'):
+        """Full synchronization with all market data.
+        
+        V3 — Critical fixes:
+        - Choppiness filter: blocks signals when confluence_score is 40-60%
+        - Trend-adaptive RSI: high RSI in uptrend = continuation, not reversal
+        - MTF weighting: trend_1h + trend_4h = 30% of composite score
+        """
+        # ── CHOPPINESS / CONFLUENCE FILTER ────────────────────────────
+        if 40 <= confluence_score <= 60:
+            self.trend_direction = "NEUTRAL"
+            self.confidence = 0
+            self.target_buy_pct = 50
+            self.trend_label = "◆ CHOP ZONE — NO EDGE"
+            return
+        
+        # ── COMPONENT SCORES (each 0-100, 50 = neutral) ───────────────
+        
+        # 1. Volume delta force
         total = buy_volume + sell_volume + 0.001
         vol_pct = (buy_volume / total) * 100
         
-        # 2. Order book imbalance force (-1 to 1 -> 0 to 100)
+        # 2. Order book imbalance (-1..+1 → 0..100)
         ob_pct = (imbalance + 1) * 50
         
-        # 3. Trend force
+        # 3. Short-term trend (EMA cross direction)
         if trend == 'ALCISTA': trend_pct = 75
         elif trend == 'BAJISTA': trend_pct = 25
         else: trend_pct = 50
         
-        # 4. RSI force (inverted: low RSI = buy opportunity)
-        if rsi < 30: rsi_pct = 80
-        elif rsi < 40: rsi_pct = 65
-        elif rsi > 70: rsi_pct = 20
-        elif rsi > 60: rsi_pct = 35
-        else: rsi_pct = 50
+        # 4. RSI — trend-adaptive (not fixed counter-trend)
+        if trend == 'ALCISTA':
+            if rsi < 30:     rsi_pct = 80   # oversold bounce, buy dip
+            elif rsi < 40:   rsi_pct = 70
+            elif rsi > 70:   rsi_pct = 80   # strength continuation
+            elif rsi > 60:   rsi_pct = 70
+            else:            rsi_pct = 60
+        elif trend == 'BAJISTA':
+            if rsi < 30:     rsi_pct = 20   # dead bounce, sell rallies
+            elif rsi < 40:   rsi_pct = 30
+            elif rsi > 70:   rsi_pct = 20   # overbought in downtrend
+            elif rsi > 60:   rsi_pct = 30
+            else:            rsi_pct = 40
+        else:
+            if rsi < 30:     rsi_pct = 80
+            elif rsi < 40:   rsi_pct = 65
+            elif rsi > 70:   rsi_pct = 20
+            elif rsi > 60:   rsi_pct = 35
+            else:            rsi_pct = 50
         
         # 5. CVD direction
-        if cvd > 50: cvd_pct = 75
-        elif cvd > 0: cvd_pct = 60
+        if cvd > 50:    cvd_pct = 75
+        elif cvd > 0:   cvd_pct = 60
         elif cvd < -50: cvd_pct = 25
-        elif cvd < 0: cvd_pct = 40
-        else: cvd_pct = 50
+        elif cvd < 0:   cvd_pct = 40
+        else:           cvd_pct = 50
         
-        # 6. Prediction confirmation
+        # 6. Multi-timeframe trend (30% of total weight)
+        mtf_score = 50
+        if trend_1h == 'ALCISTA':   mtf_score += 20
+        elif trend_1h == 'BAJISTA': mtf_score -= 20
+        if trend_4h == 'ALCISTA':   mtf_score += 10
+        elif trend_4h == 'BAJISTA': mtf_score -= 10
+        mtf_pct = max(0, min(100, mtf_score))
+        
+        # 7. Prediction confirmation (residual weight)
         if prediction_dir == 'PUMP': pred_pct = 50 + (prediction_conf * 0.4)
         elif prediction_dir == 'DUMP': pred_pct = 50 - (prediction_conf * 0.4)
         else: pred_pct = 50
         
-        # Composite: weighted average
-        composite = (vol_pct * 0.20) + (ob_pct * 0.25) + (trend_pct * 0.15) + \
-                    (rsi_pct * 0.10) + (cvd_pct * 0.15) + (pred_pct * 0.15)
+        # ── COMPOSITE: weighted average ───────────────────────────────
+        # Weights: Vol 15% | OB 15% | Trend 10% | RSI 10% | CVD 15%
+        #          MTF 30% | Pred 5%
+        composite = (vol_pct * 0.15) + (ob_pct * 0.15) + (trend_pct * 0.10) + \
+                    (rsi_pct * 0.10) + (cvd_pct * 0.15) + (mtf_pct * 0.30) + \
+                    (pred_pct * 0.05)
         
         self.target_buy_pct = composite
         
-        # Determine signal
+        # ── SIGNAL DECISION ───────────────────────────────────────────
         self.confidence = abs(composite - 50) * 2  # 0-100
         if composite > 62:
             self.trend_direction = "LONG"
@@ -4370,7 +4411,13 @@ class MainDashboard(QMainWindow):
         if hasattr(self, 'trend_signal_bar'):
             self.trend_signal_bar.update_signal(self.battle_bar.trend_direction, self.battle_bar.trend_label)
         
-        # update battle bar itself
+        # MTF data from async engine
+        mt = self.market_state.get("mtf_trend", {})
+        c_score = mt.get("confluence_score", 50)
+        t_1h = mt.get("t_1h", "NEUTRAL")
+        t_4h = mt.get("t_4h", "NEUTRAL")
+        
+        # update battle bar — single source of truth, real data only
         self.battle_bar.update_battle(
             buy_volume=self.data['buy_volume'],
             sell_volume=self.data['sell_volume'],
@@ -4378,8 +4425,9 @@ class MainDashboard(QMainWindow):
             trend=self.market_state.get('trend', 'NEUTRAL'),
             rsi=self.data['rsi'],
             cvd=self.data['cvd'],
-            prediction_dir='PUMP' if self.data['delta'] > 0 else 'DUMP',
-            prediction_conf=50
+            confluence_score=c_score,
+            trend_1h=t_1h,
+            trend_4h=t_4h,
         )
             
         # ═══════════════════════════════════════════════════════════════
@@ -4649,18 +4697,7 @@ class MainDashboard(QMainWindow):
         gv("LAST TRADE #2", "WAITING...", white)
         
         # Old trend signal label removed, handled by TrendSignalBar
-        
-        pred = self.panels['HEATMAP'].predicted_candles
-        pred_dir = pred[0]['direction'] if pred else '???'
-        pred_conf = pred[0]['confidence'] if pred else 0
-        
-        # Update Battle Bar
-        self.battle_bar.update_battle(
-            buy_v, sell_v, imb,
-            trend=self.data.get('trend', 'NEUTRAL'),
-            rsi=rsi, cvd=cvd,
-            prediction_dir=pred_dir, prediction_conf=pred_conf,
-        )
+        # (signal generated exclusively in update_panels() via first update_battle call)
     
     def order_state_available(self):
         """Check if order book data is available."""
