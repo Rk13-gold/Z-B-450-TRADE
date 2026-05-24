@@ -2038,13 +2038,19 @@ class OrderFlowBattleBar(QFrame):
     def update_battle(self, buy_volume, sell_volume, imbalance,
                       trend='NEUTRAL', rsi=50, cvd=0, prediction_dir='',
                       prediction_conf=0, confluence_score=50,
-                      trend_1h='NEUTRAL', trend_4h='NEUTRAL'):
+                      trend_1h='NEUTRAL', trend_4h='NEUTRAL',
+                      delta=0, tick_speed=0, cancel_rate=0, pinam=0,
+                      bb_squeeze='NORMAL', atr=0, spread_velocity=0,
+                      avg_volume=0):
         """Full synchronization with all market data.
         
-        V3 — Critical fixes:
-        - Choppiness filter: blocks signals when confluence_score is 40-60%
-        - Trend-adaptive RSI: high RSI in uptrend = continuation, not reversal
-        - MTF weighting: trend_1h + trend_4h = 30% of composite score
+        V4 — Scalping Professional:
+        - Order flow acceleration (delta velocity, tick acceleration)
+        - HFT toxicity filter (PINAM + cancel_rate)
+        - Volatility filter (BB squeeze + ATR)
+        - Spread velocity filter
+        - Dynamic thresholds based on ATR regime
+        - Redistributed weights: OF 50% | Micro 15% | MTF 15% | RSI 10% | Volatility 10%
         """
         # ── CHOPPINESS / CONFLUENCE FILTER ────────────────────────────
         if 40 <= confluence_score <= 60:
@@ -2053,32 +2059,92 @@ class OrderFlowBattleBar(QFrame):
             self.target_buy_pct = 50
             self.trend_label = "◆ CHOP ZONE — NO EDGE"
             return
-        
+
+        # ── FILTER 1: HFT TOXICITY ────────────────────────────────────
+        # High cancel_rate + high PINAM = aggressive HFT manipulation
+        if pinam > 0.25 and cancel_rate > 12:
+            self.trend_direction = "NEUTRAL"
+            self.confidence = 0
+            self.target_buy_pct = 50
+            self.trend_label = "◆ HFT TOXIC — NO TRADE"
+            return
+
+        # ── FILTER 2: VOLATILITY COMPRESSION ──────────────────────────
+        # BB Squeeze + low ATR = impending explosion, no directional edge
+        if bb_squeeze == 'SQUEEZE' and atr > 0 and atr < 30:
+            self.trend_direction = "NEUTRAL"
+            self.confidence = 0
+            self.target_buy_pct = 50
+            self.trend_label = "◆ BB SQUEEZE — WAIT EXPANSION"
+            return
+
+        # ── FILTER 3: SPREAD VELOCITY ─────────────────────────────────
+        # Wide spreads kill scalping profitability
+        if spread_velocity > 100:
+            self.trend_direction = "NEUTRAL"
+            self.confidence = 0
+            self.target_buy_pct = 50
+            self.trend_label = "◆ WIDE SPREAD — NO EDGE"
+            return
+        spread_penalty = 0.8 if spread_velocity > 50 else 1.0
+
         # ── COMPONENT SCORES (each 0-100, 50 = neutral) ───────────────
-        
-        # 1. Volume delta force
+
+        # 1. ORDER FLOW (50% total)
+        # 1a. Volume delta force (15%)
         total = buy_volume + sell_volume + 0.001
         vol_pct = (buy_volume / total) * 100
-        
-        # 2. Order book imbalance (-1..+1 → 0..100)
+
+        # 1b. Order book imbalance (10%)
         ob_pct = (imbalance + 1) * 50
-        
-        # 3. Short-term trend (EMA cross direction)
-        if trend == 'ALCISTA': trend_pct = 75
-        elif trend == 'BAJISTA': trend_pct = 25
-        else: trend_pct = 50
-        
-        # 4. RSI — trend-adaptive (not fixed counter-trend)
+
+        # 1c. CVD direction (10%)
+        if cvd > 50:    cvd_pct = 75
+        elif cvd > 0:   cvd_pct = 60
+        elif cvd < -50: cvd_pct = 25
+        elif cvd < 0:   cvd_pct = 40
+        else:           cvd_pct = 50
+
+        # 1d. Delta acceleration — velocity of order flow (15%)
+        if not hasattr(self, '_prev_delta'):
+            self._prev_delta = delta
+        delta_vel = delta - self._prev_delta
+        self._prev_delta = delta
+        self.delta_accel = delta_vel  # exposed for snapshot
+        # delta_vel > 0 = acceleration buying, < 0 = acceleration selling
+        if delta_vel > 20:       delta_pct = 80
+        elif delta_vel > 5:      delta_pct = 65
+        elif delta_vel < -20:    delta_pct = 20
+        elif delta_vel < -5:     delta_pct = 35
+        else:                    delta_pct = 50
+
+        # 2. MICROSTRUCTURE ACCELERATION (15% total)
+        # Tick speed acceleration
+        if not hasattr(self, '_prev_tick'):
+            self._prev_tick = tick_speed
+        tick_accel = tick_speed - self._prev_tick
+        self._prev_tick = tick_speed
+        # High tick_speed + acceleration = directional urgency
+        if tick_speed > 30 and tick_accel > 5:   micro_pct = 80
+        elif tick_speed > 20 and tick_accel > 2: micro_pct = 65
+        elif tick_speed > 30 and tick_accel < -5: micro_pct = 20
+        elif tick_speed > 20 and tick_accel < -2: micro_pct = 35
+        else:                                     micro_pct = 50
+        # Adjust by cancel_rate (high cancel = noise, reduce conviction)
+        if cancel_rate > 20:      micro_pct = 50 + (micro_pct - 50) * 0.3
+        elif cancel_rate > 12:    micro_pct = 50 + (micro_pct - 50) * 0.6
+
+        # 3. RSI — trend-adaptive (10%)
         if trend == 'ALCISTA':
-            if rsi < 30:     rsi_pct = 80   # oversold bounce, buy dip
+            if rsi < 30:     rsi_pct = 80
             elif rsi < 40:   rsi_pct = 70
-            elif rsi > 70:   rsi_pct = 80   # strength continuation
+            elif rsi > 70:   rsi_pct = 80
             elif rsi > 60:   rsi_pct = 70
             else:            rsi_pct = 60
         elif trend == 'BAJISTA':
-            if rsi < 30:     rsi_pct = 20   # dead bounce, sell rallies
+            if rsi < 30:     rsi_pct = 20
             elif rsi < 40:   rsi_pct = 30
-            elif rsi > 70:   rsi_pct = 20   # overbought in downtrend
+            elif rsi > 70:   rsi_pct = 20
             elif rsi > 60:   rsi_pct = 30
             else:            rsi_pct = 40
         else:
@@ -2087,42 +2153,46 @@ class OrderFlowBattleBar(QFrame):
             elif rsi > 70:   rsi_pct = 20
             elif rsi > 60:   rsi_pct = 35
             else:            rsi_pct = 50
-        
-        # 5. CVD direction
-        if cvd > 50:    cvd_pct = 75
-        elif cvd > 0:   cvd_pct = 60
-        elif cvd < -50: cvd_pct = 25
-        elif cvd < 0:   cvd_pct = 40
-        else:           cvd_pct = 50
-        
-        # 6. Multi-timeframe trend (30% of total weight)
+
+        # 4. MTF (reduced to 15% for scalping)
         mtf_score = 50
-        if trend_1h == 'ALCISTA':   mtf_score += 20
-        elif trend_1h == 'BAJISTA': mtf_score -= 20
-        if trend_4h == 'ALCISTA':   mtf_score += 10
-        elif trend_4h == 'BAJISTA': mtf_score -= 10
+        if trend_1h == 'ALCISTA':   mtf_score += 15
+        elif trend_1h == 'BAJISTA': mtf_score -= 15
+        if trend_4h == 'ALCISTA':   mtf_score += 5
+        elif trend_4h == 'BAJISTA': mtf_score -= 5
         mtf_pct = max(0, min(100, mtf_score))
-        
-        # 7. Prediction confirmation (residual weight)
-        if prediction_dir == 'PUMP': pred_pct = 50 + (prediction_conf * 0.4)
-        elif prediction_dir == 'DUMP': pred_pct = 50 - (prediction_conf * 0.4)
-        else: pred_pct = 50
-        
+
+        # 5. VOLATILITY REGIME (10%)
+        # ATR percentile-based score: low vol = wait, high vol = follow
+        if atr > 100:        vol_regime = 75  # high vol = strong trend
+        elif atr > 50:       vol_regime = 65
+        elif atr < 15:       vol_regime = 35  # too quiet, unreliable
+        else:                vol_regime = 50
+
         # ── COMPOSITE: weighted average ───────────────────────────────
-        # Weights: Vol 15% | OB 15% | Trend 10% | RSI 10% | CVD 15%
-        #          MTF 30% | Pred 5%
-        composite = (vol_pct * 0.15) + (ob_pct * 0.15) + (trend_pct * 0.10) + \
-                    (rsi_pct * 0.10) + (cvd_pct * 0.15) + (mtf_pct * 0.30) + \
-                    (pred_pct * 0.05)
-        
+        # Weights: Vol 15% | OB 10% | CVD 10% | DeltaAccel 15% | Micro 15%
+        #          RSI 10% | MTF 15% | VolRegime 10%
+        raw_composite = (
+            vol_pct * 0.15 + ob_pct * 0.10 + cvd_pct * 0.10 +
+            delta_pct * 0.15 + micro_pct * 0.15 +
+            rsi_pct * 0.10 + mtf_pct * 0.15 + vol_regime * 0.10
+        )
+
+        # Apply spread penalty (reduces conviction when spread is wide)
+        composite = 50 + (raw_composite - 50) * spread_penalty
         self.target_buy_pct = composite
-        
+
+        # ── DYNAMIC THRESHOLDS based on ATR ───────────────────────────
+        if atr > 70:       threshold = 65  # high vol needs stronger signal
+        elif atr < 20:     threshold = 58  # low vol, tighten threshold
+        else:              threshold = 62
+
         # ── SIGNAL DECISION ───────────────────────────────────────────
         self.confidence = abs(composite - 50) * 2  # 0-100
-        if composite > 62:
+        if composite > threshold:
             self.trend_direction = "LONG"
             self.trend_label = f"▲ GO LONG — {self.confidence:.0f}% FORCE"
-        elif composite < 38:
+        elif composite < 100 - threshold:
             self.trend_direction = "SHORT"
             self.trend_label = f"▼ GO SHORT — {self.confidence:.0f}% FORCE"
         else:
@@ -4262,6 +4332,7 @@ class MainDashboard(QMainWindow):
 
                 # Order flow
                 'delta': self.data.get('delta', 0),
+                'delta_accel': self.battle_bar.delta_accel if hasattr(self, 'battle_bar') and hasattr(self.battle_bar, 'delta_accel') else 0,
                 'cvd': self.data.get('cvd', 0),
                 'buy_volume': bv,
                 'sell_volume': sv,
@@ -4417,6 +4488,18 @@ class MainDashboard(QMainWindow):
         t_1h = mt.get("t_1h", "NEUTRAL")
         t_4h = mt.get("t_4h", "NEUTRAL")
         
+        # Microstructure / HFT data from async engine
+        mom = self.market_state.get('momentum', {})
+        m_tick = mom.get('tick_speed', 0)
+        m_cancel = mom.get('cancel_rate', 0)
+        m_pinam = mom.get('pinam', 0)
+        m_spread = mom.get('spread_velocity', 0)
+        
+        # Volatility data
+        b_squeeze = self.data.get('bb_squeeze', 'NORMAL')
+        atr_val = self.data.get('atr', 0)
+        avg_vol = self.data.get('avg_volume', 0)
+        
         # update battle bar — single source of truth, real data only
         self.battle_bar.update_battle(
             buy_volume=self.data['buy_volume'],
@@ -4428,6 +4511,14 @@ class MainDashboard(QMainWindow):
             confluence_score=c_score,
             trend_1h=t_1h,
             trend_4h=t_4h,
+            delta=self.data['delta'],
+            tick_speed=m_tick,
+            cancel_rate=m_cancel,
+            pinam=m_pinam,
+            bb_squeeze=b_squeeze,
+            atr=atr_val,
+            spread_velocity=m_spread,
+            avg_volume=avg_vol,
         )
             
         # ═══════════════════════════════════════════════════════════════

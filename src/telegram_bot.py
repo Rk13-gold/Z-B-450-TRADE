@@ -27,6 +27,8 @@ from typing import Optional, Callable
 
 import aiohttp
 
+import edge_tts
+
 # matplotlib headless backend — must be set before any pyplot import
 os.environ["MPLBACKEND"] = "Agg"
 import matplotlib
@@ -137,6 +139,7 @@ class TelegramBot:
         self._alert_state = AlertState()
         self._user_config = {
             "crash": True, "buy_sell": True, "volume": True, "rsi": True,
+            "trend_change": True, "whale": True, "ai_trade": True,
             "capital": 100.0, "risk_pct": 1.0, "sl_pct": 0.5, "tp_pct": 1.5,
         }
 
@@ -426,6 +429,8 @@ class TelegramBot:
 
     async def _check_trend_alert(self):
         """Alert on trend changes detected by the dashboard."""
+        if not self._user_config.get("trend_change", True):
+            return
         trend = self._state.get("trend", "NEUTRAL")
         sig = self._state.get("signal_text", "WAIT")
         if not hasattr(self, '_prev_trend'):
@@ -466,6 +471,8 @@ class TelegramBot:
 
     async def _check_whale_alert(self):
         """Detect whale accumulation/distribution via cumulative delta acceleration."""
+        if not self._user_config.get("whale", True):
+            return
         s = self._state
         if not s:
             return
@@ -519,17 +526,19 @@ class TelegramBot:
 
     async def _check_trade_opportunity(self):
         """AI-powered trade confirmation. Fires when signal confidence > 75."""
+        if not self._user_config.get("ai_trade", True):
+            return
         s = self._state
         if not s:
             return
         conf = s.get("confidence", 0)
         direction = s.get("signal_text", "WAIT")
-        if conf < 75 or direction not in ("LONG", "SHORT"):
+        if conf < 55 or direction not in ("LONG", "SHORT"):
             return
         if not hasattr(self, '_last_trade_check'):
             self._last_trade_check = 0
         now = time.time()
-        if now - self._last_trade_check < 120:
+        if now - self._last_trade_check < 30:
             return
         self._last_trade_check = now
 
@@ -538,6 +547,7 @@ class TelegramBot:
 
         price = s.get("price", 0)
         delta = s.get("delta", 0)
+        delta_accel = s.get("delta_accel", 0)
         cvd = s.get("cvd", 0)
         rsi = s.get("rsi", 50)
         trend_5m = s.get("trend_5m", "WAIT")
@@ -556,7 +566,7 @@ class TelegramBot:
             f"Eres un trader profesional. Analiza si es seguro abrir una operacion.\n\n"
             f"SEÑAL: {direction} | CONFIANZA: {conf:.0f}%\n"
             f"PRECIO: ${price:,.0f}\n"
-            f"DELTA: {delta:+.1f} | CVD: {cvd:+.1f} | CUM DELTA: {cum_delta:+.1f}\n"
+            f"DELTA: {delta:+.1f} | ACCEL: {delta_accel:+.1f} | CVD: {cvd:+.1f} | CUM DELTA: {cum_delta:+.1f}\n"
             f"RSI: {rsi:.1f} | B/A RATIO: {ba:.3f}x | VOL: {vol:.1f}\n"
             f"PINAM: {pinam:.4f} | CANCEL RATE: {cancel:.1f}%\n"
             f"TREND 5M: {trend_5m} | TREND 1H: {trend_1h}\n"
@@ -1012,6 +1022,7 @@ class TelegramBot:
         'micro':     '_handle_micro',
         'chart':     '_cmd_chart',
         'alertas':   '_cmd_alerts',
+        'notificaciones': '_cmd_alerts',
         'estado':    '_cmd_status',
         'config':    '_cmd_config',
         'operar':    '_handle_operar',
@@ -1110,7 +1121,8 @@ class TelegramBot:
             f"  Trend 1m:  <code>{self._safe_get(s, 'trend')}</code>\n"
             f"  Trend 5m:  <code>{self._safe_get(s, 'trend_5m')}</code>\n"
             f"  RSI 1m:    <code>{self._safe_get(s, 'rsi', fmt=lambda v: f'{v:.1f}')}</code>\n\n"
-            f"\u23f0 {self._safe_get(s, 'timestamp')}"
+            f"\u23f0 {self._safe_get(s, 'timestamp')}",
+            voice=True,
         )
 
     async def _handle_trampas(self):
@@ -1242,9 +1254,7 @@ class TelegramBot:
             f"  Tick Speed: <code>{ts:.1f} t/s</code>",
             f"\u23f0 {self._safe_get(s, 'timestamp')}",
         ]
-        await self._send('\n'.join(lines))
-
-    async def _handle_micro(self):
+        await self._send('\n'.join(lines), voice=True)
         """Statistical flow report: asymmetry, absorption, rotation risk."""
         s = self._state
         cd = s.get('cumulative_delta', 0)
@@ -1288,10 +1298,154 @@ class TelegramBot:
             f"  Cancel Rate:    <code>{self._safe_get(s, 'cancel_rate', fmt=lambda v: f'{v:.1f}%')}</code>\n\n"
             f"<b>ASIMETR\u00cdA</b>\n"
             f"  {asymmetry}\n\n"
-            f"\u23f0 {self._safe_get(s, 'timestamp')}"
+            f"\u23f0 {self._safe_get(s, 'timestamp')}",
+            voice=True,
         )
 
-    async def _send(self, text: str, kb=None, parse_mode="HTML"):
+    # ── Voice synthesis (edge-tts) ───────────────────────────────────────
+
+    @staticmethod
+    def _clean_voice_text(raw: str) -> str:
+        """Strip HTML, emojis, special chars; expand acronyms for natural speech."""
+        # Remove HTML tags
+        text = re.sub(r'<[^>]+>', '', raw)
+        # Remove emojis (So), combining marks (Mn), modifier symbols (Sk)
+        text = ''.join(
+            c for c in unicodedata.normalize('NFKD', text)
+            if unicodedata.category(c) not in ('So', 'Mn', 'Sk')
+        )
+
+        # ── Symbol replacements for spoken Spanish ────────────────────────
+        # Percentage
+        text = re.sub(r'(\d+(?:[.,]\d+)?)\s*%', r'\1 por ciento', text)
+        # +/- signs before numbers (keep sign, edge-tts reads naturally)
+        text = re.sub(r'±', 'mas menos', text)
+        # Pipe separator → pausa (coma)
+        text = text.replace('|', ',')
+        # Arrows and directionals → space
+        text = re.sub(r'[→←↑↓↗↘↖↙▶◀▸◂➡⬅]', ' ', text)
+        # Backticks → remove
+        text = text.replace('`', '')
+        # Tilde separator → espacio
+        text = text.replace('~', ' a ')
+        # slash between letters → "sobre" (e.g. B/A)
+        text = re.sub(r'(?<=[A-Za-z])/(?=[A-Za-z])', ' sobre ', text)
+        # >= and <=
+        text = re.sub(r'>=', ' mayor o igual que ', text)
+        text = re.sub(r'<=', ' menor o igual que ', text)
+        text = re.sub(r'>', ' mayor que ', text)
+        text = re.sub(r'<', ' menor que ', text)
+
+        # ── Expand acronyms to spoken Spanish ─────────────────────────────
+        acronyms = {
+            r'\bCVD\b':                   'ce-ve-de',
+            r'\bPINAM\b':                 'pi-nam',
+            r'\bRSI\b':                   'erre-ese-i',
+            r'\bMTF\b':                   'eme-te-efe',
+            r'\bSL\b':                    'stop loss',
+            r'\bTP\b':                    'take profit',
+            r'\bOI\b':                    'open interest',
+            r'\bdPOC\b':                  'de-pock',
+            r'\bEMA\d*\b':                lambda m: f'EMA {m.group(0)[3:]}',
+            r'\bVWAP\b':                  'viuap',
+            r'\bBB\b':                    'Bollinger',
+            r'\bATR\b':                   'a-te-erre',
+            r'\bMACD\b':                  'macd',
+            r'\bHFT\b':                   'hache-efe-te',
+            r'\bCONF\b':                  'confianza',
+            r'\bUSD\b':                   'dolares',
+            r'\bUSDT\b':                  'dolares',
+            r'\bTP1\b':                   'take profit uno',
+            r'\bTP2\b':                   'take profit dos',
+            r'\bLONG\b':                  'largo',
+            r'\bSHORT\b':                 'corto',
+            r'\bBTC\b':                   'bitcoin',
+        }
+        for pattern, replacement in acronyms.items():
+            text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+
+        # ── Normalize whitespace and final punctuation ────────────────────
+        text = re.sub(r'\s+', ' ', text).strip()
+        # Strip leading/trailing punctuation artifacts
+        text = text.strip(' ,;:-')
+        if text and text[-1] not in '.!?':
+            text += '.'
+        return text
+
+    async def _generate_voice_audio(self, raw_text: str) -> Optional[str]:
+        """Generate TTS audio file from text. Returns file path or None on failure."""
+        t0 = time.time()
+        try:
+            clean = self._clean_voice_text(raw_text)
+            if not clean.strip():
+                return None
+            if len(clean) < 10:
+                return None
+            voice = "es-CO-GonzaloNeural"
+            filename = f"/tmp/bb450_voice_{int(t0 * 1000)}.ogg"
+            communicate = edge_tts.Communicate(clean, voice)
+            # Generate with a generous timeout (max 60s for long texts)
+            await asyncio.wait_for(communicate.save(filename), timeout=60.0)
+            elapsed = time.time() - t0
+            # Verify the file was created and has content
+            if not os.path.exists(filename) or os.path.getsize(filename) == 0:
+                print(f"[TelegramBot] ⚠️ Archivo de voz vacío tras {elapsed:.1f}s")
+                return None
+            size_kb = os.path.getsize(filename) / 1024
+            print(f"[TelegramBot] 🎤 Voz generada en {elapsed:.1f}s ({size_kb:.0f}KB): {filename}")
+            return filename
+        except asyncio.TimeoutError:
+            print(f"[TelegramBot] ⏱ Timeout generando voz tras {time.time()-t0:.1f}s")
+            return None
+        except Exception as e:
+            print(f"[TelegramBot] ⚠️ Error generando voz: {e}")
+            return None
+
+    async def _send_voice(self, file_path: str) -> bool:
+        """Send a voice note file to Telegram; remove file afterwards."""
+        if not file_path or not os.path.exists(file_path):
+            return False
+        if os.path.getsize(file_path) == 0:
+            try:
+                os.remove(file_path)
+            except OSError:
+                pass
+            return False
+        try:
+            url = API_BASE.format(token=self.token, method="sendVoice")
+            data = aiohttp.FormData()
+            data.add_field("chat_id", self.chat_id)
+            # Read entire file into memory before sending to avoid file-lifetime issues
+            with open(file_path, "rb") as f:
+                voice_bytes = f.read()
+            data.add_field("voice", voice_bytes, filename="voice.ogg", content_type="audio/ogg")
+            async with self._session.post(url, data=data) as resp:
+                j = await resp.json()
+                ok = j.get("ok", False)
+                if not ok:
+                    print(f"[TelegramBot] ⚠️ sendVoice falló: {j.get('description', '?')}")
+                return ok
+        except (asyncio.TimeoutError, aiohttp.ClientError, OSError) as e:
+            print(f"[TelegramBot] ⚠️ Error enviando voz: {e}")
+            return False
+        finally:
+            try:
+                os.remove(file_path)
+            except OSError:
+                pass
+
+    async def _voice_pipeline(self, raw_text: str):
+        """Background pipeline: generate audio → send → clean up.
+        
+        Generates FIRST (fully on disk), THEN sends. Never partial.
+        """
+        file_path = await self._generate_voice_audio(raw_text)
+        if file_path:
+            await self._send_voice(file_path)
+
+    # ── sendMessage with optional voice ─────────────────────────────────
+
+    async def _send(self, text: str, kb=None, parse_mode="HTML", voice=False):
         payload = {"chat_id": self.chat_id, "text": self._markdown_to_html(text)}
         if parse_mode:
             payload["parse_mode"] = parse_mode
@@ -1300,7 +1454,6 @@ class TelegramBot:
         result = await self._api_call("sendMessage", **payload)
         if not result.get("ok"):
             desc = result.get("description", "")
-            # If HTML parsing failed, retry as plain text
             if parse_mode == "HTML" and "can't parse entities" in desc.lower():
                 payload.pop("parse_mode", None)
                 payload["text"] = self._html_escape(text)
@@ -1312,6 +1465,10 @@ class TelegramBot:
                 print(f"[TelegramBot] ⚠️ sendMessage falló: {desc}")
                 if "chat not found" in desc.lower():
                     print(f"[TelegramBot] 💡 TELEGRAM_CHAT_ID={self.chat_id} — el usuario debe enviar /start al bot primero")
+        else:
+            # Voice: fire-and-forget task, never blocks the text response
+            if voice:
+                asyncio.ensure_future(self._voice_pipeline(text))
         return result.get("ok", False)
 
     async def _edit(self, chat_id, message_id, text: str, kb=None, parse_mode="Markdown"):
@@ -1474,7 +1631,60 @@ class TelegramBot:
     # Command / button handlers
     # ──────────────────────────────────────────────────────────────────────────
 
+    async def _generate_welcome_image(self) -> Optional[bytes]:
+        """Create a professional welcome card with bot branding."""
+        try:
+            fig, ax = plt.subplots(figsize=(7, 3.5))
+            fig.patch.set_facecolor('#0d1117')
+            ax.set_facecolor('#0d1117')
+            ax.axis('off')
+
+            # Title
+            ax.text(0.5, 0.82, 'BB-450', fontsize=28, fontweight='bold',
+                    color='#00e676', ha='center', va='center', fontfamily='sans-serif')
+            ax.text(0.5, 0.68, 'TRADING BOT', fontsize=14, fontweight='bold',
+                    color='#8b949e', ha='center', va='center', fontfamily='sans-serif')
+
+            # Decorative line
+            ax.axhline(y=0.58, xmin=0.15, xmax=0.85, color='#30363d', linewidth=1)
+
+            # Description
+            desc = (
+                "Monitoreo en tiempo real de BTC/USDT\n"
+                "Analisis de order flow, delta, CVD y microestructura\n"
+                "Senales LONG/SHORT con IA (Gemini)\n"
+                "Deteccion de ballenas, trampas y spoofing\n"
+                "Reportes por voz con IA"
+            )
+            ax.text(0.5, 0.35, desc, fontsize=8.5, color='#c9d1d9',
+                    ha='center', va='center', fontfamily='sans-serif',
+                    linespacing=1.6)
+
+            # Footer
+            ax.text(0.5, 0.08, 'Creado por Sebastian Lara',
+                    fontsize=10, fontweight='bold', color='#f0883e',
+                    ha='center', va='center', fontfamily='sans-serif')
+
+            # Save to bytes
+            buf = io.BytesIO()
+            fig.savefig(buf, format='png', dpi=120, bbox_inches='tight',
+                        facecolor='#0d1117', edgecolor='none', pad_inches=0.3)
+            plt.close(fig)
+            buf.seek(0)
+            return buf.getvalue()
+        except Exception as e:
+            print(f"[TelegramBot] Error generando imagen de bienvenida: {e}")
+            return None
+
     async def _cmd_start(self):
+        # Send welcome image
+        welcome_img = await self._generate_welcome_image()
+        if welcome_img:
+            await self._send_photo(welcome_img, caption=(
+                f"\U0001f916 <b>BB-450</b> \u2014 Trading Bot\n"
+                f"\U0001f535 <code>{settings.SYMBOL}</code> en vivo | Creado por Sebasti\u00e1n Lara \u2728"
+            ))
+
         kb = _keyboard(
             _row(_btn("\U0001f4ca Info", "info"), _btn("\U0001f4e1 Signal", "signal"), _btn("\U0001f3c3 Scalp", "scalp")),
             _row(_btn("\U0001f50d Trampas", "trampas"), _btn("\U0001f52e Micro", "micro"), _btn("\U0001f4f7 Chart", "chart")),
@@ -1482,21 +1692,7 @@ class TelegramBot:
             _row(_btn("\U0001f514 Notificaciones", "alerts"), _btn("\U0001f7e2 LONG", "long"), _btn("\U0001f7e3 SHORT", "short")),
         )
         msg = (
-            "\U0001f916 <b>BB-450 Trading Bot</b>\n"
-            "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n\n"
-            "Monitoreo en tiempo real de <code>{}</code>\n\n"
-            "<b>COMANDOS:</b>\n"
-            "\U0001f4ca <b>Info</b> \u2014 Todos los indicadores\n"
-            "\U0001f4e1 <b>Signal</b> \u2014 Se\u00f1al actual + gr\u00e1fico velas\n"
-            "\U0001f3c3 <b>Scalp</b> \u2014 Scalping 1m\n"
-            "\U0001f50d <b>Trampas</b> \u2014 Narrativa institucional\n"
-            "\U0001f52e <b>Micro</b> \u2014 Microestructura cuantitativa\n"
-            "\U0001f4f7 <b>Chart</b> \u2014 Gr\u00e1fico velas\n"
-            "\U0001f9f9 <b>Estado</b> \u2014 Estado del bot\n"
-            "\U0001f514 <b>Notificaciones</b> \u2014 Configurar alertas\n"
-            "\u2699\ufe0f <b>Config</b> \u2014 Capital, riesgo, SL/TP\n"
-            "\U0001f7e2 <b>LONG</b> \u2014 Abrir LONG real con SL/TP\n"
-            "\U0001f7e3 <b>SHORT</b> \u2014 Abrir SHORT real con SL/TP\n"
+            "\U0001f447 <b>Usa los botones abajo</b> para comenzar"
         ).format(settings.SYMBOL)
         await self._send(msg, kb=kb)
 
@@ -1511,7 +1707,7 @@ class TelegramBot:
             ("\U0001f514 Notificaciones",),
         )
         return self._send(
-            "\U0001f447 <b>Botones rapidos</b> \u2014 toca para consultar datos o ejecutar",
+            "\U0001f447 <b>Botones r\u00e1pidos</b> \u2014 toca para consultar datos o ejecutar \u00f3rdenes",
             kb=rkb,
         )
 
@@ -1549,7 +1745,7 @@ class TelegramBot:
         sig = s.get('signal_text', 'WAIT'); conf = s.get('confidence', 0)
         rsi = s.get('rsi', 50); macd = s.get('macd', 0); mh = s.get('macd_hist', 0)
         bb = s.get('bb_position', 50); atr = s.get('atr', 0)
-        delta = s.get('delta', 0); cvd = s.get('cvd', 0); bv = s.get('buy_volume', 0); sv = s.get('sell_volume', 0)
+        delta = s.get('delta', 0); da = s.get('delta_accel', 0); cvd = s.get('cvd', 0); bv = s.get('buy_volume', 0); sv = s.get('sell_volume', 0)
         imb = s.get('imbalance', 0); ke = s.get('kaufman_eff', 0.5); ts = s.get('tick_speed', 0)
         trend_5m = s.get('trend_5m', 'WAIT'); trend_1h = s.get('trend_1h', 'WAIT')
         conf_score = s.get('confluence_score', 0); macro = s.get('global_macro', 'NEUTRAL')
@@ -1579,7 +1775,7 @@ class TelegramBot:
             f"  BB {bb_e} `{bb:.1f}%` | ATR `${atr:.2f}`",
             f"",
             f"<b>ORDER FLOW</b> \U0001f4c8",
-            f"  Delta {de} `{delta:.0f}` | CVD `{cvd:.0f}`",
+            f"  Delta {de} `{delta:.0f}` | Accel `{da:+.0f}` | CVD `{cvd:.0f}`",
             f"  Buy `{bv:.1f}` / Sell `{sv:.1f}` | Imb `{imb:+.3f}`",
             f"",
             f"<b>MICROESTRUCTURA</b> \U0001f52e",
@@ -1587,7 +1783,7 @@ class TelegramBot:
             f"",
             f"\u23f0 `{s.get('timestamp', '')}`",
         ]
-        await self._send("\n".join(lines))
+        await self._send("\n".join(lines), voice=True)
 
     async def _cmd_signal(self):
         s = self._state
@@ -1636,7 +1832,7 @@ class TelegramBot:
             f"  Confluencia: <code>{conf_score:.0f}%</code>",
             f"",
             f"<b>\U0001f4ca ORDER FLOW</b>",
-            f"  Delta {de}: <code>{delta:+.0f}</code> | CVD: <code>{cvd:+.0f}</code> | Acum: <code>{cum_delta:+.0f}</code>",
+            f"  Delta {de}: <code>{delta:+.0f}</code> | Accel: <code>{s.get('delta_accel', 0):+.0f}</code> | CVD: <code>{cvd:+.0f}</code> | Acum: <code>{cum_delta:+.0f}</code>",
             f"  B/A: <code>{ba:.3f}x</code> | Imb: <code>{imb:+.3f}</code> | Depth: <code>{depth:+.1f}%</code>",
             f"  Buy <code>{bv:.0f}</code> / Sell <code>{sv:.0f}</code> | {dom}",
             f"",
@@ -1705,26 +1901,34 @@ class TelegramBot:
                 )
 
     async def _cmd_alerts(self):
-        crash_on = self._user_config.get("crash", True)
-        bs_on = self._user_config.get("buy_sell", True)
-        vol_on = self._user_config.get("volume", True)
-        rsi_on = self._user_config.get("rsi", True)
+        cfg = self._user_config
+
+        entries = [
+            ("crash", "\U0001f4a5 Crash/Pump", f"Ca\u00edda/subida > {settings.ALERT_CRASH_PCT:.0f}% en 60s"),
+            ("buy_sell", "\U0001f4e1 Se\u00f1al Fuerte", "Confianza de se\u00f1al cambia \u226520%"),
+            ("volume", "\U0001f4ca Volumen Anormal", f"Pico > {settings.ALERT_VOLUME_SPIKE:.0f}x promedio"),
+            ("rsi", "\U0001f4c8 RSI Extremo", f"Sobrecompra > {settings.ALERT_RSI_OVERBOUGHT:.0f} / sobreventa < {settings.ALERT_RSI_OVERSOLD:.0f}"),
+            ("trend_change", "\U0001f3c6 Cambio Tendencia", "Trend cambia (alcista \u2194 bajista)"),
+            ("whale", "\U0001f40b Ballena", "Delta acumulado acelera > 100 en 5s"),
+            ("ai_trade", "\U0001f916 AI Trade Opp", "Confianza > 75% + AI confirma entrada"),
+        ]
+        active = sum(1 for v in cfg.values() if isinstance(v, bool) and v)
 
         kb = _keyboard(
-            _row(_btn(f"{'\u2705' if crash_on else '\u274c'} Crash {settings.ALERT_CRASH_PCT:.0f}%", "tog_crash")),
-            _row(_btn(f"{'\u2705' if bs_on else '\u274c'} Buy/Sell", "tog_buysell")),
-            _row(_btn(f"{'\u2705' if vol_on else '\u274c'} Volume Spike", "tog_volume")),
-            _row(_btn(f"{'\u2705' if rsi_on else '\u274c'} RSI Extremes", "tog_rsi")),
+            *[_row(_btn(f"{'\u2705' if cfg.get(k, True) else '\u274c'} {label}", f"tog_{k}"))
+              for k, label, _ in entries],
             _row(_btn("\U0001f504 Refresh", "refresh"), _btn("\U0001f519 Back", "start")),
         )
+        desc_lines = "\n".join(
+            f"{'\u2705' if cfg.get(k, True) else '\u274c'} <b>{label}</b>: {desc}"
+            for k, label, desc in entries
+        )
         msg = (
-            "\U0001f514 <b>Configuraci\u00f3n de Notificaciones</b>\n"
-            "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n\n"
-            "Toca cada opci\u00f3n para activar/desactivar:\n\n"
-            f"{'\u2705' if crash_on else '\u274c'} <b>Crash</b>: ca\u00edda > {settings.ALERT_CRASH_PCT:.0f}% en 60s\n"
-            f"{'\u2705' if bs_on else '\u274c'} <b>Buy/Sell</b>: nueva se\u00f1al LONG o SHORT\n"
-            f"{'\u2705' if vol_on else '\u274c'} <b>Volumen</b>: pico > {settings.ALERT_VOLUME_SPIKE:.0f}x promedio\n"
-            f"{'\u2705' if rsi_on else '\u274c'} <b>RSI</b>: sobrecompra > {settings.ALERT_RSI_OVERBOUGHT:.0f} / sobreventa < {settings.ALERT_RSI_OVERSOLD:.0f}"
+            "\U0001f514 <b>Notificaciones</b>\n"
+            "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n\n"
+            f"{active}/7 activas\n\n"
+            f"{desc_lines}\n\n"
+            "Toca cada opci\u00f3n para activar/desactivar."
         )
         await self._send(msg, kb=kb)
 
@@ -1923,11 +2127,15 @@ class TelegramBot:
         f_e = "\U0001f7e2" if force == "BUY" else "\U0001f7e3" if force == "SELL" else "\u26ab"
         sq_e = "\U0001f4a5" if bb_sq == "SQUEEZE" else "\u26ab"
 
-        # Scalping bias calculation
+        # Scalping bias calculation with acceleration
         imbalance_score = (imb * 50) + 50  # -1..+1 → 0..100
+        da = s.get('delta_accel', 0)
+        # Use acceleration as leading indicator, delta as confirmation
+        delta_accel_score = min(100, max(0, (da / max(abs(da) + 1, 1) * 50) + 50))
         delta_score = min(100, max(0, (delta / max(abs(delta) + 1, 1) * 50) + 50))
         vol_score = min(100, (bv / max(bv + sv, 0.001)) * 100)
-        bias = (imbalance_score * 0.35 + delta_score * 0.30 + vol_score * 0.20 + conf * 0.15)
+        bias = (imbalance_score * 0.25 + delta_accel_score * 0.30 +
+                delta_score * 0.15 + vol_score * 0.20 + conf * 0.10)
         scalp_dir = "LONG" if bias > 55 else "SHORT" if bias < 45 else "WAIT"
         strength = abs(bias - 50) * 2
 
@@ -1987,7 +2195,7 @@ class TelegramBot:
             f"  Uptime: `{uptime_str}`",
             f"  AI Win Rate: `{ai:.1f}%`",
             f"",
-            f"  Notificaciones: {sum(1 for v in self._user_config.values() if v)}/4 activas",
+            f"  Notificaciones: {sum(1 for v in self._user_config.values() if isinstance(v, bool) and v)}/7 activas",
         ]
         kb = _keyboard(_row(_btn("\U0001f504 Refresh", "refresh"), _btn("\U0001f519 Back", "start")))
         await self._send("\n".join(lines), kb=kb)
@@ -2230,7 +2438,7 @@ class TelegramBot:
                     await self._cmd_ai_help()
                 else:
                     reply = await self._typing_for(self._chat_gemini(user_q))
-                    await self._send(reply)
+                    await self._send(reply, voice=True)
                 return
             elif cmd == "/refresh":
                 await self._cmd_refresh()
@@ -2261,7 +2469,7 @@ class TelegramBot:
         wants_chart = any(kw in text.lower() for kw in ['chart', 'grafico', 'gráfico', 'vela', 'candle', 'precio', 'precios'])
         reply = await self._typing_for(self._chat_gemini(text))
         if reply:
-            await self._send(reply)
+            await self._send(reply, voice=True)
         if wants_chart:
             klines = await self._fetch_klines()
             if klines:
@@ -2328,13 +2536,13 @@ class TelegramBot:
             await self._cmd_config()
         elif data.startswith("tog_"):
             key = data.replace("tog_", "")
-            if key == "crash":
-                self._user_config["crash"] = not self._user_config["crash"]
-            elif key == "buysell":
-                self._user_config["buy_sell"] = not self._user_config["buy_sell"]
-            elif key == "volume":
-                self._user_config["volume"] = not self._user_config["volume"]
-            elif key == "rsi":
-                self._user_config["rsi"] = not self._user_config["rsi"]
+            key_map = {
+                "crash": "crash", "buysell": "buy_sell", "volume": "volume",
+                "rsi": "rsi", "trend_change": "trend_change",
+                "whale": "whale", "ai_trade": "ai_trade",
+            }
+            mapped = key_map.get(key, key)
+            if mapped in self._user_config:
+                self._user_config[mapped] = not self._user_config[mapped]
             await self._answer_cb(cb_id, "Configuración actualizada")
             await self._cmd_alerts()
