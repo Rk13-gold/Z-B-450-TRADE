@@ -15,7 +15,7 @@ import time
 import math
 import threading
 from collections import deque
-from typing import Dict, Optional
+from typing import Dict, Optional, Any
 
 import aiohttp
 import numpy as np
@@ -93,12 +93,18 @@ class AsyncDataEngine:
         self._spread_history = deque(maxlen=200)
         self._order_diffs = deque(maxlen=500)
         self._oi_history = deque(maxlen=300)
+        self._tick_speed_history = deque(maxlen=300)  # 5 min @ 1s
+
+        # ── Circular buffers for indicator computation ──
+        self._klines_cache: list = []
+        self._ob_volume_history = deque(maxlen=1800)
 
         # ── Last-known-good cache ──
         self._last_oi = 0.0
         self._last_best_bid = 0.0
         self._last_best_ask = 0.0
         self._last_spread_ts = 0.0
+        self._last_price = 0.0
 
     # ─────────────────────────────────────────────────────────────
     # Lifecycle
@@ -131,6 +137,10 @@ class AsyncDataEngine:
             timeout=aiohttp.ClientTimeout(total=10)
         ) as session:
             tasks = [
+                asyncio.create_task(self._poll_price(session)),
+                asyncio.create_task(self._poll_klines_and_indicators(session)),
+                asyncio.create_task(self._poll_trades(session)),
+                asyncio.create_task(self._poll_order_book_light(session)),
                 asyncio.create_task(self._poll_open_interest(session)),
                 asyncio.create_task(self._poll_mtf_indicators(session)),
                 asyncio.create_task(self._poll_deep_book(session)),
@@ -138,6 +148,226 @@ class AsyncDataEngine:
                 asyncio.create_task(self._compute_hft_metrics()),
             ]
             await asyncio.gather(*tasks, return_exceptions=True)
+
+    # ─────────────────────────────────────────────────────────────
+    # 0. PRICE TICKER (every 1s)
+    # ─────────────────────────────────────────────────────────────
+    async def _poll_price(self, session: aiohttp.ClientSession):
+        url = f"{BASE_URL}/fapi/v1/ticker/price"
+        while self._running:
+            try:
+                async with session.get(url, params={"symbol": self.symbol}) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        p = float(data.get("price", 0))
+                        old = self._last_price
+                        self.market_state["price"] = p
+                        self.market_state["last_price"] = old or p
+                        self.market_state["change_pct"] = ((p - old) / max(old, 0.0001)) * 100 if old > 0 else 0
+                        self._last_price = p
+                    elif resp.status == 429:
+                        await asyncio.sleep(5)
+            except Exception:
+                pass
+            await asyncio.sleep(1.0)
+
+    # ─────────────────────────────────────────────────────────────
+    # 0b. KLINES + INDICATORS (every 1s)
+    # ─────────────────────────────────────────────────────────────
+    async def _poll_klines_and_indicators(self, session: aiohttp.ClientSession):
+        url = f"{BASE_URL}/fapi/v1/klines"
+        while self._running:
+            try:
+                async with session.get(url, params={"symbol": self.symbol, "interval": "1m", "limit": 200}) as resp:
+                    if resp.status == 200:
+                        klines = await resp.json()
+                        self._klines_cache = klines
+                        self.market_state["klines"] = klines
+
+                        closes = [float(k[4]) for k in klines]
+                        highs = [float(k[2]) for k in klines]
+                        lows = [float(k[3]) for k in klines]
+                        volumes = [float(k[5]) for k in klines]
+
+                        ind = {}
+
+                        # VWAP
+                        typical = [(highs[i] + lows[i] + closes[i]) / 3 for i in range(len(klines))]
+                        cum_pv = sum(typical[i] * volumes[i] for i in range(len(klines)))
+                        cum_v = sum(volumes)
+                        ind["vwap"] = cum_pv / cum_v if cum_v > 0 else 0
+
+                        ind["day_high"] = max(highs[-100:]) if len(highs) >= 100 else max(highs)
+                        ind["day_low"] = min(lows[-100:]) if len(lows) >= 100 else min(lows)
+
+                        p = self.market_state.get("price", closes[-1])
+                        if ind["vwap"] > 0:
+                            ind["price_vwap_dist"] = ((p - ind["vwap"]) / ind["vwap"]) * 100
+
+                        ind["ema_20"] = float(np.mean(closes[-20:])) if len(closes) >= 20 else 0
+                        ind["ema_50"] = float(np.mean(closes[-50:])) if len(closes) >= 50 else ind["ema_20"]
+
+                        sma20 = float(np.mean(closes[-20:]))
+                        std = float(np.std(closes[-20:]))
+                        ind["bb_upper"] = sma20 + 2 * std
+                        ind["bb_middle"] = sma20
+                        ind["bb_lower"] = sma20 - 2 * std
+                        if ind["bb_upper"] != ind["bb_lower"]:
+                            ind["bb_position"] = ((closes[-1] - ind["bb_lower"]) / (ind["bb_upper"] - ind["bb_lower"])) * 100
+                        else:
+                            ind["bb_position"] = 50.0
+
+                        ind["rsi"] = calc_rsi(np.array(closes))
+                        macd_l, macd_s, macd_h = calc_macd(np.array(closes))
+                        ind["macd"] = macd_l
+                        ind["macd_signal"] = macd_s
+                        ind["macd_hist"] = macd_h
+
+                        trs = []
+                        for i in range(1, len(klines)):
+                            h = float(klines[i][2]); l = float(klines[i][3])
+                            pc = float(klines[i-1][4])
+                            trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+                        ind["atr"] = sum(trs[-14:]) / 14 if len(trs) >= 14 else 0
+
+                        ind["avg_volume"] = float(np.mean(volumes[-20:])) if len(volumes) >= 20 else 0
+
+                        # Trend
+                        if ind["ema_20"] > ind["ema_50"]:
+                            ind["trend"] = "ALCISTA"
+                        elif ind["ema_20"] < ind["ema_50"]:
+                            ind["trend"] = "BAJISTA"
+                        else:
+                            ind["trend"] = "NEUTRAL"
+
+                        self.market_state["indicators"] = ind
+
+                        # ── Signal ──
+                        signal = "NINGUNA"
+                        lc = 0
+                        if ind["rsi"] < 30: lc += 1
+                        if ind["bb_position"] < 20: lc += 1
+                        if ind["macd"] > ind["macd_signal"] and ind["macd_hist"] > 0: lc += 1
+                        if self.market_state.get("order_flow", {}).get("delta", 0) > 100: lc += 1
+                        if ind["trend"] == "ALCISTA": lc += 1
+                        sc = 0
+                        if ind["rsi"] > 70: sc += 1
+                        if ind["bb_position"] > 80: sc += 1
+                        if ind["macd"] < ind["macd_signal"] and ind["macd_hist"] < 0: sc += 1
+                        if self.market_state.get("order_flow", {}).get("delta", 0) < -100: sc += 1
+                        if ind["trend"] == "BAJISTA": sc += 1
+                        if lc >= 3: signal = "COMPRA"
+                        elif sc >= 3: signal = "VENTA"
+                        self.market_state["signal"] = signal
+
+                    elif resp.status == 429:
+                        await asyncio.sleep(5)
+            except Exception:
+                pass
+            await asyncio.sleep(1.0)
+
+    # ─────────────────────────────────────────────────────────────
+    # 0c. TRADES + ORDER FLOW (every 1s)
+    # ─────────────────────────────────────────────────────────────
+    async def _poll_trades(self, session: aiohttp.ClientSession):
+        from src.engine.order_flow import order_flow_engine
+        url = f"{BASE_URL}/fapi/v1/aggTrades"
+        while self._running:
+            try:
+                async with session.get(url, params={"symbol": self.symbol, "limit": 50}) as resp:
+                    if resp.status == 200:
+                        trades = await resp.json()
+                        self.market_state["trades"] = trades
+
+                        for t in trades[:20]:
+                            order_flow_engine.add_trade({
+                                "time": int(t["T"]),
+                                "price": float(t["p"]),
+                                "quantity": float(t["q"]),
+                                "is_buyer_maker": t["m"],
+                            })
+
+                        delta_info = order_flow_engine.calculate_delta()
+                        of = self.market_state.get("order_flow", {})
+                        of["delta"] = delta_info.get("delta", 0)
+                        of["cvd"] = order_flow_engine.cumulative_delta
+                        of["buy_volume"] = delta_info.get("buy_volume", 0)
+                        of["sell_volume"] = delta_info.get("sell_volume", 0)
+
+                    elif resp.status == 429:
+                        await asyncio.sleep(5)
+            except Exception:
+                pass
+            await asyncio.sleep(1.0)
+
+    # ─────────────────────────────────────────────────────────────
+    # 0d. ORDER BOOK + WHALE WALLS (every 1s)
+    # ─────────────────────────────────────────────────────────────
+    async def _poll_order_book_light(self, session: aiohttp.ClientSession):
+        url = f"{BASE_URL}/fapi/v1/depth"
+        while self._running:
+            try:
+                async with session.get(url, params={"symbol": self.symbol, "limit": 20}) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        self.market_state["order_book"] = data
+
+                        # ── Whale wall detection via z-score ──
+                        bids = [(float(p), float(q)) for p, q in data.get("bids", [])]
+                        asks = [(float(p), float(q)) for p, q in data.get("asks", [])]
+
+                        all_qties = [q for _, q in bids] + [q for _, q in asks]
+                        if all_qties:
+                            self._ob_volume_history.extend(all_qties)
+
+                        z_threshold = 3.0
+                        min_samples = 30
+                        ob_max_z = 0.0
+                        if len(self._ob_volume_history) >= min_samples:
+                            arr = list(self._ob_volume_history)
+                            mean = sum(arr) / len(arr)
+                            variance = sum((x - mean) ** 2 for x in arr) / len(arr)
+                            std = variance ** 0.5 if variance > 0 else 1.0
+                            dynamic_min = mean + z_threshold * std
+                            # Track max z-score across all levels (for explosion trigger)
+                            for qty in all_qties:
+                                z = (qty - mean) / std if std > 0 else 0
+                                if z > ob_max_z:
+                                    ob_max_z = z
+                        else:
+                            dynamic_min = 10.0
+                        self.market_state["_ob_max_z_score"] = ob_max_z
+
+                        buy_walls = []
+                        sell_walls = []
+                        for price, qty in bids:
+                            if qty >= dynamic_min:
+                                buy_walls.append({"price": price, "quantity": qty})
+                        for price, qty in asks:
+                            if qty >= dynamic_min:
+                                sell_walls.append({"price": price, "quantity": qty})
+                        buy_walls.sort(key=lambda x: x["quantity"], reverse=True)
+                        sell_walls.sort(key=lambda x: x["quantity"], reverse=True)
+
+                        total_buy = sum(w["quantity"] for w in buy_walls)
+                        total_sell = sum(w["quantity"] for w in sell_walls)
+                        imbalance = (total_buy - total_sell) / max(total_buy + total_sell + 0.001, 0.001)
+
+                        ww = {
+                            "buy_walls": buy_walls[:5],
+                            "sell_walls": sell_walls[:5],
+                            "total_buy_walls": total_buy,
+                            "total_sell_walls": total_sell,
+                            "imbalance": imbalance,
+                            "signal": "BUY_WALL" if imbalance > 0.3 else "SELL_WALL" if imbalance < -0.3 else "NEUTRAL",
+                        }
+                        self.market_state["whale_walls"] = ww
+
+                    elif resp.status == 429:
+                        await asyncio.sleep(5)
+            except Exception:
+                pass
+            await asyncio.sleep(1.0)
 
     # ─────────────────────────────────────────────────────────────
     # 1. OPEN INTEREST (every 1s)
@@ -339,7 +569,14 @@ class AsyncDataEngine:
 
             # Tick Speed: depth events in last 1s
             recent = [t for t in self._depth_events if t >= now - 1.0]
-            mom["tick_speed"] = len(recent) * 10  # extrapolate
+            tick_spd = len(recent) * 10
+            mom["tick_speed"] = tick_spd
+
+            # Rolling 5-min tick-speed history for explosion detection
+            self._tick_speed_history.append(tick_spd)
+            mom["tick_speed_avg_5m"] = (
+                sum(self._tick_speed_history) / len(self._tick_speed_history)
+            ) if self._tick_speed_history else 30.0
 
             # Order Cancel Rate: average from recent diffs
             recent_diffs = [d for d in self._order_diffs if d["ts"] >= now - 10]
@@ -370,5 +607,12 @@ class AsyncDataEngine:
             d_imb = lq.get("depth_imbalance", 0)
             cancel = mom.get("cancel_rate", 0)
             mom["pinam"] = min(1.0, (abs(d_imb) / 50 + cancel / 100) / 2)
+
+            # ── Volatility Explosion Sensor ───────────────────────────
+            avg_5m = mom.get("tick_speed_avg_5m", 30)
+            tick_trigger = tick_spd > avg_5m * 3.0 and avg_5m > 5
+            # Individual order volume z-score > 3.5σ (checked in _poll_order_book_light)
+            ob_z_trigger = self.market_state.get("_ob_max_z_score", 0) > 3.5
+            mom["volatility_explosion"] = tick_trigger or ob_z_trigger
 
             await asyncio.sleep(1.0)

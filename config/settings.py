@@ -5,9 +5,14 @@ load_dotenv()
 
 
 class Settings:
+    # Testnet API (used when USE_TESTNET=True in order_executor)
     BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
     BINANCE_SECRET_KEY = os.getenv("BINANCE_SECRET_KEY", "")
     BINANCE_TESTNET = os.getenv("BINANCE_TESTNET", "True").lower() == "true"
+
+    # Real API (used when USE_TESTNET=False in order_executor)
+    BINANCE_REAL_API_KEY = os.getenv("BINANCE_REAL_API_KEY", "")
+    BINANCE_REAL_SECRET_KEY = os.getenv("BINANCE_REAL_SECRET_KEY", "")
     SYMBOL = os.getenv("SYMBOL", "BTCUSDT")
     LEVERAGE = int(os.getenv("LEVERAGE", "100"))
 
@@ -28,8 +33,6 @@ class Settings:
     TELEGRAM_ENABLED = os.getenv("TELEGRAM_ENABLED", "false").lower() == "true"
     ALERT_CRASH_PCT = float(os.getenv("ALERT_CRASH_PCT", "3.0"))
     ALERT_VOLUME_SPIKE = float(os.getenv("ALERT_VOLUME_SPIKE", "3.0"))
-    ALERT_RSI_OVERBOUGHT = float(os.getenv("ALERT_RSI_OVERBOUGHT", "75"))
-    ALERT_RSI_OVERSOLD = float(os.getenv("ALERT_RSI_OVERSOLD", "25"))
 
 
 settings = Settings()

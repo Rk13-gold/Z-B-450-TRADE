@@ -193,4 +193,10 @@ class BinanceClient:
         print("🔌 Conexiones WebSocket cerradas")
 
 
-binance_client = BinanceClient()
+try:
+    binance_client = BinanceClient()
+    print(f"[✅ BINANCE] Conectado a {'testnet' if settings.BINANCE_TESTNET else 'mainnet'}")
+except Exception as e:
+    print(f"[❌ BINANCE] No se pudo conectar a Binance API: {e}")
+    print("[⚠ BINANCE] Continuando sin conexión — las funciones de mercado no estarán disponibles")
+    binance_client = None

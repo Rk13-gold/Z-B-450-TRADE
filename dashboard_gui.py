@@ -4,6 +4,9 @@ import os
 import threading
 import time
 import subprocess
+import sqlite3
+import re
+from collections import deque
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -26,22 +29,31 @@ def play_notification_sound():
         pass
 
 
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QGridLayout, 
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QGridLayout,
                              QLabel, QFrame, QVBoxLayout, QHBoxLayout,
-                             QTabWidget, QShortcut, QPushButton, QOpenGLWidget)
-from PyQt5.QtCore import Qt, QTimer, QRectF, QPointF
-from PyQt5.QtGui import QFont, QColor, QPalette, QKeySequence, QPainter, QPen, QStaticText, QPixmap, QFontDatabase
+                             QTabWidget, QShortcut, QPushButton, QOpenGLWidget,
+                             QSplitter, QPlainTextEdit, QTextBrowser,
+                             QProgressBar, QSlider,
+                             QListWidget, QFileDialog)
+from PyQt5.QtCore import Qt, QTimer, QRectF, QPointF, QThread, pyqtSignal, QSettings
+from PyQt5.QtGui import QFont, QColor, QPalette, QKeySequence, QPainter, QPainterPath, QPen, QStaticText, QPixmap, QFontDatabase
 
 from binance.client import Client
 from config.settings import settings
 from src.engine.order_flow import order_flow_engine
 from src.telegram_bot import TelegramBot
+from src.engine.order_executor import OrderExecutor
 from src.engine.strategy import trading_strategy
 from src.engine.async_data_engine import AsyncDataEngine
 from src.database.supabase_manager import supabase_manager
+from src.engine.gemini_brain import GeminiBrainManager, GeminiTradingDecision
 
 
-client = Client(settings.BINANCE_API_KEY, settings.BINANCE_SECRET_KEY, testnet=False)
+try:
+    client = Client(settings.BINANCE_API_KEY, settings.BINANCE_SECRET_KEY, testnet=False)
+except Exception as e:
+    print(f"[DASHBOARD] ⚠ No se pudo conectar con Binance (python-binance): {e}")
+    client = None
 
 COLORS = {
     'background': '#000000',
@@ -649,13 +661,25 @@ class GalaxyOrderFlowChart(QOpenGLWidget):
         self.show_footprint_numbers = False
         
         # ── RENDERING CACHES ──
-        self.text_cache = {}  # Store QStaticText for numbers
-        self.bg_buffer = None  # Offscreen QPixmap back-buffer for static candles
-        self.last_buffer_state = None  # Hash to check if buffer needs redraw
+        self.text_cache = {}
+        self.bg_buffer = None
+        self.last_buffer_state = None
         
         # New State for Animations and Indicators
         self.entry_state = None
         self.visual_pulses = []
+        
+        # ── dPOC history (last 20 candles for dynamic coloring + trail) ──
+        self._dpoc_history = deque(maxlen=20)      # (price, timestamp)
+        self._dpoc_5m_ago = None                   # price from 5 candles back
+        
+        # ── EMA band pre-compute cache ──
+        self._ema9_cache: list[float] = []
+        self._ema21_cache: list[float] = []
+        self._ema_cache_hash = None                # invalidate when klines change
+        
+        # ── Imbalance circles buffer (pre-computed outside paintEvent) ──
+        self._imbalance_circles: list[dict] = []   # [{x, y, side, alpha}, ...]
         
         self.anim_timer = QTimer(self)
         self.anim_timer.timeout.connect(self.update)
@@ -913,6 +937,8 @@ class GalaxyOrderFlowChart(QOpenGLWidget):
         # Calculate Daily POC, VAH, VAL
         if self.session_profile:
             self.poc_price = max(self.session_profile.items(), key=lambda x: x[1])[0]
+            self._dpoc_history.append(self.poc_price)
+            self._dpoc_5m_ago = self._dpoc_history[-5] if len(self._dpoc_history) >= 5 else None
             total_vol = sum(self.session_profile.values())
             target_vol = total_vol * 0.70
             
@@ -1155,9 +1181,9 @@ class GalaxyOrderFlowChart(QOpenGLWidget):
             if min_p <= self.poc_price <= max_p:
                 poc_y = py(self.poc_price)
                 if vp_min_y <= poc_y <= vp_max_y:
-                    painter.setPen(QPen(QColor(0, 255, 102, 200), 2))
+                    painter.setPen(QPen(QColor(0, 255, 102, 60), 1, Qt.DotLine))
                     painter.drawLine(draw_rect.left(), int(poc_y), draw_rect.right() + vp_w, int(poc_y))
-                    painter.setPen(QColor(0, 255, 102))
+                    painter.setPen(QColor(0, 255, 102, 100))
                     painter.drawText(draw_rect.right() + vp_w - 40, int(poc_y) - 2, "dPOC")
                 
             if hasattr(self, 'vah') and min_p <= self.vah <= max_p:
@@ -1340,6 +1366,192 @@ class GalaxyOrderFlowChart(QOpenGLWidget):
         painter.end()
         return pm
 
+    def _precompute_ema_bands(self):
+        """Pre-compute EMA 9 and EMA 21 from cached klines.
+
+        Runs outside paintEvent; results stored in ``_ema9_cache`` and
+        ``_ema21_cache``.  Cache is invalidated whenever klines change
+        (checked via a simple kline-id hash).
+        """
+        if not self.klines or len(self.klines) < 3:
+            self._ema9_cache = []
+            self._ema21_cache = []
+            return
+
+        closes = [float(k[4]) for k in self.klines]
+        klines_id = hash(tuple(closes[-3:]))  # last 3 closes
+        if klines_id == self._ema_cache_hash and self._ema9_cache:
+            return  # cache is fresh
+
+        def ema(values: list[float], period: int) -> list[float]:
+            if len(values) < period:
+                return [values[-1]] * len(values)
+            k = 2.0 / (period + 1)
+            result = [values[0]]
+            for v in values[1:]:
+                result.append(v * k + result[-1] * (1.0 - k))
+            return result
+
+        self._ema9_cache = ema(closes, 9)
+        self._ema21_cache = ema(closes, 21)
+        self._ema_cache_hash = klines_id
+
+    def _precompute_imbalance_circles(self, nc, cw, draw_rect, min_p, max_p, py):
+        """Scan candles for volume/delta extremes and buffer circle draw data."""
+        circles = []
+        for idx in range(nc):
+            if idx not in self.trade_grid:
+                continue
+            bands = self.trade_grid[idx]
+            tb = sum(v['bid_vol'] for v in bands.values())
+            ta = sum(v['ask_vol'] for v in bands.values())
+            vol_mult = (tb + ta) / max(VOLUME_THRESHOLD, 0.001)
+            delta = ta - tb
+            if vol_mult > 3.0 or abs(delta) > 20:
+                x = draw_rect.left() + (idx * cw) + (cw * 0.5)
+                # Find POC price for this candle
+                max_v = 0.0
+                poc = 0.0
+                for bp, vols in bands.items():
+                    tot = vols['bid_vol'] + vols['ask_vol']
+                    if tot > max_v:
+                        max_v = tot
+                        poc = bp
+                if not (min_p <= poc <= max_p):
+                    continue
+                y = py(poc)
+                circles.append({
+                    'x': x, 'y': y,
+                    'side': 'BUY' if delta > 0 else 'SELL',
+                    'alpha': min(0.8, 0.3 + vol_mult * 0.1),
+                    'radius': min(20, 8 + vol_mult * 2),
+                })
+        self._imbalance_circles = circles
+
+    def _render_ema_cloud(self, painter, draw_rect, min_p, max_p, ps, h, nc, cw):
+        """Shaded band between EMA 9 and EMA 21 using a filled polygon.
+
+        Dark green (alpha 0.15) when EMA 9 > EMA 21 (bullish).
+        Dark purple (alpha 0.15) when EMA 9 < EMA 21 (bearish).
+        """
+        self._precompute_ema_bands()
+        if not self._ema9_cache or not self._ema21_cache:
+            return
+        if len(self._ema9_cache) < nc or len(self._ema21_cache) < nc:
+            return
+
+        def py(p):
+            return draw_rect.bottom() - ((p - min_p) / ps * h)
+
+        bullish = self._ema9_cache[-1] > self._ema21_cache[-1]
+        fill_color = QColor(0, 80, 40, 38) if bullish else QColor(80, 0, 100, 38)
+
+        # Build polygon: top edge = max(ema9, ema21), bottom = min(ema9, ema21)
+        path = QPainterPath()
+        first = True
+        for i in range(nc):
+            e9 = self._ema9_cache[i]
+            e21 = self._ema21_cache[i]
+            top = max(e9, e21)
+            bot = min(e9, e21)
+            if not (min_p <= top <= max_p or min_p <= bot <= max_p):
+                continue
+            x = draw_rect.left() + (i * cw) + (cw * 0.5)
+            y_top = py(top)
+            y_bot = py(bot)
+            if first:
+                path.moveTo(x, y_top)
+                first = False
+            else:
+                path.lineTo(x, y_top)
+        for i in range(nc - 1, -1, -1):
+            e9 = self._ema9_cache[i]
+            e21 = self._ema21_cache[i]
+            top = max(e9, e21)
+            bot = min(e9, e21)
+            if not (min_p <= top <= max_p or min_p <= bot <= max_p):
+                continue
+            x = draw_rect.left() + (i * cw) + (cw * 0.5)
+            y_bot = py(bot)
+            path.lineTo(x, y_bot)
+        path.closeSubpath()
+
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(fill_color)
+        painter.drawPath(path)
+
+    def _render_dpoc_dynamic(self, painter, draw_rect, min_p, max_p, ps, h):
+        """Dynamic dPOC line + dotted history trail.
+
+        Color: magenta (#A020F0) if current dPOC < 5‑min‑ago dPOC,
+               bright green (#00FF00) if current dPOC >= 5‑min‑ago dPOC.
+        """
+        if not hasattr(self, 'poc_price') or not self.poc_price:
+            return
+        if not (min_p <= self.poc_price <= max_p):
+            return
+
+        def py(p):
+            return draw_rect.bottom() - ((p - min_p) / ps * h)
+
+        y_poc = py(self.poc_price)
+
+        # Dynamic color based on 5‑min comparison
+        if self._dpoc_5m_ago is not None:
+            dpoc_color = (QColor(0xA0, 0x20, 0xF0)       # magenta when falling
+                          if self.poc_price < self._dpoc_5m_ago
+                          else QColor(0x00, 0xFF, 0x00))   # green when rising
+        else:
+            dpoc_color = QColor(0x00, 0xFF, 0x00)
+
+        # Main dPOC line
+        painter.setPen(QPen(dpoc_color, 2, Qt.SolidLine))
+        painter.drawLine(draw_rect.left(), int(y_poc),
+                         draw_rect.right(), int(y_poc))
+
+        # Label
+        painter.setPen(dpoc_color)
+        font = painter.font()
+        bold = QFont(font); bold.setBold(True); bold.setPointSize(8)
+        painter.setFont(bold)
+        painter.drawText(draw_rect.right() - 55, int(y_poc) - 4,
+                         f"dPOC ${self.poc_price:,.1f}")
+
+        # Dotted history trail (last 20 dPOC values)
+        if len(self._dpoc_history) >= 2:
+            trail_pen = QPen(QColor(dpoc_color.red(), dpoc_color.green(),
+                                     dpoc_color.blue(), 80), 1, Qt.DotLine)
+            painter.setPen(trail_pen)
+            n = len(self._dpoc_history)
+            for i in range(1, n):
+                prev = self._dpoc_history[i - 1]
+                curr = self._dpoc_history[i]
+                if not (min_p <= prev <= max_p and min_p <= curr <= max_p):
+                    continue
+                x1 = draw_rect.left() + int((i - 1) / n * draw_rect.width())
+                x2 = draw_rect.left() + int(i / n * draw_rect.width())
+                painter.drawLine(x1, int(py(prev)), x2, int(py(curr)))
+
+    def _render_imbalance_circles(self, painter, min_p, max_p, ps, h, draw_rect):
+        """Draw semi-transparent circles at imbalance/volume‑explosion points."""
+        def py(p):
+            return draw_rect.bottom() - ((p - min_p) / ps * h)
+
+        for circ in self._imbalance_circles:
+            x = circ['x']
+            y = circ['y']
+            r = circ['radius']
+            alpha = circ['alpha']
+            if circ['side'] == 'BUY':
+                color = QColor(0, 255, 102, int(alpha * 255))
+                glow = QColor(0, 255, 102, int(alpha * 80))
+            else:
+                color = QColor(0xA0, 0x20, 0xF0, int(alpha * 255))
+                glow = QColor(0xA0, 0x20, 0xF0, int(alpha * 80))
+            painter.setPen(QPen(color, 2))
+            painter.setBrush(glow)
+            painter.drawEllipse(QPointF(x, y), r, r)
+
     def paintEvent(self, event):
         super().paintEvent(event)
         if not self.klines or len(self.klines) < 2: return
@@ -1409,7 +1621,18 @@ class GalaxyOrderFlowChart(QOpenGLWidget):
 
         # Draw offscreen buffer
         painter.drawPixmap(0, 0, self.bg_buffer)
-        
+
+        # ── PREMIUM OVERLAYS (pre-computed buffers, drawn every frame) ──
+        # 1. Micro-trend cloud (EMA 9/21 band)
+        self._render_ema_cloud(painter, draw_rect, min_p, max_p, ps, h, nc, cw)
+
+        # 2. Dynamic dPOC line with color shift + history trail
+        self._render_dpoc_dynamic(painter, draw_rect, min_p, max_p, ps, h)
+
+        # 3. Imbalance circles (pre-computed in _precompute_imbalance_circles)
+        self._precompute_imbalance_circles(nc, cw, draw_rect, min_p, max_p, py)
+        self._render_imbalance_circles(painter, min_p, max_p, ps, h, draw_rect)
+
         # Draw volume bars ON TOP of candles
         self._render_volume_bars_on_candles(painter, draw_rect, cw, min_p, max_p, ps, h, base_font_size, font)
 
@@ -1959,11 +2182,18 @@ class TrendSignalBar(QFrame):
     def trigger_flash(self):
         self.flash_alpha = 255
         
-    def update_signal(self, direction, text):
+    def update_signal(self, direction, text, trap_text=None):
         if self.trend_direction != direction:
             self.trigger_flash()
         self.trend_direction = direction
         self.trend_text = text
+        self.trap_text = trap_text
+
+    def set_trap_mode(self, trap_text):
+        """Override banner with trap alert."""
+        self.trap_text = trap_text
+        self.trigger_flash()
+        self.update()
         
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -1975,29 +2205,54 @@ class TrendSignalBar(QFrame):
         
         # Base background
         painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor("#111"))
-        painter.drawRoundedRect(rect, 8, 8)
         
-        # Signal Background
-        a = int(120 + pulse * 60)
-        if self.trend_direction == "LONG":
-            color = QColor(0, 255, 102, a)
-        elif self.trend_direction == "SHORT":
-            color = QColor(187, 0, 255, a)
+        trap_active = getattr(self, 'trap_text', None) is not None and 'SIN TRAMPA' not in (self.trap_text or '')
+        
+        if trap_active:
+            # Trap mode: dark red background
+            a = int(160 + pulse * 60)
+            bg_color = QColor(139, 0, 0, a)
+            border_color = QColor(255, 215, 0, 200)
+            text_color = QColor(255, 255, 0)
+            painter.setBrush(bg_color)
+            painter.drawRoundedRect(rect, 8, 8)
+            # Gold border
+            painter.setPen(QPen(border_color, 2))
+            painter.drawRoundedRect(rect.adjusted(1, 1, -1, -1), 8, 8)
         else:
-            color = QColor(30, 30, 30, a)
-            
-        if self.flash_alpha > 0:
-            color = QColor(255, 255, 255, self.flash_alpha)
-            
-        painter.setBrush(color)
-        painter.drawRoundedRect(rect, 8, 8)
+            painter.setBrush(QColor("#111"))
+            painter.drawRoundedRect(rect, 8, 8)
+            # Signal Background
+            a = int(120 + pulse * 60)
+            if self.trend_direction == "LONG":
+                color = QColor(0, 255, 102, a)
+            elif self.trend_direction == "SHORT":
+                color = QColor(187, 0, 255, a)
+            else:
+                color = QColor(30, 30, 30, a)
+                
+            if self.flash_alpha > 0:
+                color = QColor(255, 255, 255, self.flash_alpha)
+                
+            painter.setBrush(color)
+            painter.drawRoundedRect(rect, 8, 8)
         
         # Text
         font = painter.font(); font.setBold(True); font.setPointSize(10); painter.setFont(font)
-        text_color = QColor("#ffcc00") if self.trend_direction == "NEUTRAL" else QColor("#fff")
+        
+        trap_active = getattr(self, 'trap_text', None) is not None and 'SIN TRAMPA' not in (self.trap_text or '')
+        
+        if trap_active:
+            text_color = QColor("#ffff00")
+            display_text = self.trap_text
+        elif self.trend_direction == "NEUTRAL":
+            text_color = QColor("#ffcc00")
+            display_text = self.trend_text
+        else:
+            text_color = QColor("#fff")
+            display_text = self.trend_text
         painter.setPen(text_color)
-        painter.drawText(rect, Qt.AlignCenter, self.trend_text)
+        painter.drawText(rect, Qt.AlignCenter, display_text)
 
 class OrderFlowBattleBar(QFrame):
     """Trend-synchronized battle bar.
@@ -2041,100 +2296,128 @@ class OrderFlowBattleBar(QFrame):
                       trend_1h='NEUTRAL', trend_4h='NEUTRAL',
                       delta=0, tick_speed=0, cancel_rate=0, pinam=0,
                       bb_squeeze='NORMAL', atr=0, spread_velocity=0,
-                      avg_volume=0):
+                      avg_volume=0, volatility_explosion=False):
         """Full synchronization with all market data.
-        
-        V4 — Scalping Professional:
-        - Order flow acceleration (delta velocity, tick acceleration)
-        - HFT toxicity filter (PINAM + cancel_rate)
-        - Volatility filter (BB squeeze + ATR)
-        - Spread velocity filter
-        - Dynamic thresholds based on ATR regime
-        - Redistributed weights: OF 50% | Micro 15% | MTF 15% | RSI 10% | Volatility 10%
+
+        V5 — Dynamic Order Flow Balance:
+        - Primary: 30-second rolling window of aggressive buy/sell ratio
+        - Secondary: weighted composite from order flow, micro, MTF, RSI, vol regime
+        - Volatility Explosion bypass: when institutional presence is detected,
+          all passive filters are suspended and signal is computed aggressively
         """
-        # ── CHOPPINESS / CONFLUENCE FILTER ────────────────────────────
-        if 40 <= confluence_score <= 60:
+        # ── 30-second rolling volume window (primary bar driver) ──────
+        if not hasattr(self, '_rolling_volume_30s'):
+            self._rolling_volume_30s = deque(maxlen=30)
+        self._rolling_volume_30s.append((buy_volume, sell_volume))
+        total_buy_30 = sum(b for b, _ in self._rolling_volume_30s)
+        total_sell_30 = sum(s for _, s in self._rolling_volume_30s)
+        vol_total = total_buy_30 + total_sell_30 + 0.001
+        rolling_buy_pct = (total_buy_30 / vol_total) * 100
+        self.target_buy_pct = rolling_buy_pct
+
+        # ── Volatility Explosion: bypass all passive filters ──────────
+        if volatility_explosion:
+            self._compute_signal(
+                buy_volume, sell_volume, imbalance, trend, rsi, cvd,
+                confluence_score, trend_1h, trend_4h,
+                delta, tick_speed, cancel_rate, pinam,
+                bb_squeeze, atr, spread_velocity,
+                override=True,
+            )
+            return
+
+        # ── CHOP ZONE / CONFLUENCE FILTER (soft: only suppress if 30s ratio is flat) ──
+        force_ratio = max(total_buy_30, total_sell_30) / vol_total
+        if 40 <= confluence_score <= 60 and force_ratio < 0.60:
             self.trend_direction = "NEUTRAL"
             self.confidence = 0
-            self.target_buy_pct = 50
             self.trend_label = "◆ CHOP ZONE — NO EDGE"
             return
 
-        # ── FILTER 1: HFT TOXICITY ────────────────────────────────────
-        # High cancel_rate + high PINAM = aggressive HFT manipulation
+        # ── HFT TOXICITY FILTER ──────────────────────────────────────
         if pinam > 0.25 and cancel_rate > 12:
             self.trend_direction = "NEUTRAL"
             self.confidence = 0
-            self.target_buy_pct = 50
             self.trend_label = "◆ HFT TOXIC — NO TRADE"
             return
 
-        # ── FILTER 2: VOLATILITY COMPRESSION ──────────────────────────
-        # BB Squeeze + low ATR = impending explosion, no directional edge
+        # ── VOLATILITY COMPRESSION ───────────────────────────────────
         if bb_squeeze == 'SQUEEZE' and atr > 0 and atr < 30:
             self.trend_direction = "NEUTRAL"
             self.confidence = 0
-            self.target_buy_pct = 50
             self.trend_label = "◆ BB SQUEEZE — WAIT EXPANSION"
             return
 
-        # ── FILTER 3: SPREAD VELOCITY ─────────────────────────────────
-        # Wide spreads kill scalping profitability
+        # ── SPREAD VELOCITY ──────────────────────────────────────────
         if spread_velocity > 100:
             self.trend_direction = "NEUTRAL"
             self.confidence = 0
-            self.target_buy_pct = 50
             self.trend_label = "◆ WIDE SPREAD — NO EDGE"
             return
-        spread_penalty = 0.8 if spread_velocity > 50 else 1.0
 
-        # ── COMPONENT SCORES (each 0-100, 50 = neutral) ───────────────
+        self._compute_signal(
+            buy_volume, sell_volume, imbalance, trend, rsi, cvd,
+            confluence_score, trend_1h, trend_4h,
+            delta, tick_speed, cancel_rate, pinam,
+            bb_squeeze, atr, spread_velocity,
+            override=False,
+        )
 
-        # 1. ORDER FLOW (50% total)
-        # 1a. Volume delta force (15%)
+    def _compute_signal(self, buy_volume, sell_volume, imbalance,
+                        trend, rsi, cvd,
+                        confluence_score, trend_1h, trend_4h,
+                        delta, tick_speed, cancel_rate, pinam,
+                        bb_squeeze, atr, spread_velocity,
+                        override=False):
+        """Weighted composite signal computation.
+
+        When *override* is True (volatility explosion), spread_penalty is
+        removed and ATR threshold is loosened to capture institutional flow.
+        """
+        spread_penalty = 0.8 if spread_velocity > 50 and not override else 1.0
+
+        # ── COMPONENT SCORES (0–100, 50 = neutral) ────────────────────
+
+        # 1a. Volume delta force
         total = buy_volume + sell_volume + 0.001
         vol_pct = (buy_volume / total) * 100
 
-        # 1b. Order book imbalance (10%)
+        # 1b. Order book imbalance
         ob_pct = (imbalance + 1) * 50
 
-        # 1c. CVD direction (10%)
+        # 1c. CVD direction
         if cvd > 50:    cvd_pct = 75
         elif cvd > 0:   cvd_pct = 60
         elif cvd < -50: cvd_pct = 25
         elif cvd < 0:   cvd_pct = 40
         else:           cvd_pct = 50
 
-        # 1d. Delta acceleration — velocity of order flow (15%)
+        # 1d. Delta acceleration
         if not hasattr(self, '_prev_delta'):
             self._prev_delta = delta
         delta_vel = delta - self._prev_delta
         self._prev_delta = delta
-        self.delta_accel = delta_vel  # exposed for snapshot
-        # delta_vel > 0 = acceleration buying, < 0 = acceleration selling
+        self.delta_accel = delta_vel
         if delta_vel > 20:       delta_pct = 80
         elif delta_vel > 5:      delta_pct = 65
         elif delta_vel < -20:    delta_pct = 20
         elif delta_vel < -5:     delta_pct = 35
         else:                    delta_pct = 50
 
-        # 2. MICROSTRUCTURE ACCELERATION (15% total)
-        # Tick speed acceleration
+        # 2. MICROSTRUCTURE ACCELERATION
         if not hasattr(self, '_prev_tick'):
             self._prev_tick = tick_speed
         tick_accel = tick_speed - self._prev_tick
         self._prev_tick = tick_speed
-        # High tick_speed + acceleration = directional urgency
         if tick_speed > 30 and tick_accel > 5:   micro_pct = 80
         elif tick_speed > 20 and tick_accel > 2: micro_pct = 65
         elif tick_speed > 30 and tick_accel < -5: micro_pct = 20
         elif tick_speed > 20 and tick_accel < -2: micro_pct = 35
         else:                                     micro_pct = 50
-        # Adjust by cancel_rate (high cancel = noise, reduce conviction)
         if cancel_rate > 20:      micro_pct = 50 + (micro_pct - 50) * 0.3
         elif cancel_rate > 12:    micro_pct = 50 + (micro_pct - 50) * 0.6
 
-        # 3. RSI — trend-adaptive (10%)
+        # 3. RSI
         if trend == 'ALCISTA':
             if rsi < 30:     rsi_pct = 80
             elif rsi < 40:   rsi_pct = 70
@@ -2154,7 +2437,7 @@ class OrderFlowBattleBar(QFrame):
             elif rsi > 60:   rsi_pct = 35
             else:            rsi_pct = 50
 
-        # 4. MTF (reduced to 15% for scalping)
+        # 4. MTF
         mtf_score = 50
         if trend_1h == 'ALCISTA':   mtf_score += 15
         elif trend_1h == 'BAJISTA': mtf_score -= 15
@@ -2162,33 +2445,32 @@ class OrderFlowBattleBar(QFrame):
         elif trend_4h == 'BAJISTA': mtf_score -= 5
         mtf_pct = max(0, min(100, mtf_score))
 
-        # 5. VOLATILITY REGIME (10%)
-        # ATR percentile-based score: low vol = wait, high vol = follow
-        if atr > 100:        vol_regime = 75  # high vol = strong trend
+        # 5. VOLATILITY REGIME
+        if atr > 100:        vol_regime = 75
         elif atr > 50:       vol_regime = 65
-        elif atr < 15:       vol_regime = 35  # too quiet, unreliable
+        elif atr < 15:       vol_regime = 35
         else:                vol_regime = 50
 
-        # ── COMPOSITE: weighted average ───────────────────────────────
-        # Weights: Vol 15% | OB 10% | CVD 10% | DeltaAccel 15% | Micro 15%
-        #          RSI 10% | MTF 15% | VolRegime 10%
+        # ── COMPOSITE ─────────────────────────────────────────────────
         raw_composite = (
             vol_pct * 0.15 + ob_pct * 0.10 + cvd_pct * 0.10 +
             delta_pct * 0.15 + micro_pct * 0.15 +
             rsi_pct * 0.10 + mtf_pct * 0.15 + vol_regime * 0.10
         )
-
-        # Apply spread penalty (reduces conviction when spread is wide)
         composite = 50 + (raw_composite - 50) * spread_penalty
-        self.target_buy_pct = composite
 
-        # ── DYNAMIC THRESHOLDS based on ATR ───────────────────────────
-        if atr > 70:       threshold = 65  # high vol needs stronger signal
-        elif atr < 20:     threshold = 58  # low vol, tighten threshold
-        else:              threshold = 62
+        # ── DYNAMIC THRESHOLDS ───────────────────────────────────────
+        if override:
+            threshold = 55  # looser threshold during explosion
+        elif atr > 70:
+            threshold = 65
+        elif atr < 20:
+            threshold = 58
+        else:
+            threshold = 62
 
-        # ── SIGNAL DECISION ───────────────────────────────────────────
-        self.confidence = abs(composite - 50) * 2  # 0-100
+        # ── SIGNAL ───────────────────────────────────────────────────
+        self.confidence = abs(composite - 50) * 2
         if composite > threshold:
             self.trend_direction = "LONG"
             self.trend_label = f"▲ GO LONG — {self.confidence:.0f}% FORCE"
@@ -2893,8 +3175,21 @@ class AIBracketWidget(QFrame):
         layout.addWidget(self.bar_bg)
         self.setLayout(layout)
 
-    def update_data(self, risk_panel, confidence, price, dpoc_price=None, orderbook_imb=0.0):
-        st = risk_panel["status"]
+    def update_data(self, risk_panel, confidence, price, dpoc_price=None, orderbook_imb=0.0, brain_bracket=None):
+        """Update panel — uses brain_bracket values when available."""
+        if brain_bracket and brain_bracket.get('sl', 0) != 0:
+            panel = {
+                "status": brain_bracket.get('status', risk_panel["status"]),
+                "trigger": brain_bracket.get('trigger', price),
+                "sl": brain_bracket.get('sl', 0),
+                "tp1": brain_bracket.get('tp1', 0),
+                "tp2": brain_bracket.get('tp2', 0),
+                "lot_size": brain_bracket.get('lot_size', 0),
+            }
+            st = panel["status"]
+        else:
+            panel = risk_panel
+            st = risk_panel["status"]
         self.labels["status"].setText(st)
         if st == "WAITING":
             color = COLORS['accent_gold']; bc = COLORS['text_secondary']
@@ -2918,41 +3213,41 @@ class AIBracketWidget(QFrame):
                 dpoc_offset = dpoc_dist * 0.5
         
         if st == "LONG":
-            sl_val = risk_panel.get("sl", 0)
+            sl_val = panel.get("sl", 0)
             if sl_val == 0 and dpoc_price > 0:
                 sl_val = dpoc_price - (price * 0.0025)
-            tp1_val = risk_panel.get("tp1", 0)
+            tp1_val = panel.get("tp1", 0)
             if tp1_val == 0 and dpoc_price > 0:
                 tp1_val = dpoc_price + (price * 0.005)
-            tp2_val = risk_panel.get("tp2", 0)
+            tp2_val = panel.get("tp2", 0)
             if tp2_val == 0:
                 tp2_val = price + (price * 0.015)
         elif st == "SHORT":
-            sl_val = risk_panel.get("sl", 0)
+            sl_val = panel.get("sl", 0)
             if sl_val == 0 and dpoc_price > 0:
                 sl_val = dpoc_price + (price * 0.0025)
-            tp1_val = risk_panel.get("tp1", 0)
+            tp1_val = panel.get("tp1", 0)
             if tp1_val == 0 and dpoc_price > 0:
                 tp1_val = dpoc_price - (price * 0.005)
-            tp2_val = risk_panel.get("tp2", 0)
+            tp2_val = panel.get("tp2", 0)
             if tp2_val == 0:
                 tp2_val = price - (price * 0.015)
         else:
-            sl_val = risk_panel.get("sl", 0)
-            tp1_val = risk_panel.get("tp1", 0)
-            tp2_val = risk_panel.get("tp2", 0)
+            sl_val = panel.get("sl", 0)
+            tp1_val = panel.get("tp1", 0)
+            tp2_val = panel.get("tp2", 0)
         
         for k, fmt, val in [("trigger", "${:,.2f}", price), ("sl", "${:,.2f}", sl_val), ("tp1", "${:,.2f}", tp1_val), ("tp2", "${:,.2f}", tp2_val)]:
             self.labels[k].setText(fmt.format(val) if val else "—")
             if val: self.labels[k].setStyleSheet(f"color: {COLORS['text_primary']}; font-weight: bold; font-size: 9px; border: none; background: transparent;")
         
-        lot = risk_panel.get("lot_size", 0)
+        lot = panel.get("lot_size", 0)
         self.labels["lot"].setText(f"{lot:.4f} BTC" if lot else "—")
         if lot: self.labels["lot"].setStyleSheet(f"color: {COLORS['text_primary']}; font-weight: bold; font-size: 9px; border: none; background: transparent;")
         
         for k in ["sl", "tp1", "tp2", "trigger"]:
             if k in self.dist_bars and price > 0:
-                val = risk_panel.get(k, 0)
+                val = panel.get(k, 0)
                 if k == "trigger":
                     val = price
                 if val:
@@ -3402,11 +3697,20 @@ class MarketNarrativePanel(QFrame):
 
         # ── 2. INSTITUTIONAL POSITIONS ─────────────────────────────────────
         inst_html = ""
-        for p, q in whale_bids[:2]:
+        # Use z-score filtered walls from analyze_whale_walls() when available
+        ld_pre = state.get('liquidity_data', {})
+        if ld_pre and (ld_pre.get('buy_walls') or ld_pre.get('sell_walls')):
+            whale_bids_display = [(w['price'], w['quantity']) for w in ld_pre.get('buy_walls', [])]
+            whale_asks_display = [(w['price'], w['quantity']) for w in ld_pre.get('sell_walls', [])]
+        else:
+            whale_bids_display = whale_bids
+            whale_asks_display = whale_asks
+
+        for p, q in whale_bids_display[:2]:
             inst_html += (f"<div style='background:#002233; padding:3px 5px; margin:2px; border-left:3px solid #00ff66; border-radius:2px;'>"
                           f"<b style='color:#00ff66;'>🐋 BID {q:.1f}₿</b> "
                           f"<span style='color:#aaa;'>@ ${p:,.0f}</span></div>")
-        for p, q in whale_asks[:2]:
+        for p, q in whale_asks_display[:2]:
             inst_html += (f"<div style='background:#1a0033; padding:3px 5px; margin:2px; border-left:3px solid #bb00ff; border-radius:2px;'>"
                           f"<b style='color:#bb00ff;'>🐋 ASK {q:.1f}₿</b> "
                           f"<span style='color:#aaa;'>@ ${p:,.0f}</span></div>")
@@ -3423,24 +3727,43 @@ class MarketNarrativePanel(QFrame):
         self.lbl_inst.setText(inst_html)
 
         # ── 3. LIQUIDITY TRAPS ─────────────────────────────────────────────
-        # Trap = large wall on one side + CVD divergence against that side
+        # Trap = large wall on one side + CVD divergence + HFT confluency
         trap_html = ""
-        bid_wall_near = whale_bids[0] if whale_bids else None
-        ask_wall_near = whale_asks[0] if whale_asks else None
 
-        # Bid trap: big bid wall but CVD falling (selling into support)
-        if bid_wall_near and cvd < -2 and delta < 0:
-            trap_html += (f"<div style='background:#1a0808; padding:4px 5px; margin:2px; border-left:3px solid #FF2244; border-radius:2px;'>"
-                          f"<b style='color:#FF2244;'>🔴 TRAMPA ALCISTA</b><br>"
-                          f"<span style='color:#aaa; font-size:10px;'>Muro BID {bid_wall_near[1]:.1f}₿ @ ${bid_wall_near[0]:,.0f} con CVD bajista — posible stop hunt abajo</span>"
-                          f"</div>")
+        # Read HFT metrics from state (passed from dashboard)
+        cancel_rate_narr = state.get('cancel_rate', 0.0)
+        depth_imb_narr = state.get('depth_imb_pct', 0.0)
+        tick_speed_narr = state.get('tick_speed', 0)
+        delta_vel_narr = state.get('delta_accel', 0)
 
-        # Ask trap: big ask wall but CVD rising (buying into resistance)
-        if ask_wall_near and cvd > 2 and delta > 0:
-            trap_html += (f"<div style='background:#0a1a08; padding:4px 5px; margin:2px; border-left:3px solid #FF2244; border-radius:2px;'>"
-                          f"<b style='color:#FF2244;'>🔴 TRAMPA BAJISTA</b><br>"
-                          f"<span style='color:#aaa; font-size:10px;'>Muro ASK {ask_wall_near[1]:.1f}₿ @ ${ask_wall_near[0]:,.0f} con CVD alcista — posible fakeout arriba</span>"
-                          f"</div>")
+        # Use z-score filtered walls for trap detection
+        bid_wall_near = whale_bids_display[0] if whale_bids_display else None
+        ask_wall_near = whale_asks_display[0] if whale_asks_display else None
+
+        # Trap OFF conditions
+        if bid_wall_near or ask_wall_near:
+            has_wall_narr = True
+            cancel_ok = cancel_rate_narr > 55.0
+            depth_ok = abs(depth_imb_narr) > 45.0
+            tick_brake = abs(delta_vel_narr) * 10 > 500 and tick_speed_narr < 15
+
+            if not cancel_ok or not depth_ok:
+                # Legitimate S/R — mark as operational
+                pass
+            elif cancel_ok and depth_ok and tick_brake:
+                # Bid trap: big bid wall but CVD falling (selling into support)
+                if bid_wall_near and cvd < -2 and delta < 0:
+                    trap_html += (f"<div style='background:#1a0808; padding:4px 5px; margin:2px; border-left:3px solid #FF2244; border-radius:2px;'>"
+                                  f"<b style='color:#FF2244;'>🔴 TRAMPA ALCISTA</b><br>"
+                                  f"<span style='color:#aaa; font-size:10px;'>Muro BID {bid_wall_near[1]:.1f}₿ @ ${bid_wall_near[0]:,.0f} con CVD bajista — stop hunt en curso</span>"
+                                  f"</div>")
+
+                # Ask trap: big ask wall but CVD rising (buying into resistance)
+                if ask_wall_near and cvd > 2 and delta > 0:
+                    trap_html += (f"<div style='background:#0a1a08; padding:4px 5px; margin:2px; border-left:3px solid #FF2244; border-radius:2px;'>"
+                                  f"<b style='color:#FF2244;'>🔴 TRAMPA BAJISTA</b><br>"
+                                  f"<span style='color:#aaa; font-size:10px;'>Muro ASK {ask_wall_near[1]:.1f}₿ @ ${ask_wall_near[0]:,.0f} con CVD alcista — fakeout en curso</span>"
+                                  f"</div>")
 
         # Absorption: high vol + price not moving = absorption
         if ba_ratio > 0.7 and ba_ratio < 1.3 and total_vol > 5:
@@ -3517,6 +3840,165 @@ class MarketNarrativePanel(QFrame):
             self.trigger_flash(dec_color)
             self.last_state = new_state
 
+    def get_current_alert(self) -> str:
+        """Return the current trap alert text, or empty string if none."""
+        raw = self.lbl_traps.text()
+        if "TRAMPA" in raw.upper():
+            # Extract plain text — strip HTML
+            import re as _re
+            clean = _re.sub(r'<[^>]+>', '', raw).strip()
+            return clean
+        return ""
+
+
+class KnowledgeParserWorker(QThread):
+    """Background worker: scan, parse, clean .md files — EMIT-ONLY, no UI touch.
+    All results are communicated via Qt signals.
+
+    Signals
+    -------
+    progress_updated(int current, int total)
+    log_message(str text)
+    finished_with_data(list[str] blocks, list[str] filenames)
+    """
+
+    progress_updated = pyqtSignal(int, int)
+    log_message = pyqtSignal(str)
+    finished_with_data = pyqtSignal(list, list)
+
+    def __init__(self, folder_path: str):
+        super().__init__()
+        self.folder_path = folder_path
+
+    def run(self):
+        md_files: list[str] = []
+        md_filenames: list[str] = []
+        for f in os.listdir(self.folder_path):
+            if f.lower().endswith('.md'):
+                md_files.append(os.path.join(self.folder_path, f))
+                md_filenames.append(f)
+
+        if not md_files:
+            self.log_message.emit(
+                "[Lector MD] ⚠️ No se encontraron archivos .md "
+                "en la ruta seleccionada.")
+            self.finished_with_data.emit([], [])
+            return
+
+        self.log_message.emit(
+            f"[Lector MD] 📂 Escaneando {len(md_files)} archivos Markdown...")
+
+        all_blocks: list[str] = []
+        total = len(md_files)
+
+        for i, filepath in enumerate(md_files):
+            if self.isInterruptionRequested():
+                self.log_message.emit(
+                    "[Lector MD] ⛔ Procesamiento interrumpido por el usuario.")
+                break
+            filename = os.path.basename(filepath)
+            try:
+                with open(filepath, 'r', encoding='utf-8') as f:
+                    raw = f.read()
+                cleaned = raw
+                cleaned = re.sub(r'```[\s\S]*?```', '', cleaned)
+                cleaned = re.sub(r'#{1,6}\s+', '', cleaned)
+                cleaned = re.sub(r'\*\*(.*?)\*\*', r'\1', cleaned)
+                cleaned = re.sub(r'\*(.*?)\*', r'\1', cleaned)
+                cleaned = re.sub(r'`([^`]+)`', r'\1', cleaned)
+                cleaned = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', cleaned)
+                cleaned = re.sub(r'[>\-\*\+]\s+', '', cleaned)
+                cleaned = re.sub(r'!\[.*?\]\(.*?\)', '', cleaned)
+                cleaned = re.sub(r'\|.*?\|', '', cleaned)
+                cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+                cleaned = cleaned.strip()
+                blocks = [
+                    b.strip() for b in cleaned.split('\n\n')
+                    if b.strip() and len(b.strip()) > 30
+                ]
+                all_blocks.extend(blocks)
+                self.log_message.emit(
+                    f"  ✓ {filename}: {len(blocks)} bloques extraídos")
+            except Exception as e:
+                self.log_message.emit(f"  ✗ {filename}: error — {e}")
+            self.progress_updated.emit(i + 1, total)
+
+        self.log_message.emit(
+            f"[Cerebro Core] 🧠 {len(all_blocks)} bloques parseados. "
+            f"Transfiriendo al pipeline de inferencia...")
+        self.finished_with_data.emit(all_blocks, md_filenames)
+
+
+class BrainInferenceWorker(QThread):
+    """Background QThread for PyTorch brain inference.
+
+    Receives a market snapshot, runs ``infer_sync()`` in a secondary
+    thread so the UI event-loop is never blocked by tensor ops.
+    All results are emitted via ``inference_finished(dict)``.
+    """
+
+    inference_finished = pyqtSignal(dict)
+
+    def __init__(self, brain_agent, snapshot: dict,
+                 knowledge_blocks: list[str] | None = None,
+                 temperature: float = 0.5):
+        super().__init__()
+        self.brain_agent = brain_agent
+        self.snapshot = snapshot
+        self.knowledge_blocks = knowledge_blocks
+        self.temperature = temperature
+
+    def run(self):
+        try:
+            result = self.brain_agent.infer_sync(
+                self.snapshot,
+                knowledge_blocks=self.knowledge_blocks,
+                temperature=self.temperature,
+            )
+            self.inference_finished.emit(result)
+        except Exception as e:
+            print(f"[⚠️ BRAIN WORKER] Error en inferencia: {e}")
+            self.inference_finished.emit({})
+
+
+class GeminiInferenceWorker(QThread):
+    """Background QThread for Gemini 2.0 Flash inference.
+
+    Runs ``execute_inference()`` in its own temporary asyncio event-loop
+    so the UI thread is never blocked.  Emits a ``GeminiTradingDecision``
+    or ``None`` via ``gemini_finished``.
+
+    Supports inter-brain dialogue by receiving episodic_context and
+    pytorch_metrics from the quantum brain.
+    """
+
+    gemini_finished = pyqtSignal(object)
+
+    def __init__(self, gemini_brain: GeminiBrainManager,
+                 snapshot: dict,
+                 episodic_context: Optional[list] = None,
+                 pytorch_metrics: Optional[dict] = None):
+        super().__init__()
+        self.gemini_brain = gemini_brain
+        self.snapshot = snapshot
+        self.episodic_context = episodic_context
+        self.pytorch_metrics = pytorch_metrics
+
+    def run(self):
+        import asyncio
+        try:
+            result = asyncio.run(
+                self.gemini_brain.execute_inference(
+                    self.snapshot,
+                    episodic_context=self.episodic_context,
+                    pytorch_metrics=self.pytorch_metrics,
+                )
+            )
+            self.gemini_finished.emit(result)
+        except Exception as e:
+            print(f"[⚠️ GEMINI WORKER] Error en inferencia: {e}")
+            self.gemini_finished.emit(None)
+
 
 class MainDashboard(QMainWindow):
 
@@ -3524,31 +4006,109 @@ class MainDashboard(QMainWindow):
         super().__init__()
         self.data = {}
         self.running = True
+        self._refresh_busy = False
+
+        # Set leverage once at startup, never in the hot loop
+        try:
+            client.futures_change_leverage(symbol="BTCUSDT", leverage=100)
+        except Exception:
+            pass
+
+        # Window flags: hide title bar, keep minimize/maximize buttons
+        self.setWindowFlags(
+            Qt.Window | Qt.CustomizeWindowHint
+            | Qt.WindowMaximizeButtonHint | Qt.WindowMinimizeButtonHint
+        )
+
         self.init_ui()
         self.init_data()
         self.start_update_thread()
 
         self.telegram_bot = TelegramBot()
         self.telegram_bot.start()
+
+        # Wire up OrderExecutor (unified trade execution, REAL / TESTNET)
+        self.order_executor = OrderExecutor()
+        self.order_executor.order_result.connect(self._on_order_result)
+
+        # Wire up BrainAgent (Quantum Brain)
+        try:
+            from src.engine.quantum_brain import create_brain_agent
+            self.brain_agent = create_brain_agent(
+                telegram_queue=self.telegram_bot._queue,
+                load_model=True
+            )
+            print("[🧠 BRAIN CORE] BrainAgent inicializado con pipeline de inferencia.")
+        except Exception as e:
+            print(f"[⚠️ BRAIN] Error inicializando BrainAgent: {e}")
+            self.brain_agent = None
+
+        # Wire up GeminiBrain (LLM hybrid engine)
+        try:
+            self.gemini_brain = GeminiBrainManager()
+            if self.gemini_brain.is_enabled:
+                print(f"[🧠 GEMINI BRAIN] GeminiBrainManager inicializado "
+                      f"(modelo=gemini-2.0-flash)")
+            else:
+                print(f"[⚠️ GEMINI BRAIN] GeminiBrainManager deshabilitado — "
+                      f"sin GEMINI_API_KEY")
+        except Exception as e:
+            print(f"[⚠️ GEMINI BRAIN] Error inicializando: {e}")
+            self.gemini_brain = None
+
+        # Auto-load last knowledge base from SQLite on startup
+        self._load_persisted_knowledge_base()
+
+        # ── Auto-Learner ────────────────────────────────────────────────
+        try:
+            from src.engine.auto_learner import AutoLearner
+            self._auto_learner = AutoLearner(interval=30.0)
+            # Wire up raw genai.Client (not GeminiBrainManager wrapper)
+            if getattr(self, 'gemini_brain', None) is not None:
+                raw_client = getattr(self.gemini_brain, '_client', None)
+                self._auto_learner.set_gemini_client(raw_client)
+            from src.engine.episodic_memory import EpisodicMemory
+            self._auto_learner.set_episodic_memory(EpisodicMemory())
+        except Exception as e:
+            print(f"[⚠️ AUTO-LEARNER] Error: {e}")
+            self._auto_learner = None
+
+        # ── Brain inference throttle ────────────────────────────────────
+        self._last_brain_time: float = 0.0
+        self._last_candle_close: float = 0.0
+        self._brain_cooldown: float = 1.0          # seconds
+        self.brain_worker: BrainInferenceWorker | None = None
+        self._pending_brain_snapshot: dict | None = None
+        self._last_brain_decision: dict | None = None
+        self._prev_cvd: float = 0.0
+
+        # ── Gemini inference throttle ───────────────────────────────────
+        self._last_gemini_time: float = 0.0
+        self._gemini_cooldown: float = 3.0         # seconds — Gemini is slower
+        self.gemini_worker: GeminiInferenceWorker | None = None
+        self._last_gemini_decision: Optional['GeminiTradingDecision'] = None
+
+        # ── Episodic memory & training ──────────────────────────────────
+        self._last_retrain_time: float = 0.0
+        self._last_alert_snapshot: dict | None = None
+        self._last_alert_time: float = 0.0
+        self._journal_pending: bool = False
     
     def init_ui(self):
         self.panels = {}
         self.setWindowTitle("BB-450 REELS MODE")
         
-        # ═══════════════════════════════════════════════════════════════════════
-        # PRO MODE: 16:9 Horizontal Layout
-        # ═══════════════════════════════════════════════════════════════════════
-        screen = QApplication.instance().desktop().availableGeometry()
-        target_width = int(screen.width() * 0.92)
-        target_height = int(target_width * (9 / 16))
-        if target_height > screen.height() * 0.90:
-            target_height = int(screen.height() * 0.90)
-            target_width = int(target_height * (16 / 9))
-        
-        x = int((screen.width() - target_width) / 2)
-        y = int((screen.height() - target_height) / 2)
-        self.setGeometry(x, y, target_width, target_height)
+        # ── Adaptive screen sizing — full maximized ────────────────────
         self.setStyleSheet(f"background-color: #000000;")
+        self.setWindowState(Qt.WindowMaximized)
+        self.showMaximized()
+
+        # ── Keyboard shortcuts ─────────────────────────────────────────
+        self.shortcut_close = QShortcut(QKeySequence("Ctrl+C"), self)
+        self.shortcut_close.activated.connect(self.close_application_cleanly)
+
+        self.shortcut_escape = QShortcut(QKeySequence(Qt.Key_Escape), self)
+        self.shortcut_escape.activated.connect(self.lower_to_normal_window)
         
         central = QWidget()
         self.setCentralWidget(central)
@@ -3790,13 +4350,646 @@ class MainDashboard(QMainWindow):
         QShortcut(QKeySequence("F1"), self).activated.connect(lambda: self.tabs.setCurrentIndex(0))
         QShortcut(QKeySequence("F2"), self).activated.connect(lambda: self.tabs.setCurrentIndex(1))
         
+        # ─── TAB 3: QUANTUM BRAIN CONTROL PANEL ────────────────────────
+        tab3 = QWidget()
+        tab3_layout = QVBoxLayout()
+        tab3_layout.setContentsMargins(10, 10, 10, 10)
+        tab3_layout.setSpacing(8)
+
+        # ═══════════════════════════════════════════════════════════════════
+        # F3 — BRAIN OFFICE
+        # ═══════════════════════════════════════════════════════════════════
+
+        brain_title = QLabel("🧠 BRAIN OFFICE — CENTRAL DE CONOCIMIENTO")
+        brain_title.setStyleSheet(
+            f"color: {COLORS['accent_cyan']}; font-size: 16px; "
+            f"font-weight: bold; background: transparent; padding: 4px;")
+        brain_title.setAlignment(Qt.AlignCenter)
+        tab3_layout.addWidget(brain_title)
+
+        # ── KNOWLEDGE INGESTION ─────────────────────────────────────────
+        ingest_frame = QFrame()
+        ingest_frame.setStyleSheet(
+            f"background: rgba(10,10,20,0.95); "
+            f"border: 1px solid {COLORS['accent_cyan']}; border-radius: 6px;")
+        ingest_layout = QHBoxLayout()
+        ingest_layout.setContentsMargins(10, 8, 10, 8)
+        ingest_layout.setSpacing(8)
+
+        ingest_label = QLabel("📂 INGESTA DE CONOCIMIENTO")
+        ingest_label.setStyleSheet(
+            f"color: {COLORS['accent_cyan']}; font-size: 11px; "
+            f"font-weight: bold; border: none; background: transparent;")
+        ingest_layout.addWidget(ingest_label)
+
+        self.btn_load_knowledge = QPushButton("📂 CARGAR (.md)")
+        self.btn_load_knowledge.setStyleSheet(f"""
+            QPushButton {{
+                background: rgba(0, 255, 102, 0.1);
+                color: {COLORS['accent_cyan']};
+                border: 1px solid {COLORS['accent_cyan']};
+                border-radius: 4px; padding: 8px;
+                font-size: 11px; font-weight: bold;
+            }}
+            QPushButton:hover {{
+                background: rgba(0, 255, 102, 0.25);
+            }}
+            QPushButton:pressed {{
+                background: rgba(0, 255, 102, 0.35);
+            }}
+        """)
+        ingest_layout.addWidget(self.btn_load_knowledge)
+        ingest_layout.addStretch()
+
+        # ── Knowledge Index Stats ───────────────────────────────────────
+        kb_stats_label = QLabel("📊 KNOWLEDGE INDEX")
+        kb_stats_label.setStyleSheet(
+            f"color: {COLORS['accent_gold']}; font-size: 11px; "
+            f"font-weight: bold; border: none; background: transparent;")
+        ingest_layout.addWidget(kb_stats_label)
+
+        self._kb_blocks_label = QLabel("0 reglas")
+        self._kb_blocks_label.setStyleSheet(
+            f"color: {COLORS['accent_turquoise']}; font-size: 12px; "
+            f"font-weight: bold; border: none; background: transparent;")
+        self._kb_blocks_label.setFixedWidth(80)
+        ingest_layout.addWidget(self._kb_blocks_label)
+
+        self._kb_size_label = QLabel("0 KB")
+        self._kb_size_label.setStyleSheet(
+            f"color: {COLORS['text_secondary']}; font-size: 10px; "
+            f"border: none; background: transparent;")
+        self._kb_size_label.setFixedWidth(70)
+        ingest_layout.addWidget(self._kb_size_label)
+
+        self._kb_search_label = QLabel("⏱ —")
+        self._kb_search_label.setStyleSheet(
+            f"color: {COLORS['text_dim']}; font-size: 9px; "
+            f"border: none; background: transparent;")
+        self._kb_search_label.setFixedWidth(50)
+        ingest_layout.addWidget(self._kb_search_label)
+
+        ingest_frame.setLayout(ingest_layout)
+
+        # ── QSPLITTER: TWO-COLUMN LAYOUT ──────────────────────────────
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setHandleWidth(2)
+        splitter.setStyleSheet(f"""
+            QSplitter::handle {{
+                background: {COLORS['border_dim']};
+                width: 2px;
+            }}
+        """)
+
+        # LEFT PANEL: FILE EXPLORER
+        left_panel = QFrame()
+        left_panel.setStyleSheet(
+            f"background: rgba(10,10,20,0.95); "
+            f"border: 1px solid {COLORS['border_dim']}; border-radius: 6px;")
+        left_layout = QVBoxLayout()
+        left_layout.setContentsMargins(6, 6, 6, 6)
+        left_layout.setSpacing(4)
+
+        left_label = QLabel("📁 EXPLORADOR DE CONOCIMIENTO")
+        left_label.setStyleSheet(
+            f"color: {COLORS['accent_cyan']}; font-size: 10px; "
+            f"font-weight: bold; border: none; background: transparent;")
+        left_layout.addWidget(left_label)
+
+        self.brain_files_list = QListWidget()
+        self.brain_files_list.setStyleSheet(f"""
+            QListWidget {{
+                background: #050510;
+                color: {COLORS['text_secondary']};
+                border: 1px solid {COLORS['border_dim']};
+                border-radius: 4px;
+                font-family: 'Courier New', monospace;
+                font-size: 10px; padding: 4px;
+                outline: none;
+            }}
+            QListWidget::item {{
+                padding: 6px 8px;
+                border-bottom: 1px solid rgba(255,255,255,0.03);
+            }}
+            QListWidget::item:selected {{
+                background: rgba(0, 212, 255, 0.15);
+                color: {COLORS['accent_cyan']};
+                border-left: 3px solid {COLORS['accent_cyan']};
+            }}
+            QListWidget::item:hover {{
+                background: rgba(0, 212, 255, 0.06);
+            }}
+        """)
+        self.brain_files_list.setMinimumWidth(160)
+        left_layout.addWidget(self.brain_files_list)
+        left_panel.setLayout(left_layout)
+        splitter.addWidget(left_panel)
+
+        # RIGHT PANEL: CONTENT VIEWER + MONITOR + LOG
+        right_panel = QFrame()
+        right_panel.setStyleSheet(
+            f"background: rgba(10,10,20,0.95); "
+            f"border: 1px solid {COLORS['border_dim']}; border-radius: 6px;")
+        right_layout = QVBoxLayout()
+        right_layout.setContentsMargins(6, 6, 6, 6)
+        right_layout.setSpacing(6)
+
+        # Keep brain_content_viewer hidden (referenced by callbacks)
+        self.brain_content_viewer = QPlainTextEdit()
+        self.brain_content_viewer.setVisible(False)
+
+        # ── Dual AI Engine Monitor (expanded — visor de contenido eliminado) ──
+        ai_monitor_label = QLabel("🌌 MONITOR DE MOTORES (LSTM + GEMINI)")
+        ai_monitor_label.setStyleSheet(
+            f"color: {COLORS['accent_gold']}; font-size: 10px; "
+            f"font-weight: bold; border: none; background: transparent;")
+        right_layout.addWidget(ai_monitor_label)
+
+        self.ai_engines_monitor = QTextBrowser()
+        self.ai_engines_monitor.setOpenExternalLinks(False)
+        self.ai_engines_monitor.setStyleSheet(f"""
+            QTextBrowser {{
+                background: #0B0B0B;
+                color: {COLORS['text_secondary']};
+                border: 1px solid {COLORS['border_dim']};
+                border-radius: 4px;
+                font-family: 'Courier New', monospace;
+                font-size: 9px; padding: 6px;
+            }}
+        """)
+        self.ai_engines_monitor.setMinimumHeight(160)
+        right_layout.addWidget(self.ai_engines_monitor, stretch=3)
+
+        # ── Auto-Learner Log ───────────────────────────────────────────
+        learn_log_label = QLabel("🎓 AUTO-LEARNER LOG")
+        learn_log_label.setStyleSheet(
+            f"color: {COLORS['accent_turquoise']}; font-size: 10px; "
+            f"font-weight: bold; border: none; background: transparent;")
+        right_layout.addWidget(learn_log_label)
+
+        self._learning_log = QTextBrowser()
+        self._learning_log.setOpenExternalLinks(False)
+        self._learning_log.setStyleSheet(f"""
+            QTextBrowser {{
+                background: #080808;
+                color: {COLORS['text_dim']};
+                border: 1px solid {COLORS['border_dim']};
+                border-radius: 4px;
+                font-family: 'Courier New', monospace;
+                font-size: 9px; padding: 4px;
+            }}
+        """)
+        self._learning_log.setMinimumHeight(60)
+        self._learning_log.setMaximumHeight(120)
+        right_layout.addWidget(self._learning_log)
+
+        self.brain_console = QPlainTextEdit()
+        self.brain_console.setReadOnly(True)
+        self.brain_console.setMaximumBlockCount(200)
+        self.brain_console.setStyleSheet(f"""
+            QPlainTextEdit {{
+                background: #050510;
+                color: {COLORS['text_secondary']};
+                border: 1px solid {COLORS['border_dim']};
+                border-radius: 4px;
+                font-family: 'Courier New', monospace;
+                font-size: 10px; padding: 6px;
+            }}
+        """)
+        self.brain_console.setMinimumHeight(40)
+        right_layout.addWidget(self.brain_console, stretch=1)
+
+        self.brain_progress = QProgressBar()
+        self.brain_progress.setRange(0, 100)
+        self.brain_progress.setValue(0)
+        self.brain_progress.setTextVisible(True)
+        self.brain_progress.setStyleSheet(f"""
+            QProgressBar {{
+                background: #111;
+                border: 1px solid {COLORS['accent_cyan']};
+                border-radius: 3px; height: 18px;
+                text-align: center; font-size: 10px;
+                color: {COLORS['accent_cyan']};
+            }}
+            QProgressBar::chunk {{
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 {COLORS['accent_cyan']},
+                    stop:1 {COLORS['accent_turquoise']});
+                border-radius: 2px;
+            }}
+        """)
+        right_layout.addWidget(self.brain_progress)
+        right_panel.setLayout(right_layout)
+        splitter.addWidget(right_panel)
+        splitter.setSizes([250, 750])
+
+        # ── BRAIN PARAMETERS + AUTO-LEARNER TOGGLE ──────────────────────
+        params_frame = QFrame()
+        params_frame.setStyleSheet(
+            f"background: rgba(10,10,20,0.95); "
+            f"border: 1px solid {COLORS['accent_cyan']}; border-radius: 6px;")
+        params_layout = QHBoxLayout()
+        params_layout.setContentsMargins(10, 6, 10, 6)
+        params_layout.setSpacing(12)
+
+        # Temperature slider
+        temp_label = QLabel("🎛️ TEMP")
+        temp_label.setStyleSheet(
+            f"color: {COLORS['accent_cyan']}; font-size: 10px; "
+            f"font-weight: bold; border: none; background: transparent;")
+        params_layout.addWidget(temp_label)
+
+        self.temp_slider = QSlider(Qt.Horizontal)
+        self.temp_slider.setRange(0, 100)
+        self.temp_slider.setValue(50)
+        self.temp_slider.setFixedWidth(120)
+        self.temp_slider.setTickPosition(QSlider.TicksBelow)
+        self.temp_slider.setTickInterval(10)
+        self.temp_slider.setStyleSheet(f"""
+            QSlider::groove:horizontal {{
+                background: #222; height: 4px; border-radius: 2px;
+            }}
+            QSlider::handle:horizontal {{
+                background: {COLORS['accent_cyan']};
+                width: 12px; height: 12px;
+                margin: -4px 0; border-radius: 6px;
+            }}
+            QSlider::sub-page:horizontal {{
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #0044aa,
+                    stop:1 {COLORS['accent_cyan']});
+                border-radius: 2px;
+            }}
+        """)
+        params_layout.addWidget(self.temp_slider)
+
+        self.temp_value_label = QLabel("0.50")
+        self.temp_value_label.setStyleSheet(
+            f"color: {COLORS['accent_cyan']}; font-size: 11px; "
+            f"font-weight: bold; border: none; background: transparent;")
+        self.temp_value_label.setFixedWidth(36)
+        params_layout.addWidget(self.temp_value_label)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.VLine)
+        sep.setStyleSheet(f"color: {COLORS['border_dim']};")
+        sep.setFixedWidth(1)
+        params_layout.addWidget(sep)
+
+        # Brain stats
+        self._brain_latency_label = QLabel("⏱ —")
+        self._brain_latency_label.setStyleSheet(
+            f"color: {COLORS['text_secondary']}; font-size: 9px; "
+            f"border: none; background: transparent;")
+        params_layout.addWidget(self._brain_latency_label)
+
+        self._brain_acc_label = QLabel("🎯 —")
+        self._brain_acc_label.setStyleSheet(
+            f"color: {COLORS['text_secondary']}; font-size: 9px; "
+            f"border: none; background: transparent;")
+        params_layout.addWidget(self._brain_acc_label)
+
+        self._brain_mem_label = QLabel("💾 —")
+        self._brain_mem_label.setStyleSheet(
+            f"color: {COLORS['text_secondary']}; font-size: 9px; "
+            f"border: none; background: transparent;")
+        params_layout.addWidget(self._brain_mem_label)
+
+        params_layout.addStretch()
+
+        # Auto-Learner toggle
+        self._btn_auto_learn = QPushButton("🎓 AUTO-LEARN OFF")
+        self._btn_auto_learn.setCheckable(True)
+        self._btn_auto_learn.setStyleSheet(f"""
+            QPushButton {{
+                background: rgba(255, 255, 255, 0.05);
+                color: {COLORS['text_dim']};
+                border: 1px solid {COLORS['border_dim']};
+                border-radius: 4px; padding: 6px 12px;
+                font-size: 10px; font-weight: bold;
+            }}
+            QPushButton:checked {{
+                background: rgba(0, 255, 102, 0.15);
+                color: {COLORS['accent_turquoise']};
+                border: 1px solid {COLORS['accent_turquoise']};
+            }}
+            QPushButton:hover {{
+                background: rgba(0, 255, 102, 0.1);
+            }}
+        """)
+        params_layout.addWidget(self._btn_auto_learn)
+        params_frame.setLayout(params_layout)
+
+        self.brain_status = QLabel(
+            "🧠 CEREBRO CUÁNTICO: INACTIVO — Sin conocimiento cargado")
+        self.brain_status.setStyleSheet(
+            f"color: {COLORS['text_dim']}; font-size: 10px; "
+            f"background: transparent; padding: 2px;")
+        self.brain_status.setAlignment(Qt.AlignCenter)
+
+        # F3 layout assembly
+        tab3_layout.addWidget(ingest_frame)
+        tab3_layout.addWidget(splitter, stretch=1)
+        tab3_layout.addWidget(params_frame)
+        tab3_layout.addWidget(self.brain_status)
+
+        tab3.setLayout(tab3_layout)
+        self.tabs.addTab(tab3, "🧠 BRAIN (F3)")
+
+        # Keyboard shortcuts to switch tabs (F3 added)
+        QShortcut(QKeySequence("F3"), self).activated.connect(
+            lambda: self.tabs.setCurrentIndex(2))
+
+        # Wire up brain UI signals
+        self.btn_load_knowledge.clicked.connect(self._on_load_knowledge)
+        self.temp_slider.valueChanged.connect(self._on_temp_changed)
+        self.brain_files_list.itemClicked.connect(self._on_knowledge_file_selected)
+        self._btn_auto_learn.clicked.connect(self._on_toggle_auto_learn)
+        self._brain_worker: KnowledgeParserWorker | None = None
+        self._brain_knowledge_blocks: list[str] = []
+        self.brain_temperature: float = 0.50
+        self._brain_folder_path: str = ""
+
         central_layout = QVBoxLayout()
         central_layout.setContentsMargins(0, 0, 0, 0)
         central_layout.addWidget(self.tabs)
         central.setLayout(central_layout)
         
         self.indicator_widgets = {}
-    
+
+        # Restore last window geometry (size/position) if available
+        settings = QSettings("BB-450", "Dashboard")
+        geo = settings.value("window_geometry")
+        if geo is not None:
+            self.restoreGeometry(geo)
+
+    def closeEvent(self, event):
+        """Save window geometry on close."""
+        settings = QSettings("BB-450", "Dashboard")
+        settings.setValue("window_geometry", self.saveGeometry())
+        self.running = False
+        super().closeEvent(event)
+
+    # ── Brain control callbacks ─────────────────────────────────────────
+
+    def _on_load_knowledge(self):
+        """Open folder dialog → launch KnowledgeParserWorker (non-blocking)."""
+        initial_dir = os.path.join(os.getcwd(), "CONCMT")
+        if not os.path.isdir(initial_dir):
+            initial_dir = os.getcwd()
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Seleccionar Carpeta de Conocimiento (.md)",
+            initial_dir,
+            QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks)
+        if not folder:
+            print("[📂 SYSTEM] Selección de carpeta cancelada por el usuario.")
+            return
+
+        print(f"[📂 SYSTEM] Ruta seleccionada con éxito: {folder}")
+        self._brain_folder_path = folder
+
+        if self._brain_worker is not None:
+            self._brain_worker.requestInterruption()
+            self._brain_worker.deleteLater()
+            self._brain_worker = None
+
+        self.brain_console.clear()
+        self.brain_progress.setValue(0)
+        self.brain_status.setText(
+            "🧠 CEREBRO CUÁNTICO: INGIRIENDO CONOCIMIENTO...")
+        self.brain_status.setStyleSheet(
+            f"color: {COLORS['accent_cyan']}; font-size: 10px; "
+            f"background: transparent; padding: 2px;")
+        self.btn_load_knowledge.setEnabled(False)
+        self.brain_files_list.clear()
+        self.brain_content_viewer.clear()
+
+        self._brain_worker = KnowledgeParserWorker(folder)
+        self._brain_worker.progress_updated.connect(
+            self._on_brain_progress)
+        self._brain_worker.log_message.connect(self._on_brain_log)
+        self._brain_worker.finished_with_data.connect(
+            self._on_brain_data_ready)
+        self._brain_worker.start()
+
+    def _on_brain_data_ready(self, blocks: list, filenames: list):
+        """Atomic handoff from worker — runs in main thread via signal."""
+        self._brain_knowledge_blocks = blocks
+
+        self.brain_files_list.clear()
+        for fname in filenames:
+            self.brain_files_list.addItem(fname)
+
+        if blocks and getattr(self, 'brain_agent', None) is not None:
+            self.brain_agent.set_knowledge_blocks(blocks)
+            print(
+                f"[🧠 BRAIN CORE] Sincronización Exitosa: "
+                f"{len(blocks)} bloques de conocimiento "
+                f"vinculados al pipeline de inferencia.")
+
+        # Persist last knowledge base path to SQLite
+        if self._brain_folder_path:
+            try:
+                db_path = os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)),
+                    'bb450_trades.db')
+                conn = sqlite3.connect(db_path)
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS system_config "
+                    "(key TEXT PRIMARY KEY, value TEXT)")
+                conn.execute(
+                    "INSERT OR REPLACE INTO system_config (key, value) "
+                    "VALUES (?, ?)",
+                    ('last_knowledge_base', self._brain_folder_path))
+                conn.commit()
+                conn.close()
+            except Exception as e:
+                print(f"[⚠️ DB] Error persistiendo ruta de conocimiento: {e}")
+
+        if self._brain_worker is not None:
+            self._brain_worker.deleteLater()
+            self._brain_worker = None
+
+        self.btn_load_knowledge.setEnabled(True)
+        if blocks:
+            self.brain_status.setText(
+                f"🧠 CEREBRO CUÁNTICO: ACTIVO — "
+                f"{len(blocks)} reglas de bitácora cargadas")
+            self.brain_status.setStyleSheet(
+                f"color: {COLORS['accent_turquoise']}; font-size: 10px; "
+                f"background: transparent; padding: 2px;")
+            self.brain_progress.setValue(100)
+        else:
+            self.brain_status.setText(
+                "🧠 CEREBRO CUÁNTICO: INACTIVO — Sin conocimiento cargado")
+            self.brain_status.setStyleSheet(
+                f"color: {COLORS['text_dim']}; font-size: 10px; "
+                f"background: transparent; padding: 2px;")
+
+    def _on_brain_progress(self, current: int, total: int):
+        pct = int(current / max(total, 1) * 100)
+        self.brain_progress.setValue(pct)
+
+    def _on_brain_log(self, text: str):
+        self.brain_console.appendPlainText(text)
+
+    def _on_temp_changed(self, value: int):
+        temp = value / 100.0
+        self.brain_temperature = temp
+        self.temp_value_label.setText(f"{temp:.2f}")
+        if temp < 0.3:
+            hue = COLORS['accent_cyan']
+        elif temp < 0.7:
+            hue = COLORS['accent_gold']
+        else:
+            hue = COLORS['accent_magenta']
+        self.temp_value_label.setStyleSheet(
+            f"color: {hue}; font-size: 11px; font-weight: bold; "
+            f"border: none; background: transparent;")
+
+    def _on_toggle_auto_learn(self):
+        """Toggle Auto-Learner on/off."""
+        if self._auto_learner is None:
+            self._btn_auto_learn.setChecked(False)
+            return
+        enabled = self._auto_learner.toggle()
+        if enabled:
+            self._btn_auto_learn.setText("🎓 AUTO-LEARN ON")
+            self._btn_auto_learn.setChecked(True)
+            print("[🎓 AUTO-LEARNER] Activado")
+        else:
+            self._btn_auto_learn.setText("🎓 AUTO-LEARN OFF")
+            self._btn_auto_learn.setChecked(False)
+            print("[🎓 AUTO-LEARNER] Desactivado")
+
+    def _run_auto_learn_analysis(self, snapshot: dict):
+        """Run one auto-learn analysis cycle (non-blocking in main loop)."""
+        if self._auto_learner is None or not self._auto_learner.enabled:
+            return
+        if not self._auto_learner.should_analyze():
+            return
+        try:
+            brain = getattr(self, '_last_brain_decision', {}) or {}
+            brain_stats = self.brain_agent.get_stats() if getattr(self, 'brain_agent', None) else {}
+            memory = {}
+            try:
+                from src.engine.episodic_memory import EpisodicMemory
+                mem = EpisodicMemory()
+                memory = mem.stats()
+            except Exception:
+                pass
+            knowledge = {}
+            if getattr(self, 'brain_agent', None) is not None:
+                try:
+                    knowledge = self.brain_agent._knowledge_index.stats()
+                except Exception:
+                    pass
+            training = self.brain_agent.get_training_stats() if getattr(self, 'brain_agent', None) else {}
+
+            result = self._auto_learner.analyze(
+                snapshot, brain_stats, memory, knowledge, training
+            )
+            if result:
+                # Update the learning log widget
+                log_entries = self._auto_learner.get_log(15)
+                html = '<br>'.join(log_entries)
+                self._learning_log.setHtml(html)
+        except Exception as e:
+            print(f"[⚠️ AUTO-LEARN] Error en análisis: {e}")
+
+    def _update_brain_office(self):
+        """Refresh Brain Office metric labels every update cycle."""
+        # Knowledge Index stats
+        if getattr(self, 'brain_agent', None) is not None:
+            try:
+                kstats = self.brain_agent._knowledge_index.stats()
+                self._kb_blocks_label.setText(f"{kstats['blocks']} reglas")
+                self._kb_size_label.setText(f"{kstats['size_kb']} KB")
+            except Exception:
+                pass
+
+        # Brain agent stats
+        if getattr(self, 'brain_agent', None) is not None:
+            try:
+                stats = self.brain_agent.get_stats()
+                lat = stats.get('avg_latency_ms', 0)
+                self._brain_latency_label.setText(
+                    f"⏱ {lat:.0f}ms" if lat else "⏱ —")
+                acc = stats.get('avg_accuracy', 0)
+                self._brain_acc_label.setText(
+                    f"🎯 {acc:.1f}%" if acc else "🎯 —")
+                mem_s = stats.get('episodic_memory', {})
+                self._brain_mem_label.setText(
+                    f"💾 {mem_s.get('total_records', 0)} ev / "
+                    f"{mem_s.get('failed', 0)} F")
+            except Exception:
+                pass
+
+    def _on_knowledge_file_selected(self, item):
+        """Display content of the selected .md file in the viewer."""
+        if not self._brain_folder_path:
+            return
+        fname = item.text()
+        fpath = os.path.join(self._brain_folder_path, fname)
+        try:
+            with open(fpath, 'r', encoding='utf-8') as f:
+                content = f.read()
+            self.brain_content_viewer.setPlainText(content)
+        except Exception as e:
+            self.brain_content_viewer.setPlainText(
+                f"[ERROR] No se pudo leer {fname}: {e}")
+
+    def _load_persisted_knowledge_base(self):
+        """Auto-load last knowledge base from SQLite on startup."""
+        try:
+            db_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                'bb450_trades.db')
+            conn = sqlite3.connect(db_path)
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS system_config "
+                "(key TEXT PRIMARY KEY, value TEXT)")
+            cursor = conn.execute(
+                "SELECT value FROM system_config WHERE key = ?",
+                ('last_knowledge_base',))
+            row = cursor.fetchone()
+            conn.close()
+            if row is None:
+                return
+            folder = row[0]
+            if not os.path.isdir(folder):
+                print(f"[📂 SYSTEM] Ruta persistida no válida: {folder}")
+                return
+            print(f"[📂 SYSTEM] Auto-cargando base de conocimiento: {folder}")
+            self._brain_folder_path = folder
+            self.brain_files_list.clear()
+            self.brain_content_viewer.clear()
+            md_filenames = sorted(
+                f for f in os.listdir(folder)
+                if f.lower().endswith('.md'))
+            if not md_filenames:
+                print("[📂 SYSTEM] No hay archivos .md en la carpeta persistida.")
+                return
+            for fname in md_filenames:
+                self.brain_files_list.addItem(fname)
+            self.brain_status.setText(
+                f"🧠 CEREBRO CUÁNTICO: CARGANDO {len(md_filenames)} archivos...")
+            self.brain_status.setStyleSheet(
+                f"color: {COLORS['accent_cyan']}; font-size: 10px; "
+                f"background: transparent; padding: 2px;")
+            self.brain_progress.setValue(0)
+            self.btn_load_knowledge.setEnabled(False)
+            self._brain_worker = KnowledgeParserWorker(folder)
+            self._brain_worker.progress_updated.connect(
+                self._on_brain_progress)
+            self._brain_worker.log_message.connect(self._on_brain_log)
+            self._brain_worker.finished_with_data.connect(
+                self._on_brain_data_ready)
+            self._brain_worker.start()
+        except Exception as e:
+            print(f"[⚠️ SYSTEM] Error en auto-carga de conocimiento: {e}")
+
     def init_data(self):
         self.data = {
             'price': 0.0, 'price_change': 0.0, 'price_change_pct': 0.0,
@@ -3867,7 +5060,7 @@ class MainDashboard(QMainWindow):
         # Start the async data engine in background thread
         self._async_engine = AsyncDataEngine(self.market_state)
         self._async_engine.start()
-        
+
         self.update_data()
     
     def format_number(self, num, decimals=2):
@@ -3924,24 +5117,44 @@ class MainDashboard(QMainWindow):
         bids = order_book.get('bids', [])
         asks = order_book.get('asks', [])
         
+        # Collect all level quantities for z-score history
+        all_qties = [float(q) for _, q in bids] + [float(q) for _, q in asks]
+        if all_qties:
+            self._ob_volume_history.extend(all_qties)
+
+        # Compute z-score threshold from rolling distribution
+        z_threshold = 3.0
+        min_samples = 30
+        if len(self._ob_volume_history) >= min_samples:
+            arr = list(self._ob_volume_history)
+            mean = sum(arr) / len(arr)
+            variance = sum((x - mean) ** 2 for x in arr) / len(arr)
+            std = variance ** 0.5 if variance > 0 else 1.0
+            dynamic_min = mean + z_threshold * std
+        else:
+            # Cold start: use conservative absolute minimum (10 BTC) until history fills
+            dynamic_min = 10.0
+
         whale_buy_walls = []
         whale_sell_walls = []
         
         for price, qty in bids:
             qty_float = float(qty)
-            if qty_float >= 50:
+            if qty_float >= dynamic_min:
                 whale_buy_walls.append({
                     'price': float(price),
                     'quantity': qty_float,
+                    'z_score': ((qty_float - mean) / std) if len(self._ob_volume_history) >= min_samples and std > 0 else 0,
                     'total_usd': qty_float * float(price)
                 })
         
         for price, qty in asks:
             qty_float = float(qty)
-            if qty_float >= 50:
+            if qty_float >= dynamic_min:
                 whale_sell_walls.append({
                     'price': float(price),
                     'quantity': qty_float,
+                    'z_score': ((qty_float - mean) / std) if len(self._ob_volume_history) >= min_samples and std > 0 else 0,
                     'total_usd': qty_float * float(price)
                 })
         
@@ -4189,12 +5402,14 @@ class MainDashboard(QMainWindow):
         return signal
     
     def update_data(self):
-        try:
-            client.futures_change_leverage(symbol="BTCUSDT", leverage=100)
-        except:
-            pass
-        
-        klines = self.get_klines()
+        # Wait for first klines from AsyncDataEngine
+        klines = self.market_state.get("klines", [])
+        if not klines:
+            print("[⚠️ DATA] Esperando datos de AsyncDataEngine...")
+            self.update_timer = QTimer()
+            self.update_timer.timeout.connect(self.refresh_data)
+            self.update_timer.start(1000)
+            return
         for k in klines:
             kline = {'time': k[0], 'open': float(k[1]), 'high': float(k[2]),
                      'low': float(k[3]), 'close': float(k[4]), 'volume': float(k[5])}
@@ -4202,8 +5417,6 @@ class MainDashboard(QMainWindow):
         
         self.data['price'] = float(klines[-1][4])
         self.data['last_price'] = self.data['price']
-        self.data['klines'] = klines
-        self.calculate_all_indicators(klines)
         
         supabase_manager.connect()
         self.stats['db_connected'] = True
@@ -4213,190 +5426,647 @@ class MainDashboard(QMainWindow):
         self.update_timer.start(1000)
     
     def refresh_data(self):
-        if not self.running:
+        if not self.running or self._refresh_busy:
             return
-        
-        import time
-        start_time = time.time()
-        
-        self.data['price'] = self.get_price()
-        self.data['price_change'] = self.data['price'] - self.data['last_price']
-        
-        klines = self.get_klines()
-        self.data['klines'] = klines
-        self.stats['klines_count'] = len(klines)
-        self.calculate_all_indicators(klines)
-        
-        self.stats['latency_ms'] = int((time.time() - start_time) * 1000)
-        self.stats['update_count'] += 1
-        self.stats['last_update'] = time.strftime("%H:%M:%S")
-        self.stats['api_connected'] = self.data['price'] > 0
-        
-        if self.stats['start_time']:
-            self.stats['uptime_seconds'] = int(time.time() - self.stats['start_time'])
-        
+        self._refresh_busy = True
         try:
-            trades = self.get_trades()
+
+            import time
+            start_time = time.time()
+
+            # ── Read ALL pre-computed data from AsyncDataEngine (zero REST) ──
+            ms = self.market_state
+            ind = ms.get("indicators", {})
+            of = ms.get("order_flow", {})
+            lq = ms.get("liquidity", {})
+            mom = ms.get("momentum", {})
+            mtf = ms.get("mtf_trend", {})
+            ww = ms.get("whale_walls", {})
+
+            self.data['price'] = ms.get('price', self.data.get('price', 0))
+            self.data['last_price'] = ms.get('last_price', self.data.get('last_price', 0))
+            self.data['price_change'] = self.data['price'] - self.data['last_price']
+
+            klines = ms.get('klines', [])
+            self.data['klines'] = klines
+            self.stats['klines_count'] = len(klines)
+
+            # ── Copy indicators (pre-computed by AsyncDataEngine) ──
+            for key in ('rsi', 'macd', 'macd_signal', 'macd_hist',
+                         'bb_upper', 'bb_middle', 'bb_lower', 'bb_position',
+                         'atr', 'ema_20', 'ema_50', 'vwap', 'price_vwap_dist',
+                         'day_high', 'day_low', 'avg_volume', 'trend'):
+                self.data[key] = ind.get(key, self.data.get(key, 0))
+
+            # ── Copy order flow (pre-computed by AsyncDataEngine) ──
+            self.data['delta'] = of.get('delta', self.data.get('delta', 0))
+            self.data['cvd'] = of.get('cvd', self.data.get('cvd', 0))
+            self.data['buy_volume'] = of.get('buy_volume', self.data.get('buy_volume', 0))
+            self.data['sell_volume'] = of.get('sell_volume', self.data.get('sell_volume', 0))
+
+            # ── Copy signal (pre-computed by AsyncDataEngine from indicators) ──
+            self.data['signal'] = ms.get('signal', self.data.get('signal', 'NINGUNA'))
+
+            # ── Copy order book + whale walls ──
+            self.data['order_book'] = ms.get('order_book', self.data.get('order_book', {'bids': [], 'asks': []}))
+            self.data['liquidity_data'] = ww if ww else self.data.get('liquidity_data', {})
+
+            # ── Stats ──
+            self.stats['latency_ms'] = int((time.time() - start_time) * 1000)
+            self.stats['update_count'] += 1
+            self.stats['last_update'] = time.strftime("%H:%M:%S")
+            self.stats['api_connected'] = self.data['price'] > 0
+            if self.stats['start_time']:
+                self.stats['uptime_seconds'] = int(time.time() - self.stats['start_time'])
+
+            # ── Feed trades to HeatMap chart (from shared cache) ──
+            trades = ms.get('trades', [])
             trade_data_list = []
             for t in trades[:20]:
-                trade_data = {
+                trade_data_list.append({
                     'time': int(t['T']),
                     'price': float(t['p']),
                     'quantity': float(t['q']),
-                    'is_buyer_maker': t['m']
-                }
-                order_flow_engine.add_trade(trade_data)
-                trade_data_list.append(trade_data)
-            
-            # Feed trades to chart for footprint grid
+                    'is_buyer_maker': t['m'],
+                })
             self.panels['HEATMAP'].update_trades(trade_data_list)
-            
-            delta_info = order_flow_engine.calculate_delta()
-            self.data['delta'] = delta_info.get('delta', 0)
-            self.data['cvd'] = order_flow_engine.cumulative_delta
-            self.data['buy_volume'] = delta_info.get('buy_volume', 0)
-            self.data['sell_volume'] = delta_info.get('sell_volume', 0)
-        except:
-            pass
-        
-        # Get open positions
-        self.data['positions'] = self.get_open_positions()
-        
-        self.data['signal'] = self.determine_signal()
-        
-        try:
-            order_book = self.get_order_book()
-            self.data['order_book'] = order_book
-            self.data['liquidity_data'] = self.analyze_whale_walls(order_book)
+
+            # ── AI prediction (inline, lightweight, no REST) ──
             self.data['ai_prediction'] = self.calculate_ai_prediction()
             self.data['agent_logs'] = self.generate_agent_logs(self.data['ai_prediction'])
-        except:
-            pass
-        
-        # Sound notification on signal change
-        if self.data['signal'] != 'NINGUNA' and self.stats['prev_signal'] == 'NINGUNA':
-            play_notification_sound()
-        
-        self.stats['prev_signal'] = self.data['signal']
-        
-        self.data['price_change_pct'] = (self.data['price_change'] / self.data['last_price'] * 100) if self.data['last_price'] > 0 else 0
-        
-        # Update Galaxy Order Flow Chart con todos los datos
-        self.panels['HEATMAP'].update_indicators(self.data)
-        self.panels['HEATMAP'].update_klines(self.data.get('klines', []))
-        self.panels['HEATMAP'].update_data(self.data['order_book'], self.data['price'])
-        
-        self.update_panels()
 
-        if hasattr(self, 'telegram_bot') and self.telegram_bot:
-            mom = self.market_state.get('momentum', {})
-            lq = self.market_state.get('liquidity', {})
-            of = self.market_state.get('order_flow', {})
-            mtf = self.market_state.get('mtf_trend', {})
-            ai = self.market_state.get('ai_engine', {})
-            bv = self.data.get('buy_volume', 0)
-            sv = self.data.get('sell_volume', 0)
-            total_vol = bv + sv
-            ld = self.data.get('liquidity_data', {})
-            cl = self.data.get('klines', [])
-            closes = [float(k[4]) for k in cl[-20:]] if cl else []
-            snapshot = {
-                # Precio y cambio
-                'symbol': settings.SYMBOL,
-                'price': self.data.get('price', 0),
-                'change_pct': self.data.get('price_change_pct', 0),
-                'day_high': self.data.get('day_high', 0),
-                'day_low': self.data.get('day_low', 0),
-                'vwap': self.data.get('vwap', 0),
-                'price_vwap_dist': self.data.get('price_vwap_dist', 0),
+            # ── Sound notification on signal change ──
+            if self.data['signal'] != 'NINGUNA' and self.stats['prev_signal'] == 'NINGUNA':
+                play_notification_sound()
+            self.stats['prev_signal'] = self.data['signal']
 
-                # Tendencia y señal
-                'trend': self.data.get('trend', 'NEUTRAL'),
-                'signal_text': self.battle_bar.trend_direction if hasattr(self, 'battle_bar') else 'WAIT',
-                'confidence': self.battle_bar.confidence if hasattr(self, 'battle_bar') else 0,
-                'signal': self.data.get('signal', 'NINGUNA'),
+            self.data['price_change_pct'] = (self.data['price_change'] / max(self.data['last_price'], 0.0001) * 100) if self.data['last_price'] > 0 else 0
 
-                # Indicadores técnicos
-                'rsi': self.data.get('rsi', 50),
-                'macd': self.data.get('macd', 0),
-                'macd_signal': self.data.get('macd_signal', 0),
-                'macd_hist': self.data.get('macd_hist', 0),
-                'bb_upper': self.data.get('bb_upper', 0),
-                'bb_middle': self.data.get('bb_middle', 0),
-                'bb_lower': self.data.get('bb_lower', 0),
-                'bb_position': self.data.get('bb_position', 50),
-                'bb_squeeze': mom.get('bb_squeeze', 'NORMAL'),
-                'atr': self.data.get('atr', 0),
-                'ema_20': self.data.get('ema_20', 0),
-                'ema_50': self.data.get('ema_50', 0),
+            # ── Update Galaxy Order Flow Chart ──
+            self.panels['HEATMAP'].update_indicators(self.data)
+            self.panels['HEATMAP'].update_klines(self.data.get('klines', []))
+            self.panels['HEATMAP'].update_data(self.data['order_book'], self.data['price'])
 
-                # Order flow
-                'delta': self.data.get('delta', 0),
-                'delta_accel': self.battle_bar.delta_accel if hasattr(self, 'battle_bar') and hasattr(self.battle_bar, 'delta_accel') else 0,
-                'cvd': self.data.get('cvd', 0),
-                'buy_volume': bv,
-                'sell_volume': sv,
-                'volume': total_vol,
-                'avg_volume': self.data.get('avg_volume', 0),
-                'ba_ratio': bv / max(sv, 0.001),
-                'imbalance': ld.get('imbalance', 0),
-                'depth_imb_pct': lq.get('depth_imbalance', 0),
-                'cumulative_delta': lq.get('cvd_delta', of.get('oi_delta_1m', 0)),
+            # ── Update all UI panels ──
+            self.update_panels()
 
-                # Order book / whale walls
-                'liq_zones': lq.get('liq_zones', 0),
-                'wall_bid': lq.get('wall_bid_1', 0),
-                'wall_bid_size': lq.get('wall_bid_size_1', 0),
-                'wall_ask': lq.get('wall_ask_1', 0),
-                'wall_ask_size': lq.get('wall_ask_size_1', 0),
+            # ════════════════════════════════════════════════════════════════
+            # Telegram + Brain + Gemini dispatches (unchanged below)
+            # ════════════════════════════════════════════════════════════════
 
-                # Microestructura
-                'kaufman_eff': mom.get('kaufman_efficiency', 0.5),
-                'spread_velocity': mom.get('spread_velocity', 0),
-                'tick_speed': mom.get('tick_speed', 0),
-                'cancel_rate': mom.get('cancel_rate', 0),
-                'skewness': mom.get('skewness', 0),
-                'pinam': mom.get('pinam', 0),
-                'force': mom.get('force', 'NONE'),
+            if hasattr(self, 'telegram_bot') and self.telegram_bot:
+                mom = self.market_state.get('momentum', {})
+                lq = self.market_state.get('liquidity', {})
+                of = self.market_state.get('order_flow', {})
+                mtf = self.market_state.get('mtf_trend', {})
+                ai = self.market_state.get('ai_engine', {})
+                bv = self.data.get('buy_volume', 0)
+                sv = self.data.get('sell_volume', 0)
+                total_vol = bv + sv
+                ld = self.data.get('liquidity_data', {})
+                cl = self.data.get('klines', [])
+                closes = [float(k[4]) for k in cl[-20:]] if cl else []
+                snapshot = {
+                    # Precio y cambio
+                    'symbol': settings.SYMBOL,
+                    'price': self.data.get('price', 0),
+                    'change_pct': self.data.get('price_change_pct', 0),
+                    'day_high': self.data.get('day_high', 0),
+                    'day_low': self.data.get('day_low', 0),
+                    'vwap': self.data.get('vwap', 0),
+                    'price_vwap_dist': self.data.get('price_vwap_dist', 0),
+                    'price_above_vwap': self.data.get('price', 0) > self.data.get('vwap', 0),
 
-                # MTF
-                'trend_1m': mtf.get('t_1m', 'WAIT'),
-                'trend_5m': mtf.get('t_5m', 'WAIT'),
-                'trend_15m': mtf.get('t_15m', 'WAIT'),
-                'trend_1h': mtf.get('t_1h', 'WAIT'),
-                'trend_4h': mtf.get('t_4h', 'WAIT'),
-                'rsi_5m': mtf.get('rsi_5m', 0),
-                'rsi_15m': mtf.get('rsi_15m', 0),
-                'confluence_score': mtf.get('confluence_score', 0),
-                'global_macro': mtf.get('global_macro', 'NEUTRAL'),
-                'ema_cross_5m': mtf.get('ema_cross_5m', 'NEUTRAL'),
-                'ema_cross_15m': mtf.get('ema_cross_15m', 'NEUTRAL'),
+                    # ── Buy imbalance count (last 5 candles, for divergence filter) ──
+                    'buy_imbalance_count_5': (
+                        sum(
+                            1 for k in cl[-5:]
+                            if float(k[9]) > (float(k[5]) - float(k[9])) * 1.5
+                        ) if len(cl) >= 5 else 0
+                    ),
 
-                # AI predictions
-                'ai_signal': ai.get('ai_signal', 'NINGUNA'),
-                'ai_final': ai.get('final_prediction', 'WAIT'),
-                'ai_score_of': ai.get('score_of', 0),
-                'ai_score_mom': ai.get('score_mom', 0),
-                'ai_score_trend': ai.get('score_trend', 0),
-                'ai_win_rate': ai.get('win_rate', 0),
-                'ai_risk_status': ai.get('risk_panel', {}).get('status', 'WAITING'),
-                'ai_trigger': ai.get('risk_panel', {}).get('trigger', 0),
-                'ai_sl': ai.get('risk_panel', {}).get('sl', 0),
-                'ai_tp1': ai.get('risk_panel', {}).get('tp1', 0),
-                'ai_tp2': ai.get('risk_panel', {}).get('tp2', 0),
+                    # Tendencia y señal
+                    'trend': self.data.get('trend', 'NEUTRAL'),
+                    'signal_text': self.battle_bar.trend_direction if hasattr(self, 'battle_bar') else 'WAIT',
+                    'confidence': self.battle_bar.confidence if hasattr(self, 'battle_bar') else 0,
+                    'signal': self.data.get('signal', 'NINGUNA'),
 
-                # Stats
-                'uptime': self.stats.get('uptime_seconds', 0),
-                'update_count': self.stats.get('update_count', 0),
-                'latency_ms': self.stats.get('latency_ms', 0),
-                'timestamp': self.stats.get('last_update', ''),
-                'klines_ready': len(cl) >= 50,
-                'klines_count': len(cl),
-                'last_price': self.data.get('last_price', 0),
-                'change': self.data.get('price_change', 0),
-            }
+                    # Indicadores técnicos
+                    'rsi': self.data.get('rsi', 50),
+                    'macd': self.data.get('macd', 0),
+                    'macd_signal': self.data.get('macd_signal', 0),
+                    'macd_hist': self.data.get('macd_hist', 0),
+                    'bb_upper': self.data.get('bb_upper', 0),
+                    'bb_middle': self.data.get('bb_middle', 0),
+                    'bb_lower': self.data.get('bb_lower', 0),
+                    'bb_position': self.data.get('bb_position', 50),
+                    'bb_squeeze': mom.get('bb_squeeze', 'NORMAL'),
+                    'atr': self.data.get('atr', 0),
+                    'ema_20': self.data.get('ema_20', 0),
+                    'ema_50': self.data.get('ema_50', 0),
+
+                    # Order flow
+                    'delta': self.data.get('delta', 0),
+                    'delta_accel': self.battle_bar.delta_accel if hasattr(self, 'battle_bar') and hasattr(self.battle_bar, 'delta_accel') else 0,
+                    'cvd': self.data.get('cvd', 0),
+                    'prev_cvd': self._prev_cvd,
+                    'buy_volume': bv,
+                    'sell_volume': sv,
+                    'volume': total_vol,
+                    'avg_volume': self.data.get('avg_volume', 0),
+                    'ba_ratio': bv / max(sv, 0.001),
+                    'imbalance': ld.get('imbalance', 0),
+                    'depth_imb_pct': lq.get('depth_imbalance', 0),
+                    'cumulative_delta': lq.get('cvd_delta', of.get('oi_delta_1m', 0)),
+
+                    # Order book / whale walls
+                    'liq_zones': lq.get('liq_zones', 0),
+                    'wall_bid': lq.get('wall_bid_1', 0),
+                    'wall_bid_size': lq.get('wall_bid_size_1', 0),
+                    'wall_ask': lq.get('wall_ask_1', 0),
+                    'wall_ask_size': lq.get('wall_ask_size_1', 0),
+
+                    # Microestructura
+                    'kaufman_eff': mom.get('kaufman_efficiency', 0.5),
+                    'spread_velocity': mom.get('spread_velocity', 0),
+                    'tick_speed': mom.get('tick_speed', 0),
+                    'tick_speed_avg_5m': mom.get('tick_speed_avg_5m', 0),
+                    'volatility_explosion': mom.get('volatility_explosion', False),
+                    'cancel_rate': mom.get('cancel_rate', 0),
+                    'skewness': mom.get('skewness', 0),
+                    'pinam': mom.get('pinam', 0),
+                    'force': mom.get('force', 'NONE'),
+
+                    # MTF
+                    'trend_1m': mtf.get('t_1m', 'WAIT'),
+                    'trend_5m': mtf.get('t_5m', 'WAIT'),
+                    'trend_15m': mtf.get('t_15m', 'WAIT'),
+                    'trend_1h': mtf.get('t_1h', 'WAIT'),
+                    'trend_4h': mtf.get('t_4h', 'WAIT'),
+                    'rsi_5m': mtf.get('rsi_5m', 0),
+                    'rsi_15m': mtf.get('rsi_15m', 0),
+                    'confluence_score': mtf.get('confluence_score', 0),
+                    'global_macro': mtf.get('global_macro', 'NEUTRAL'),
+                    'ema_cross_5m': mtf.get('ema_cross_5m', 'NEUTRAL'),
+                    'ema_cross_15m': mtf.get('ema_cross_15m', 'NEUTRAL'),
+
+                    # AI predictions
+                    'ai_signal': ai.get('ai_signal', 'NINGUNA'),
+                    'ai_final': ai.get('final_prediction', 'WAIT'),
+                    'ai_score_of': ai.get('score_of', 0),
+                    'ai_score_mom': ai.get('score_mom', 0),
+                    'ai_score_trend': ai.get('score_trend', 0),
+                    'ai_win_rate': ai.get('win_rate', 0),
+                    'ai_risk_status': ai.get('risk_panel', {}).get('status', 'WAITING'),
+                    'ai_trigger': ai.get('risk_panel', {}).get('trigger', 0),
+                    'ai_sl': ai.get('risk_panel', {}).get('sl', 0),
+                    'ai_tp1': ai.get('risk_panel', {}).get('tp1', 0),
+                    'ai_tp2': ai.get('risk_panel', {}).get('tp2', 0),
+
+                    # Stats
+                    'uptime': self.stats.get('uptime_seconds', 0),
+                    'update_count': self.stats.get('update_count', 0),
+                    'latency_ms': self.stats.get('latency_ms', 0),
+                    'timestamp': self.stats.get('last_update', ''),
+                    'klines_ready': len(cl) >= 50,
+                    'klines_count': len(cl),
+                    'last_price': self.data.get('last_price', 0),
+                    'change': self.data.get('price_change', 0),
+
+                    # Trap detection (derived from available data)
+                    'directional_probability': 50.0,
+                    'market_bias': 'INCIERTO',
+                    'trap_status': 'SIN TRAMPA',
+
+                    # Anti-latency: wall-clock snapshot timestamp
+                    '_snapshot_time': time.time(),
+                }
+
+                # ── Enrich trap & bias from battle_bar ────────────────────
+                sig = snapshot.get('signal_text', 'WAIT')
+                conf = snapshot.get('confidence', 0)
+                if sig == 'LONG' and conf > 50:
+                    snapshot['market_bias'] = 'ALZA'
+                    snapshot['directional_probability'] = min(
+                        95.0, 50.0 + conf * 0.4)
+                elif sig == 'SHORT' and conf > 50:
+                    snapshot['market_bias'] = 'BAJA'
+                    snapshot['directional_probability'] = min(
+                        95.0, 50.0 + conf * 0.4)
+
+                rsi_val = snapshot.get('rsi', 50)
+                bb_pos = snapshot.get('bb_position', 50)
+
+                # ── HFT confluency filters ──────────────────────────────────
+                mom = self.market_state.get('momentum', {})
+                lq = self.market_state.get('liquidity', {})
+                cancel_rate = mom.get('cancel_rate', 0.0)
+                depth_imb = lq.get('depth_imbalance', 0.0)
+                tick_speed = mom.get('tick_speed', 0)
+                delta_vel = getattr(self.battle_bar, 'delta_accel', 0) if hasattr(self, 'battle_bar') else 0
+                # delta_velocity in c/s — abs value for magnitude
+                delta_vel_mag = abs(delta_vel) * 10  # scale to c/s
+
+                # Determine if a real institutional wall exists (z-score filtered)
+                ld = self.data.get('liquidity_data', {})
+                has_wall = bool(ld.get('buy_walls') or ld.get('sell_walls'))
+
+                # Trap OFF: cancel_rate < 35% → legitimate S/R regardless of wall
+                if has_wall and cancel_rate < 35.0:
+                    pass  # keep SIN TRAMPA
+
+                # Trap OFF: cancel_rate between 35-55% or depth_imb < 45% → operational
+                elif has_wall and (cancel_rate < 55.0 or abs(depth_imb) < 45.0):
+                    pass  # keep SIN TRAMPA
+
+                # Trap ON: cancel_rate > 55% AND depth_imb > 45%
+                elif has_wall and cancel_rate > 55.0 and abs(depth_imb) > 45.0:
+                    if rsi_val < 25 and bb_pos < 15 and snapshot.get('market_bias') == 'ALZA':
+                        # Tick Speed Brake: require delta_vel > 500 c/s AND tick_speed < 15
+                        if delta_vel_mag > 500 and tick_speed < 15:
+                            snapshot['trap_status'] = '🔴 TRAMPA BAJISTA (FALSO SOPORTE)'
+                    elif rsi_val > 75 and bb_pos > 85 and snapshot.get('market_bias') == 'BAJA':
+                        if delta_vel_mag > 500 and tick_speed < 15:
+                            snapshot['trap_status'] = '🔴 TRAMPA ALCISTA (FALSA RESISTENCIA)'
+
+                # Store trap_status in data for UI banner
+                self.data['trap_status'] = snapshot['trap_status']
+
+                # Track CVD for exhaustion engine (prev_cvd used by check_market_exhaustion)
+                current_cvd = snapshot.get('cvd', 0.0)
+                self._prev_cvd = current_cvd
+
+                # Push market snapshot to Telegram (lightning fast, no brain)
+                self.telegram_bot.push_update(snapshot)
+
+                # ── BrainAgent throttle & background dispatch ─────────────
+                if getattr(self, 'brain_agent', None) is not None:
+                    now = time.time()
+                    candle_close = closes[-1] if closes else 0.0
+                    time_elapsed = now - self._last_brain_time
+                    candle_changed = (
+                        candle_close != self._last_candle_close
+                        and candle_close > 0.0
+                    )
+                    if time_elapsed >= self._brain_cooldown or candle_changed:
+                        self._last_brain_time = now
+                        self._last_candle_close = candle_close
+                        if (self.brain_worker is None
+                                or not self.brain_worker.isRunning()):
+                            snap_copy = snapshot.copy()
+                            self._pending_brain_snapshot = snap_copy
+                            self.brain_worker = BrainInferenceWorker(
+                                self.brain_agent,
+                                snap_copy,
+                                knowledge_blocks=(
+                                    self._brain_knowledge_blocks
+                                    if self._brain_knowledge_blocks
+                                    else None),
+                                temperature=self.brain_temperature,
+                            )
+                            self.brain_worker.inference_finished.connect(
+                                self._on_inference_finished)
+                            self.brain_worker.finished.connect(
+                                self._clear_brain_worker)
+                            self.brain_worker.start()
+
+                # ── GeminiBrain dispatch: DESACTIVADO en automático ──────
+                # Gemini solo se activa desde Auto-Learner (botón F3) o Telegram.
+                # El bloque original está comentado para mantener referencia.
+                # if getattr(self, 'gemini_brain', None) is not None and self.gemini_brain.is_enabled:
+                #     ...
+
+                # ── Background retrain check ────────────────────────────
+                if getattr(self, 'brain_agent', None) is not None:
+                    try:
+                        now = time.time()
+                        if now - self._last_retrain_time >= 14400:  # 4h
+                            self._last_retrain_time = now
+                            import asyncio
+                            asyncio.run(self.brain_agent.background_retrain())
+                    except Exception:
+                        pass
+
+                # ── Narrative journal trigger (5 min after alert) ─────
+                if self._journal_pending and self._last_alert_snapshot is not None:
+                    try:
+                        now = time.time()
+                        if now - self._last_alert_time >= 300:  # 5 min
+                            self._journal_pending = False
+                            journal_snap = dict(snapshot)
+                            before = self._last_alert_snapshot
+                            if getattr(self, 'gemini_brain', None) is not None:
+                                import asyncio
+                                asyncio.run(
+                                    self.gemini_brain.journal_event(
+                                        before, journal_snap,
+                                        brain_direction=before.get('brain_direction'),
+                                        brain_confidence=before.get('brain_confidence_pct', 0),
+                                    )
+                                )
+                    except Exception:
+                        pass
+        finally:
+            self._refresh_busy = False
+
+    def _on_inference_finished(self, brain: dict):
+        """Handle BrainInferenceWorker result — runs in main thread."""
+        if not brain:
+            return
+        try:
+            snapshot = getattr(self, '_pending_brain_snapshot', None)
+            if snapshot is None:
+                return
+            for key in ('direction', 'confidence_pct',
+                        'prob_alza', 'prob_baja', 'prob_incierto',
+                        'market_rationale', 'inference_latency_ms'):
+                snapshot[f'brain_{key}'] = brain.get(key, 0.0 if key in (
+                    'confidence_pct', 'prob_alza', 'prob_baja',
+                    'prob_incierto', 'inference_latency_ms') else '')
+            # Store risk_bracket as nested dict (Telegram lo espera así)
+            bracket = brain.get('risk_bracket', {})
+            if bracket:
+                snapshot['risk_bracket'] = bracket
+                snapshot['brain_bracket_sl'] = bracket.get('sl', 0)
+                snapshot['brain_bracket_tp1'] = bracket.get('tp1', 0)
+                snapshot['brain_bracket_tp2'] = bracket.get('tp2', 0)
+                snapshot['brain_bracket_trigger'] = bracket.get('trigger', 0)
+                snapshot['brain_bracket_lot'] = bracket.get('lot_size', 0)
+                snapshot['brain_bracket_status'] = bracket.get('status', '')
             self.telegram_bot.push_update(snapshot)
-    
+
+            # Store for UI panel updates
+            self._last_brain_decision = brain
+            self._last_brain_snapshot = snapshot
+
+            # ── Save alert snapshot for narrative journaling ────────
+            direction = brain.get('direction', '')
+            conf = brain.get('confidence_pct', 0)
+            if direction in ('ALZA', 'BAJA') and conf >= 60:
+                self._last_alert_snapshot = dict(snapshot)
+                self._last_alert_time = time.time()
+                self._journal_pending = True
+
+                # ── Auto-execute trade signal (solo quantum_brain) ──
+                bracket = brain.get('risk_bracket', {})
+                entry_price = snapshot.get('price', 0)
+                sl_price = bracket.get('sl', 0)
+                tp_price = bracket.get('tp1', 0)
+                if (sl_price > 0 and tp_price > 0 and entry_price > 0
+                        and hasattr(self, 'order_executor')
+                        and self.order_executor is not None):
+                    self.order_executor.execute_trade_signal(
+                        direction=direction,
+                        entry_price=entry_price,
+                        sl_price=sl_price,
+                        tp_price=tp_price,
+                    )
+
+        except Exception as e:
+            print(f"[⚠️ BRAIN] Error en _on_inference_finished: {e}")
+
+    def _on_order_result(self, success: bool, message: str, data: dict):
+        env = data.get("environment", "?")
+        direction = data.get("direction", "?")
+        entry = data.get("entry_price", 0)
+        qty = data.get("entry_qty", 0)
+        sl = data.get("sl_price", 0)
+        tp = data.get("tp_price", 0)
+        entry_id = data.get("entry_order_id", "")
+        sl_id = data.get("sl_order_id", "")
+        tp_id = data.get("tp_order_id", "")
+
+        status_icon = "✅" if success else "❌"
+        log_msg = (
+            f"[ORDEN {env}] {status_icon} {direction} "
+            f"{qty} BTC @ ${entry:,.0f} "
+            f"SL=${sl:,.0f} TP=${tp:,.0f} "
+            f"entry={entry_id} sl={sl_id} tp={tp_id}"
+        )
+        print(log_msg)
+
+        # Enviar notificación a Telegram
+        bracket_errs = data.get("bracket_errors", "")
+        bracket_info = f" | ⚠ {bracket_errs}" if bracket_errs else ""
+        telegram_text = (
+            f"<b>{status_icon} ORDEN EJECUTADA [{env}]</b>\n"
+            f"<b>Dirección:</b> {direction}\n"
+            f"<b>Cantidad:</b> <code>{qty} BTC</code>\n"
+            f"<b>Entrada:</b> <code>${entry:,.0f}</code>\n"
+            f"<b>SL:</b> <code>${sl:,.0f}</code>\n"
+            f"<b>TP:</b> <code>${tp:,.0f}</code>\n"
+            f"<b>IDs:</b> entry=<code>{entry_id}</code> "
+            f"sl=<code>{sl_id}</code> tp=<code>{tp_id}</code>"
+            f"{bracket_info}"
+        )
+
+        alert = {
+            "type": "order_execution",
+            "text": telegram_text,
+        }
+        if hasattr(self, "telegram_bot") and self.telegram_bot is not None:
+            try:
+                self.telegram_bot._queue.put_nowait(alert)
+            except Exception:
+                pass
+
+    def _clear_brain_worker(self):
+        """Safely delete BrainInferenceWorker and nullify the reference."""
+        worker = self.sender()
+        if worker is None:
+            return
+        if worker is self.brain_worker:
+            self.brain_worker = None
+        try:
+            worker.deleteLater()
+        except (RuntimeError, AttributeError):
+            pass
+
+    def _clear_gemini_worker(self):
+        """Safely delete GeminiInferenceWorker and nullify the reference."""
+        worker = self.sender()
+        if worker is None:
+            return
+        if worker is self.gemini_worker:
+            self.gemini_worker = None
+        try:
+            worker.deleteLater()
+        except (RuntimeError, AttributeError):
+            pass
+
+    def _update_ai_monitor(self,
+                            gemini_decision=None,
+                            brain_decision=None):
+        """Refresh the dual-engine monitor widget with both AI outputs.
+
+        Called from both ``update_panels()`` (~1 Hz) and
+        ``_on_gemini_finished()`` (~0.33 Hz).  Uses ``setHtml`` with
+        monospaced formatting so the report is clean and readable.
+        """
+        if not hasattr(self, 'ai_engines_monitor'):
+            return
+
+        # ── Quantum Brain (PyTorch LSTM) ──────────────────────────────
+        brain = brain_decision or {}
+        brain_dir = brain.get('direction', 'INCIERTO') if isinstance(brain, dict) else 'INCIERTO'
+        brain_conf = brain.get('confidence_pct', 0.0) if isinstance(brain, dict) else 0.0
+        brain_rationale = brain.get('market_rationale', '') if isinstance(brain, dict) else ''
+        brain_latency = brain.get('inference_latency_ms', 0.0) if isinstance(brain, dict) else 0.0
+
+        if brain_dir == 'ALZA':
+            brain_color = '#00FF66'
+        elif brain_dir == 'BAJA':
+            brain_color = '#BB00FF'
+        else:
+            brain_color = '#FFD700'
+
+        # Top-3 matched knowledge blocks (from brain_agent)
+        top_blocks = ''
+        if isinstance(brain, dict) and brain.get('flip_blocked'):
+            top_blocks = '⚠️ Flip bloqueado por histéresis'
+        elif isinstance(brain, dict) and brain.get('inference_latency_ms'):
+            top_blocks = 'Inferencia completada'
+
+        # ── Gemini 2.0 Flash ──────────────────────────────────────────
+        gem = gemini_decision
+        if gem is not None:
+            g_dir = gem.decision
+            g_conf = gem.confidence
+            g_reason = gem.reasoning
+            g_of = gem.score_order_flow
+            g_mom = gem.score_momentum
+            g_trend = gem.score_trend
+            g_exh = gem.exhaustion_detected
+            g_entry = gem.bracket.entry
+            g_sl = gem.bracket.stop_loss
+            g_tp1 = gem.bracket.take_profit_1
+            g_tp2 = gem.bracket.take_profit_2
+            if g_dir == 'ALZA':
+                g_color = '#00FF66'
+            elif g_dir == 'BAJA':
+                g_color = '#BB00FF'
+            else:
+                g_color = '#FFD700'
+
+        # ── Build HTML report ─────────────────────────────────────────
+        lines = []
+        lines.append('<pre style="color:#888; font-family:monospace; font-size:9px;">')
+
+        # Header
+        lines.append('')
+
+        # ── Block 1: Quantum Brain ────────────────────────────────────
+        lines.append(
+            f'<b style="color:#00D4FF;">🧠 [MOTOR 1: QUANTUM BRAIN (LSTM)]</b>')
+        lines.append(
+            f'<span style="color:#555;">{"─" * 50}</span>')
+        lines.append(
+            f'  <b>Dirección:</b>   '
+            f'<span style="color:{brain_color};">{brain_dir}</span>  '
+            f'<b>Confianza:</b>   '
+            f'<span style="color:{brain_color};">{brain_conf:.1f}%</span>')
+        if brain_latency:
+            lines.append(
+                f'  <b>Latencia:</b>   {brain_latency:.0f}ms')
+        if brain_rationale:
+            lines.append(
+                f'  <b>Rationale de Agresión:</b>')
+            lines.append(
+                f'    <span style="color:#CCC;">{brain_rationale}</span>')
+        lines.append(
+            f'  <b>Sesgo de Conocimiento:</b>  '
+            f'<span style="color:#888;">{top_blocks or "No aplicado"}</span>')
+        lines.append('')
+
+        # ── Block 2: Gemini ───────────────────────────────────────────
+        if gem is not None:
+            lines.append(
+                f'<b style="color:#FFD700;">🌌 [MOTOR 2: GEMINI 2.0 FLASH]</b>')
+            lines.append(
+                f'<span style="color:#555;">{"─" * 50}</span>')
+            lines.append(
+                f'  <b>Dirección:</b>   '
+                f'<span style="color:{g_color};">{g_dir}</span>  '
+                f'<b>Confianza:</b>   '
+                f'<span style="color:{g_color};">{g_conf:.0f}%</span>')
+            lines.append(
+                f'  <b>Exhaustion:</b> {g_exh}')
+            lines.append(
+                f'  <b>Scores:</b>  '
+                f'OF={g_of:.1f}  Mom={g_mom:.1f}  Trend={g_trend:.1f}')
+            lines.append(
+                f'  <b>Bracket:</b>  entry={g_entry:.1f}  '
+                f'SL={g_sl:.1f}  TP1={g_tp1:.1f}  TP2={g_tp2:.1f}')
+            if g_reason:
+                lines.append(
+                    f'  <b>Análisis Institucional:</b>')
+                lines.append(
+                    f'    <span style="color:#CCC;">{g_reason}</span>')
+            lines.append('')
+
+        lines.append('</pre>')
+        html = '\n'.join(lines)
+        self.ai_engines_monitor.setHtml(html)
+
+    def _on_gemini_finished(self, decision):
+        """Handle GeminiInferenceWorker result — runs in main thread.
+
+        Maps ``GeminiTradingDecision`` fields to the AI ENGINE panel
+        and bracket widget.  Silently ignores ``None`` (network fallback).
+        """
+        if decision is None:
+            return
+        try:
+            self._last_gemini_decision = decision
+
+            # ── Inject into market_state for the panel render loop ────
+            ai = self.market_state.setdefault("ai_engine", {})
+            ai["gemini_decision"] = decision.decision
+            ai["gemini_confidence"] = decision.confidence
+            ai["gemini_exhaustion"] = decision.exhaustion_detected
+            ai["gemini_score_of"] = decision.score_order_flow
+            ai["gemini_score_mom"] = decision.score_momentum
+            ai["gemini_score_trend"] = decision.score_trend
+            ai["gemini_reasoning"] = decision.reasoning
+
+            # ── Push Gemini bracket to the bracket widget ─────────────
+            bracket = decision.bracket
+            gemini_risk = {
+                "status": decision.decision,
+                "trigger": bracket.entry,
+                "sl": bracket.stop_loss,
+                "tp1": bracket.take_profit_1,
+                "tp2": bracket.take_profit_2,
+                "lot_size": 0.0,
+            }
+            if hasattr(self, 'bracket_widget'):
+                price = self.data.get('price', 0)
+                self.bracket_widget.update_data(
+                    ai.get("risk_panel", {"status": "WAITING", "trigger": 0,
+                                          "sl": 0, "tp1": 0, "tp2": 0,
+                                          "lot_size": 0}),
+                    decision.confidence,
+                    price,
+                    brain_bracket=gemini_risk,
+                )
+
+            # ── Push to dual-engine monitor (not brain_content_viewer) ──
+            self._update_ai_monitor(
+                gemini_decision=decision,
+                brain_decision=getattr(self, '_last_brain_decision', None),
+            )
+
+            # ── Push update to Telegram for downstream dispatch ──────
+            snap = getattr(self, '_pending_brain_snapshot', None)
+            if snap is not None:
+                snap['brain_direction'] = decision.decision
+                snap['brain_confidence_pct'] = decision.confidence
+                snap['brain_market_rationale'] = decision.reasoning
+                self.telegram_bot.push_update(snap)
+
+        except Exception as e:
+            print(f"[⚠️ GEMINI] Error en _on_gemini_finished: {e}")
+
     def create_indicator_row(self, name):
         row = QWidget()
         layout = QVBoxLayout()
@@ -4471,16 +6141,36 @@ class MainDashboard(QMainWindow):
         
         if 'NARRATIVE' in self.panels:
             mom = self.market_state.get('momentum', {})
+            lq = self.market_state.get('liquidity', {})
             narrative_state = {
                 **self.data,
                 'kaufman_eff': mom.get('kaufman_efficiency', 0.5),
                 'spread_velocity': mom.get('spread_velocity', 0),
                 'tick_speed': mom.get('tick_speed', 0),
+                'cancel_rate': mom.get('cancel_rate', 0.0),
+                'depth_imb_pct': lq.get('depth_imbalance', 0.0),
+                'delta_accel': self.battle_bar.delta_accel if hasattr(self, 'battle_bar') and hasattr(self.battle_bar, 'delta_accel') else 0,
             }
             self.panels['NARRATIVE'].update_narrative(narrative_state, self.data.get('order_book', {}))
         
         if hasattr(self, 'trend_signal_bar'):
-            self.trend_signal_bar.update_signal(self.battle_bar.trend_direction, self.battle_bar.trend_label)
+            # Cross-verify trap status from all available sources
+            active_trap = ""
+            narrative = self.panels.get('NARRATIVE')
+            if narrative and hasattr(narrative, 'get_current_alert'):
+                alert_text = narrative.get_current_alert()
+                if alert_text and "TRAMPA" in alert_text.upper():
+                    active_trap = alert_text
+
+            if active_trap or ('trap_status' in self.data and self.data['trap_status']
+                               and 'SIN TRAMPA' not in self.data['trap_status']):
+                final_trap_text = active_trap if active_trap else self.data['trap_status']
+                self.trend_signal_bar.set_trap_mode(final_trap_text)
+                self.trend_signal_bar.update()
+            else:
+                self.trend_signal_bar.update_signal(
+                    self.battle_bar.trend_direction,
+                    self.battle_bar.trend_label)
         
         # MTF data from async engine
         mt = self.market_state.get("mtf_trend", {})
@@ -4519,6 +6209,7 @@ class MainDashboard(QMainWindow):
             atr=atr_val,
             spread_velocity=m_spread,
             avg_volume=avg_vol,
+            volatility_explosion=mom.get('volatility_explosion', False),
         )
             
         # ═══════════════════════════════════════════════════════════════
@@ -4532,7 +6223,11 @@ class MainDashboard(QMainWindow):
         ratio = buy_v / max(0.001, sell_v)
         ratio_color = up if ratio > 1.2 else dn if ratio < 0.8 else gold
         gv("BUY/SELL RATIO", f"{ratio:.2f}", ratio_color)
-        gv("OB IMBALANCE", f"{imb:+.3f}", up if imb > 0 else dn)
+        
+        # OB IMBALANCE from analyze_whale_walls() dynamic data
+        ld = self.data.get('liquidity_data', {})
+        imb_dynamic = ld.get('imbalance', imb)
+        gv("OB IMBALANCE", f"{imb_dynamic:+.3f}", up if imb_dynamic > 0 else dn)
         
         bids = self.data['order_book'].get('bids', [])
         asks = self.data['order_book'].get('asks', [])
@@ -4563,9 +6258,18 @@ class MainDashboard(QMainWindow):
             dd_color = up
         gv("DELTA DIV", delta_div, dd_color)
         
-        # Find Whale Walls in Orderbook
-        bid_walls = sorted([(float(p), float(q)) for p,q in bids if float(q) >= 2.0], key=lambda x: x[1], reverse=True)
-        ask_walls = sorted([(float(p), float(q)) for p,q in asks if float(q) >= 2.0], key=lambda x: x[1], reverse=True)
+        # Find Whale Walls — prefer z-score filtered from analyze_whale_walls()
+        ld = self.data.get('liquidity_data', {})
+        whale_buy = ld.get('buy_walls', [])
+        whale_sell = ld.get('sell_walls', [])
+        if whale_buy:
+            bid_walls = [(w['price'], w['quantity']) for w in whale_buy]
+        else:
+            bid_walls = sorted([(float(p), float(q)) for p,q in bids if float(q) >= 2.0], key=lambda x: x[1], reverse=True)
+        if whale_sell:
+            ask_walls = [(w['price'], w['quantity']) for w in whale_sell]
+        else:
+            ask_walls = sorted([(float(p), float(q)) for p,q in asks if float(q) >= 2.0], key=lambda x: x[1], reverse=True)
         
         if len(bid_walls) > 0: gv("WALL BID #1", f"${bid_walls[0][0]:,.0f} ({bid_walls[0][1]:.1f} B)", up)
         else: gv("WALL BID #1", "NONE", gold)
@@ -4619,31 +6323,123 @@ class MainDashboard(QMainWindow):
         gv("TICK SPEED", f"{self.stats.get('update_count', 0) % 50} t/s", white)
         
         # ═══════════════════════════════════════════════════════════════
-        # COL 5: AI ENGINE & LOG
+        # COL 5: AI ENGINE & LOG  (Gemini 2.0 Flash + Quantum Brain hybrid)
         # ═══════════════════════════════════════════════════════════════
-        gv("AI SIGNAL", self.data['signal'], up if self.data['signal'] == 'COMPRA' else dn if self.data['signal'] == 'VENTA' else gold)
-        gv("WIN RATE", f"{self.data.get('win_rate', 0):.0f}%", up if self.data.get('win_rate', 0) > 50 else dn)
-        gv("LATENCY", f"{self.stats.get('latency_ms', 0)}ms", up if self.stats.get('latency_ms', 0) < 500 else dn)
-        
+
+        # ── Prefer Gemini result, fall back to local PyTorch brain ──────
+        gem = getattr(self, '_last_gemini_decision', None)
+        brain = getattr(self, '_last_brain_decision', None)
+
+        if gem is not None:
+            # Gemini-sourced values
+            ai_signal = gem.decision
+            ai_confidence = gem.confidence
+            ai_exhaustion = gem.exhaustion_detected
+            ai_rationale = gem.reasoning
+            ai_score_of = gem.score_order_flow
+            ai_score_mom = gem.score_momentum
+            ai_score_trend = gem.score_trend
+            ai_bracket_raw = gem.bracket
+            ai_latency = 0.0
+        else:
+            # Fallback to local PyTorch brain
+            brain_dir = brain.get('direction', 'INCIERTO') if brain else 'INCIERTO'
+            ai_signal = brain_dir if (brain and brain.get('direction') != 'INCIERTO' and brain.get('confidence_pct', 0) >= 50) else self.data.get('signal', 'NINGUNA')
+            ai_confidence = brain.get('confidence_pct', 0.0) if brain else 0.0
+            ai_rationale = brain.get('market_rationale', '') if brain else ''
+            ai_latency = brain.get('inference_latency_ms', 0.0) if brain else 0.0
+
+        # ── Push to dual-engine monitor (runs every refresh ~1 Hz) ─────
+        self._update_ai_monitor(
+            gemini_decision=getattr(self, '_last_gemini_decision', None),
+            brain_decision=getattr(self, '_last_brain_decision', None),
+        )
+
+        # ── AI SIGNAL ───────────────────────────────────────────────────
+        if gem is not None and gem.decision != 'INCIERTO':
+            as_color = up if gem.decision == 'ALZA' else dn
+            gv("AI SIGNAL", gem.decision, as_color)
+        elif brain and brain.get('direction') != 'INCIERTO' and brain.get('confidence_pct', 0) >= 50:
+            bdir = brain['direction']
+            gv("AI SIGNAL", bdir, up if bdir == 'ALZA' else dn)
+        else:
+            gv("AI SIGNAL", self.data['signal'],
+               up if self.data['signal'] == 'COMPRA' else
+               dn if self.data['signal'] == 'VENTA' else gold)
+
+        # ── WIN RATE / CONFIDENCE ──────────────────────────────────────
+        if gem is not None:
+            gv("WIN RATE", f"{gem.confidence:.0f}%", up if gem.confidence > 50 else dn)
+        elif brain and brain.get('confidence_pct', 0) > 0:
+            bc = brain['confidence_pct']
+            gv("WIN RATE", f"{bc:.0f}%", up if bc > 50 else dn)
+        else:
+            gv("WIN RATE", f"{self.data.get('win_rate', 0):.0f}%",
+               up if self.data.get('win_rate', 0) > 50 else dn)
+
+        gv("LATENCY",
+           f"{ai_latency:.0f}ms" if ai_latency else
+           f"{self.stats.get('latency_ms', 0)}ms",
+           up if (ai_latency or self.stats.get('latency_ms', 0)) < 500 else dn)
+
+        # ── EXHAUSTION ──────────────────────────────────────────────────
         exhaustion = "NONE"
         ex_color = gold
-        if rsi > 75 and self.data['bb_position'] > 85:
+        if gem is not None:
+            exhaustion = gem.exhaustion_detected
+            if "BULLISH" in exhaustion:
+                ex_color = up
+            elif "BEARISH" in exhaustion:
+                ex_color = dn
+        elif brain and brain.get('direction') == 'ALZA' and brain.get('confidence_pct', 0) >= 60:
+            exhaustion = "▲ BRAIN BULLISH"
+            ex_color = up
+        elif brain and brain.get('direction') == 'BAJA' and brain.get('confidence_pct', 0) >= 60:
+            exhaustion = "▼ BRAIN BEARISH"
+            ex_color = dn
+        elif rsi > 75 and self.data['bb_position'] > 85:
             exhaustion = "▼ SELL EXHAUST"
             ex_color = dn
         elif rsi < 25 and self.data['bb_position'] < 15:
             exhaustion = "▲ BUY EXHAUST"
             ex_color = up
         gv("EXHAUSTION", exhaustion, ex_color)
-        
-        # AI Scoring Mockup (To be driven by real AI engine)
+
+        # ── SCORES ──────────────────────────────────────────────────────
         td = self.battle_bar.trend_direction
         conf = self.battle_bar.confidence
-        gv("SCORE: ORDER FLOW", f"{min(9.5, abs(delta)*2):.1f}/10", cyan)
-        gv("SCORE: MOMENTUM", f"{min(9.0, abs(rsi-50)/3):.1f}/10", gold)
-        gv("SCORE: TREND", f"{min(9.9, conf/10):.1f}/10", magenta)
-        
-        # Determine final prediction
-        if td == 'LONG' and conf > 30:
+
+        if gem is not None:
+            gv("SCORE: ORDER FLOW", f"{gem.score_order_flow:.1f}/10", cyan)
+            gv("SCORE: MOMENTUM", f"{gem.score_momentum:.1f}/10", gold)
+            gv("SCORE: TREND", f"{gem.score_trend:.1f}/10", magenta)
+        elif brain and brain.get('confidence_pct', 0) > 0:
+            of_score = abs(brain.get('prob_alza', 0) - brain.get('prob_baja', 0)) * 10
+            gv("SCORE: ORDER FLOW", f"{min(10.0, of_score):.1f}/10", cyan)
+            mom_score = brain['confidence_pct'] / 10
+            gv("SCORE: MOMENTUM", f"{min(10.0, mom_score):.1f}/10", gold)
+            trend_score = brain.get('prob_alza', 0) if brain.get('direction') == 'ALZA' else brain.get('prob_baja', 0)
+            gv("SCORE: TREND", f"{min(10.0, trend_score/10):.1f}/10", magenta)
+        else:
+            gv("SCORE: ORDER FLOW", f"{min(9.5, abs(delta)*2):.1f}/10", cyan)
+            gv("SCORE: MOMENTUM", f"{min(9.0, abs(rsi-50)/3):.1f}/10", gold)
+            gv("SCORE: TREND", f"{min(9.9, conf/10):.1f}/10", magenta)
+
+        # ── FINAL PREDICTION ────────────────────────────────────────────
+        if gem is not None and gem.decision != 'INCIERTO' and gem.confidence >= 50:
+            if gem.decision == 'ALZA':
+                final_pred = "LONG"
+                gv("FINAL PREDICTION", f"◉ BUY {gem.confidence:.0f}%", cyan)
+            else:
+                final_pred = "SHORT"
+                gv("FINAL PREDICTION", f"◉ SELL {gem.confidence:.0f}%", magenta)
+        elif brain and brain.get('direction') == 'ALZA' and brain.get('confidence_pct', 0) >= 50:
+            final_pred = "LONG"
+            gv("FINAL PREDICTION", f"◉ BUY {brain['confidence_pct']:.0f}%", cyan)
+        elif brain and brain.get('direction') == 'BAJA' and brain.get('confidence_pct', 0) >= 50:
+            final_pred = "SHORT"
+            gv("FINAL PREDICTION", f"◉ SELL {brain['confidence_pct']:.0f}%", magenta)
+        elif td == 'LONG' and conf > 30:
             final_pred = "LONG"
             gv("FINAL PREDICTION", f"◉ BUY {conf:.0f}%", cyan)
         elif td == 'SHORT' and conf > 30:
@@ -4652,40 +6448,67 @@ class MainDashboard(QMainWindow):
         else:
             final_pred = "WAIT"
             gv("FINAL PREDICTION", "◆ WAIT", gold)
-            
+
         prev_pred = self.market_state["ai_engine"]["final_prediction"]
         self.market_state["ai_engine"]["final_prediction"] = final_pred
-        
-        # Risk control calculation - math execution on state transition
-        if prev_pred == "WAIT" and final_pred in ["LONG", "SHORT"]:
-            atr = self.data.get('atr', 10)
-            wall_ask = ask_walls[0][0] if ask_walls else price + 100
-            wall_bid = bid_walls[0][0] if bid_walls else price - 100
-            
-            trigger = price
-            if final_pred == "LONG":
-                sl = price - (1.5 * atr)
-                tp1 = price + (2 * atr)
-                tp2 = wall_ask
-            else:
-                sl = price + (1.5 * atr)
-                tp1 = price - (2 * atr)
-                tp2 = wall_bid
-            
-            loss_per_contract = abs(trigger - sl)
-            lot_size = 10.0 / loss_per_contract if loss_per_contract > 0 else 0
-            
-            self.market_state["ai_engine"]["risk_panel"] = {
-                "status": final_pred,
-                "trigger": trigger,
-                "sl": sl,
-                "tp1": tp1,
-                "tp2": tp2,
-                "lot_size": lot_size
+
+        # ── Risk bracket ───────────────────────────────────────────────
+        # Gemini bracket already pushed to widget via _on_gemini_finished.
+        # Use Gemini bracket for risk panel if available.
+        gem_bracket = None
+        if gem is not None:
+            b = gem.bracket
+            gem_bracket = {
+                "status": gem.decision,
+                "trigger": b.entry,
+                "sl": b.stop_loss,
+                "tp1": b.take_profit_1,
+                "tp2": b.take_profit_2,
+                "lot_size": 0.0,
             }
-        elif final_pred == "WAIT" and prev_pred != "WAIT":
-            # Optionally reset risk panel on back to WAIT, but requirement says to freeze
-            pass
+
+        brain_bracket = brain.get('risk_bracket', {}) if brain else {}
+
+        if gem_bracket is not None and gem_bracket['sl'] != 0:
+            risk_override = True
+            final_risk = gem_bracket
+        elif brain_bracket and brain_bracket.get('sl', 0) != 0:
+            risk_override = True
+            final_risk = brain_bracket
+        else:
+            risk_override = False
+            if prev_pred == "WAIT" and final_pred in ["LONG", "SHORT"]:
+                atr = self.data.get('atr', 10)
+                wall_ask = ask_walls[0][0] if ask_walls else price + 100
+                wall_bid = bid_walls[0][0] if bid_walls else price - 100
+
+                trigger = price
+                if final_pred == "LONG":
+                    sl = price - (1.5 * atr)
+                    tp1 = price + (2 * atr)
+                    tp2 = wall_ask
+                else:
+                    sl = price + (1.5 * atr)
+                    tp1 = price - (2 * atr)
+                    tp2 = wall_bid
+
+                loss_per_contract = abs(trigger - sl)
+                lot_size = 10.0 / loss_per_contract if loss_per_contract > 0 else 0
+
+                final_risk = {
+                    "status": final_pred,
+                    "trigger": trigger,
+                    "sl": sl,
+                    "tp1": tp1,
+                    "tp2": tp2,
+                    "lot_size": lot_size
+                }
+            elif final_pred == "WAIT" and prev_pred != "WAIT":
+                final_risk = self.market_state["ai_engine"]["risk_panel"]
+            else:
+                final_risk = self.market_state["ai_engine"]["risk_panel"]
+
+        self.market_state["ai_engine"]["risk_panel"] = final_risk
             
         # Col 1 Data Update: Read OI deltas from async engine (already populated)
         of = self.market_state["order_flow"]
@@ -4780,21 +6603,77 @@ class MainDashboard(QMainWindow):
                 orderbook_imb = self.panels['HEATMAP'].get_orderbook_imbalance()
             
             self.bottom_widgets[4].update_data(
-                self.market_state["ai_engine"]["risk_panel"], conf, price, dpoc, orderbook_imb if 'HEATMAP' in self.panels else 0.0
+                self.market_state["ai_engine"]["risk_panel"], conf, price, dpoc, orderbook_imb if 'HEATMAP' in self.panels else 0.0,
+                brain_bracket=final_risk if risk_override and final_risk.get('sl', 0) != 0 else None
             )
         
         # Trade Log Placeholders
         gv("LAST TRADE #1", "WAITING...", white)
         gv("LAST TRADE #2", "WAITING...", white)
         
-        # Old trend signal label removed, handled by TrendSignalBar
-        # (signal generated exclusively in update_panels() via first update_battle call)
+        # ── Brain Office UI update (every cycle) ───────────────────────
+        self._update_brain_office()
+
+        # ── Auto-Learner analysis (throttled internally) ──────────────
+        snap_for_learn = {
+            'price': price,
+            'delta': delta,
+            'cvd': cvd,
+            'rsi': rsi,
+            'tick_speed': m_tick,
+            'trap_status': self.data.get('trap_status', 'SIN TRAMPA'),
+            'brain_direction': brain.get('direction', 'INCIERTO') if (brain := getattr(self, '_last_brain_decision', None)) else 'INCIERTO',
+            'brain_confidence_pct': brain.get('confidence_pct', 0) if (brain := getattr(self, '_last_brain_decision', None)) else 0,
+            'bb_position': self.data.get('bb_position', 50),
+            'atr': atr_val,
+            'ba_ratio': self.data.get('ba_ratio', 1.0),
+            'signal_text': self.data.get('signal', 'WAIT'),
+        }
+        self._run_auto_learn_analysis(snap_for_learn)
     
     def order_state_available(self):
         """Check if order book data is available."""
         ob = self.data.get('order_book', {})
         return bool(ob.get('bids')) or bool(ob.get('asks'))
     
+    def lower_to_normal_window(self):
+        if self.isMaximized() or self.windowState() & Qt.WindowMaximized:
+            self.showNormal()
+        else:
+            self.setWindowState(Qt.WindowMaximized)
+            self.showMaximized()
+
+    def close_application_cleanly(self):
+        self.running = False
+
+        # Stop the refresh timer
+        if hasattr(self, 'update_timer') and self.update_timer is not None:
+            self.update_timer.stop()
+
+        # Stop async data engine
+        if hasattr(self, '_async_engine') and self._async_engine is not None:
+            self._async_engine.stop()
+
+        # Stop telegram bot
+        if hasattr(self, 'telegram_bot') and self.telegram_bot is not None:
+            self.telegram_bot.stop()
+
+        # Stop order executor thread
+        if hasattr(self, 'order_executor') and self.order_executor is not None:
+            self.order_executor.stop()
+
+        # Clean up knowledge parser worker if still running
+        if hasattr(self, '_brain_worker') and self._brain_worker is not None:
+            self._brain_worker.requestInterruption()
+            self._brain_worker.deleteLater()
+            self._brain_worker = None
+
+        # Let closeEvent propagate properly
+        self.close()
+
+        # Force exit
+        QApplication.quit()
+
     def closeEvent(self, event):
         self.running = False
         event.accept()
