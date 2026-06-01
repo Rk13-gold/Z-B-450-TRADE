@@ -99,6 +99,10 @@ class AsyncDataEngine:
         self._klines_cache: list = []
         self._ob_volume_history = deque(maxlen=1800)
 
+        # ── Technical Levels Engine ──
+        self._tech_levels_engine = None  # lazy import
+        self._tech_levels_cache = {}  # last computed result
+
         # ── Last-known-good cache ──
         self._last_oi = 0.0
         self._last_best_bid = 0.0
@@ -120,6 +124,8 @@ class AsyncDataEngine:
         self._running = False
         if self._loop and self._loop.is_running():
             self._loop.call_soon_threadsafe(self._loop.stop)
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=5)
 
     def _run_loop(self):
         self._loop = asyncio.new_event_loop()
@@ -145,9 +151,23 @@ class AsyncDataEngine:
                 asyncio.create_task(self._poll_mtf_indicators(session)),
                 asyncio.create_task(self._poll_deep_book(session)),
                 asyncio.create_task(self._poll_funding_rate(session)),
+                asyncio.create_task(self._poll_technical_levels(session)),
                 asyncio.create_task(self._compute_hft_metrics()),
+                asyncio.create_task(self._heartbeat()),
             ]
             await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _heartbeat(self):
+        """Log cada 5 minutos confirmando que el radar sigue vivo."""
+        while self._running:
+            await asyncio.sleep(300)
+            if self._running:
+                price = self.market_state.get('price', 0)
+                price_str = f"${price:,.0f}" if isinstance(price, (int, float)) and price > 0 else "--"
+                print(f"💓 [HEARTBEAT] BB-450 AsyncDataEngine activo | "
+                      f"precio={price_str} | "
+                      f"klines={len(self._klines_cache)} | "
+                      f"oi_history={len(self._oi_history)}")
 
     # ─────────────────────────────────────────────────────────────
     # 0. PRICE TICKER (every 1s)
@@ -293,6 +313,8 @@ class AsyncDataEngine:
                         of["cvd"] = order_flow_engine.cumulative_delta
                         of["buy_volume"] = delta_info.get("buy_volume", 0)
                         of["sell_volume"] = delta_info.get("sell_volume", 0)
+                        of["window_buy_volume"] = delta_info.get("window_buy_volume", 0)
+                        of["window_sell_volume"] = delta_info.get("window_sell_volume", 0)
 
                     elif resp.status == 429:
                         await asyncio.sleep(5)
@@ -555,6 +577,53 @@ class AsyncDataEngine:
                         fr = float(data.get("lastFundingRate", 0))
                         of = self.market_state.get("order_flow", {})
                         of["funding_rate"] = fr * 100
+            except Exception:
+                pass
+            await asyncio.sleep(30.0)
+
+    # ─────────────────────────────────────────────────────────────
+    # 4b. TECHNICAL LEVELS (Swing / Fibonacci / S&R / Confluence) — every 30s
+    # ─────────────────────────────────────────────────────────────
+    async def _poll_technical_levels(self, session: aiohttp.ClientSession):
+        """Compute swing highs/lows, Fibonacci, S/R, and confluence zones."""
+        if self._tech_levels_engine is None:
+            from src.engine.technical_levels import TechnicalLevelsEngine
+            self._tech_levels_engine = TechnicalLevelsEngine()
+
+        while self._running:
+            try:
+                klines_1m = self._klines_cache or []
+                klines_5m_data = []
+                klines_15m_data = []
+
+                # Fetch 5m and 15m klines for multi-TF S/R
+                async with session.get(
+                    f"{BASE_URL}/fapi/v1/klines",
+                    params={"symbol": self.symbol, "interval": "5m", "limit": 100},
+                ) as resp:
+                    if resp.status == 200:
+                        klines_5m_data = await resp.json()
+                async with session.get(
+                    f"{BASE_URL}/fapi/v1/klines",
+                    params={"symbol": self.symbol, "interval": "15m", "limit": 100},
+                ) as resp:
+                    if resp.status == 200:
+                        klines_15m_data = await resp.json()
+
+                ind = self.market_state.get("indicators", {})
+                price = self.market_state.get("price", 0)
+                result = self._tech_levels_engine.compute(
+                    klines_1m=klines_1m,
+                    klines_5m=klines_5m_data,
+                    klines_15m=klines_15m_data,
+                    price=price,
+                    vwap=ind.get("vwap", 0),
+                    ema20=ind.get("ema_20", 0),
+                    ema50=ind.get("ema_50", 0),
+                )
+                self._tech_levels_cache = result
+                self.market_state["technical_levels"] = result
+
             except Exception:
                 pass
             await asyncio.sleep(30.0)

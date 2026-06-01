@@ -76,8 +76,8 @@ class TradingBot:
                 return
 
         if not self.mock_mode:
-            if not settings.BINANCE_API_KEY or "invalid" in str(settings.BINANCE_API_KEY).lower():
-                console.print("⚠️ [yellow]Sin API Key válida - Modo MOCK[/yellow]")
+            if not settings.BINANCE_REAL_API_KEY or "invalid" in str(settings.BINANCE_REAL_API_KEY).lower():
+                console.print("⚠️ [yellow]Sin API Key REAL válida - Modo MOCK[/yellow]")
                 self.mock_mode = True
                 await self._init_mock_data()
 
@@ -239,8 +239,6 @@ def main():
 
     def signal_handler(sig, frame):
         console.print("\n⚠️ [yellow]Interrupción recibida[/yellow]")
-        asyncio.create_task(bot.stop())
-        sys.exit(0)
 
     signal.signal(signal.SIGINT, signal_handler)
 
@@ -249,8 +247,9 @@ def main():
             asyncio.run(asyncio.wait_for(bot.run(), timeout=args.timeout))
         else:
             asyncio.run(bot.run())
-    except asyncio.TimeoutError:
-        console.print("⏰ [yellow]Timeout alcanzado[/yellow]")
+    except (KeyboardInterrupt, asyncio.TimeoutError):
+        console.print("⏰ [yellow]Apagando...[/yellow]")
+    finally:
         asyncio.run(bot.stop())
 
 

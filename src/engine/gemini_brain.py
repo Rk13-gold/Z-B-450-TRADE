@@ -79,8 +79,8 @@ class GeminiTradingDecision(BaseModel):
     )
     reasoning: str = Field(
         ...,
-        max_length=500,
-        description="Concise analytical rationale with order-flow basis",
+        max_length=1000,
+        description="Analytical rationale with order-flow basis",
     )
     score_order_flow: float = Field(
         ..., ge=0.0, le=10.0,
@@ -135,6 +135,20 @@ ANÁLISIS REQUERIDO (en orden):
 4. Liquidez: muros bid/ask, depth_imb_pct. ¿Hay trampas / spoofing?
 5. Agotamiento: ¿Precio en extremo de bandas? ¿CVD frenándose? ¿Rango?
 
+NIVELES TÉCNICOS (SOPORTES / RESISTENCIAS / FIBONACCI):
+Cuando recibas el campo "technical_levels", úsalo para afinar tu predicción:
+- Si el precio está cerca de un nivel Fibonacci clave (0.382, 0.5, 0.618)
+  combinado con S/R histórico, considera posible REVERSIÓN desde esa zona.
+- Si el precio rompe un nivel Fibonacci + S/R con confluencia, confirma la
+  tendencia (breakout con objetivo en el siguiente nivel).
+- Las zonas de confluencia (score ≥ 0.7) son áreas de alta probabilidad
+  donde múltiples tipos de nivel se solapan — presta atención especial.
+- La estructura de mercado (UPTREND/DOWNTREND/RANGING) debe ser coherente
+  con tu decisión: no des ALZA si la estructura es bajista cerca de una
+  resistencia clave.
+- Usa el soporte o resistencia más cercana para validar si el bracket de
+  riesgo es razonable (SL no debe estar dentro de una zona de confluencia).
+
 CONTEXTO DE MEMORIA EPISÓDICA (Análisis Inter-Cerebral):
 Cuando recibas el campo "episodic_context", úsalo como VALIDADOR ESTRATÉGICO:
 - Las lecciones del pasado con etiqueta "FAILED" deben sesgar tu decisión en
@@ -143,7 +157,12 @@ Cuando recibas el campo "episodic_context", úsalo como VALIDADOR ESTRATÉGICO:
 - Las lecciones con etiqueta "SUCCESS" pueden servir como confirmación, pero
   no confíes ciegamente — cada tick es único.
 - Ajusta dinámicamente el bracket de riesgo según el contexto histórico:
-  más tight si hay fallos similares, más amplio si hay aciertos similares.\
+   más tight si hay fallos similares, más amplio si hay aciertos similares.
+
+IMPORTANTE — LÍMITE DE RAZONAMIENTO:
+- El campo "reasoning" debe tener MÁXIMO 800 caracteres.
+- Prioriza datos concretos sobre opiniones: menciona valores específicos
+  (delta, CVD, RSI, niveles de precios) en vez de descripciones genéricas.\
 """
 
 
@@ -238,6 +257,14 @@ class GeminiBrainManager:
                     f"delta={rec.delta:+.0f} trap={rec.trap_status}"
                 )
             compact['episodic_context'] = "\n".join(context_lines)
+
+        # Inject technical levels (S/R, Fibonacci, confluence)
+        tech_levels_raw = snapshot_data.get("technical_levels")
+        if tech_levels_raw and tech_levels_raw.get("fib_retracement"):
+            from src.engine.technical_levels import format_levels_for_prompt
+            price = snapshot_data.get("price", 0)
+            compact["technical_levels"] = format_levels_for_prompt(
+                tech_levels_raw, price)
 
         # Inject PyTorch metrics
         if pytorch_metrics:

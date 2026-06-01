@@ -14,7 +14,7 @@ from src.engine.strategy import trading_strategy
 from src.database.supabase_manager import supabase_manager
 
 
-client = Client(settings.BINANCE_API_KEY, settings.BINANCE_SECRET_KEY, testnet=False)
+client = Client(settings.BINANCE_REAL_API_KEY, settings.BINANCE_REAL_SECRET_KEY, testnet=False)
 
 # Colores ANSI
 NEGRO = "\033[40m"

@@ -94,9 +94,9 @@ def fetch_klines(symbol: str = "BTCUSDT", interval: str = "1m",
     try:
         from binance.client import Client
         from config.settings import settings
-        client = Client(settings.BINANCE_API_KEY,
-                        settings.BINANCE_SECRET_KEY,
-                        testnet=settings.BINANCE_TESTNET)
+        client = Client(settings.BINANCE_REAL_API_KEY,
+                        settings.BINANCE_REAL_SECRET_KEY,
+                        testnet=False)
         klines = client.futures_klines(
             symbol=symbol, interval=interval, limit=limit
         )

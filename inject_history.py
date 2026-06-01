@@ -76,9 +76,9 @@ def fetch_klines() -> list:
         sys.exit(1)
 
     client = Client(
-        settings.BINANCE_API_KEY,
-        settings.BINANCE_SECRET_KEY,
-        testnet=settings.BINANCE_TESTNET,
+        settings.BINANCE_REAL_API_KEY,
+        settings.BINANCE_REAL_SECRET_KEY,
+        testnet=False,
     )
 
     log.info("Descargando %d velas %s de %s Futures...", LIMIT, INTERVAL, SYMBOL)

@@ -85,6 +85,7 @@ class TradingBot:
             await binance_client.start_kline_stream(self.handle_kline)
             await binance_client.start_depth_stream(self.handle_depth)
             await binance_client.start_trade_stream(self.handle_trade)
+            await binance_client.start_liquidation_stream(self.handle_liquidation)
 
     async def _mock_data_generator(self):
         counter = 0
@@ -131,6 +132,10 @@ class TradingBot:
 
         if self.running:
             await self._check_signals()
+
+    async def handle_liquidation(self, liq: dict):
+        if liq.get('symbol') == settings.SYMBOL:
+            print(f"🧯 LIQ {liq['side']} {liq['quantity']:.3f} @ ${liq['price']:,.0f}")
 
     async def _check_signals(self):
         if not self.position and self.price > 0:
@@ -269,8 +274,6 @@ async def main():
 
     def signal_handler(sig, frame):
         console.print("\n⚠️ [yellow]Interrupción recibida[/yellow]")
-        asyncio.create_task(bot.stop())
-        sys.exit(0)
 
     signal.signal(signal.SIGINT, signal_handler)
 
@@ -279,13 +282,13 @@ async def main():
             await asyncio.wait_for(bot.run(), timeout=args.timeout)
         else:
             await bot.run()
-    except asyncio.TimeoutError:
-        console.print("⏰ [yellow]Timeout alcanzado[/yellow]")
-        await bot.stop()
+    except (KeyboardInterrupt, asyncio.TimeoutError):
+        console.print("⏰ [yellow]Apagando...[/yellow]")
     except Exception as e:
         console.print(f"❌ [red]Error: {e}[/red]")
         import traceback
         traceback.print_exc()
+    finally:
         await bot.stop()
 
 

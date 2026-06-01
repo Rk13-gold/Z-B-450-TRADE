@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import aiohttp, edge_tts
+from google import genai
 
 os.environ["MPLBACKEND"] = "Agg"
 import matplotlib
@@ -30,7 +31,6 @@ from config.settings import settings
 log = logging.getLogger("TelegramBot")
 
 API_BASE = "https://api.telegram.org/bot{token}/{method}"
-GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
 GEMINI_MODEL = "gemini-2.0-flash"
 
 ALLOWED_HTML_TAGS = frozenset({'b', 'i', 'code', 'u', 's', 'pre', 'a', 'tg-spoiler', 'span'})
@@ -56,6 +56,16 @@ def _reply_kb(*rows, resize=True, persistent=True, one_time=False):
         "one_time_keyboard": one_time,
         "input_field_placeholder": "Toca un bot\u00f3n...",
     }
+
+
+def _main_keyboard():
+    return _reply_kb(
+        ("\U0001f4ca Status", "\U0001f4c8 Signal", "\U0001f9e0 Brain"),
+        ("\U0001f4c9 Chart", "\U0001f4cf Niveles", "\U0001f916 Gemini"),
+        ("\u2699\ufe0f Config", "\U0001f7e2 Buy", "\U0001f534 Sell"),
+        ("\U0001f6aa Close", "\U0001f4b0 Balance", "\U0001f4cd Positions"),
+        ("\u2753 Help",),
+    )
 
 def _html_escape(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -137,7 +147,7 @@ class TelegramBot:
     SCALP_WHALE_TICK_SPEED_THRESHOLD = 25
     SCALP_TRAP_PROB_THRESHOLD = 60
 
-    def __init__(self):
+    def __init__(self, order_executor: Optional['OrderExecutor'] = None):
         self._bot_token: str = settings.TELEGRAM_BOT_TOKEN
         self._chat_id: int = int(settings.TELEGRAM_CHAT_ID) if settings.TELEGRAM_CHAT_ID else 0
         self.enabled: bool = settings.TELEGRAM_ENABLED
@@ -167,6 +177,8 @@ class TelegramBot:
         }
         self._radar_cooldown: float = 0.0
         self._prev_trend: str = "NEUTRAL"
+        self._last_trend_alert_ts: float = 0.0
+        self._last_strength_alert_ts: float = 0.0
         self._prev_trap_type: Optional[str] = None
 
         self._last_update_id = 0
@@ -174,8 +186,27 @@ class TelegramBot:
         self._gemini_key: str = settings.GEMINI_API_KEY
         self._gemini_enabled: bool = bool(self._gemini_key)
         self._gemini_history: list = []
+        self._gemini_fallback_count: int = 0
+        if self._gemini_enabled:
+            try:
+                self._gemini_client = genai.Client(api_key=self._gemini_key)
+                log.info("Gemini client initialized")
+            except Exception as e:
+                log.warning("Failed to initialize Gemini client: %s", e)
+                self._gemini_client = None
+                self._gemini_enabled = False
+        else:
+            self._gemini_client = None
+            log.warning("Gemini API key not set — Gemini features disabled")
 
         self._brain_block_log_counter: int = 0
+
+        # Referencia única al OrderExecutor del dashboard (se pasa por constructor)
+        self._order_executor: Optional['OrderExecutor'] = order_executor
+
+    def set_order_executor(self, executor):
+        """Inject the dashboard's OrderExecutor for callback-based execution."""
+        self._order_executor = executor
 
     # ─── Lifecycle ───────────────────────────────────────────────────
 
@@ -245,17 +276,25 @@ class TelegramBot:
                 print(f"[TelegramBot] \U0001f504 Reconectando... (chat_id={self._chat_id})")
 
     async def _main(self):
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=65, sock_connect=15)
-        ) as session:
+        connector = aiohttp.TCPConnector(limit=20, keepalive_timeout=60, ttl_dns_cache=300)
+        timeout = aiohttp.ClientTimeout(total=65, sock_connect=15)
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
             self._session = session
             await self._verify_connection()
             await asyncio.gather(
                 asyncio.create_task(self._process_queue()),
                 asyncio.create_task(self._poll_updates()),
                 asyncio.create_task(self._alert_loop()),
+                asyncio.create_task(self._heartbeat()),
                 return_exceptions=True,
             )
+
+    async def _heartbeat(self):
+        """Log cada 5 minutos confirmando que el bucle del bot sigue vivo."""
+        while self._running:
+            await asyncio.sleep(300)
+            if self._running:
+                print("💓 [HEARTBEAT] BB-450 operando con normalidad...")
 
     async def _verify_connection(self):
         try:
@@ -281,15 +320,20 @@ class TelegramBot:
             msg = _format_premium_message(
                 "\U0001f916 BB-450 Bot Conectado",
                 f"El dashboard est\u00e1 corriendo y monitoreando <code>{settings.SYMBOL}</code>.\n\n"
-                "<b>Comandos:</b>\n"
-                "/start - Men\u00fa principal\n"
-                "/info - Todos los indicadores\n"
-                "/signal - Se\u00f1al actual\n"
-                "/alerts - Configurar notificaciones\n"
-                "/status - Estado del bot\n"
-                "/micro - Microestructura cuantitativa",
+                "<b>Comandos r\u00e1pidos:</b>\n"
+                "\U0001f4ca /status — Estado del mercado\n"
+                "\U0001f4c8 /signal — \u00daltima se\u00f1al\n"
+                "\U0001f9e0 /brain — Cerebro cu\u00e1ntico\n"
+                "\U0001f4c9 /chart — Gr\u00e1fico t\u00e9cnico\n"
+                "\U0001f916 /gemini — Consultar Gemini AI\n"
+                "\U0001f7e2 /buy — Abrir LONG\n"
+                "\U0001f534 /sell — Abrir SHORT\n"
+                "\U0001f6aa /close_all — Cerrar todo\n"
+                "\U0001f4b0 /balance — Balance\n"
+                "\U0001f4cd /positions — Posiciones\n\n"
+                "<i>Usa los botones de abajo para acceder r\u00e1pido</i>",
             )
-            await self._send(msg)
+            await self._send(msg, reply_markup=_main_keyboard())
             print(f"[TelegramBot] \U0001f4e8 Mensaje de bienvenida enviado al chat {self._chat_id}")
         except Exception as e:
             print(f"[TelegramBot] \u26a0 No se pudo enviar el mensaje de bienvenida: {e}")
@@ -322,6 +366,13 @@ class TelegramBot:
                         await self._send(text)
                     continue
 
+                # POSITION TRACKING (single-order mode)
+                if snapshot.get('type') == 'position_tracking':
+                    text = snapshot.get('text', '')
+                    if text:
+                        await self._send(text)
+                    continue
+
                 # CANAL 1: ALERTAS DE MERCADO
                 await self._check_crash_alert()
                 await self._check_pump_alert()
@@ -342,7 +393,7 @@ class TelegramBot:
                         vol_ratio = vol / max(avg_vol, 0.001)
                         if conf > 55 and avg_vol > 0 and vol_ratio >= 1.0:
                             await self._send_signal_alert(snapshot)
-                        else:
+                        elif self._brain_block_log_counter % 30 == 0:
                             print(f"[TELEGRAM BOT] Alerta bloqueada: Confianza ({conf:.0f}%) por debajo del umbral o vol_ratio ({vol_ratio:.1f}x) insuficiente.")
 
                 # CANAL 2: SENIAL DEL CEREBRO CUANTICO
@@ -369,8 +420,9 @@ class TelegramBot:
 
             except asyncio.TimeoutError:
                 continue
-            except Exception:
-                pass
+            except Exception as exc:
+                log.error(f"[Queue] Error en _process_queue: {exc}", exc_info=True)
+                continue
 
     async def _handle_brain_signal(self, snapshot):
         bdir = snapshot.get('direction', 'INCIERTO')
@@ -597,16 +649,52 @@ class TelegramBot:
         trend = self._state.get("trend", "NEUTRAL")
         if not hasattr(self, '_prev_trend'):
             self._prev_trend = trend
+            self._last_trend_alert_ts = 0.0
             return
-        if trend != self._prev_trend:
+
+        if trend == self._prev_trend:
+            return
+
+        # ── FILTRO 1: Choppiness / Rango sucio ──────────────────────────
+        signal_text = self._state.get("signal_text", "WAIT")
+        trend_label = self._state.get("trend_label", "")
+        chop_keywords = ("CHOP", "HFT", "SQUEEZE", "WIDE SPREAD", "NO EDGE", "NO CLEAR")
+        is_choppy = (
+            signal_text == "WAIT"
+            or any(k in trend_label.upper() for k in chop_keywords)
+        )
+        if is_choppy:
             self._prev_trend = trend
-            emoji = "\U0001f7e2" if trend == "ALCISTA" else "\U0001f7e3"
-            body = (
-                f"  Nueva tendencia: <code>{trend}</code>\n"
-                f"  Precio: <code>${self._state.get('price', 0):,.0f}</code>\n"
-                f"  RSI: <code>{self._state.get('rsi', 50):.1f}</code>"
-            )
-            await self._send(_format_premium_message(f"{emoji} CAMBIO DE TENDENCIA", body))
+            return
+
+        # ── FILTRO 2: RSI suavizado (5m velas cerradas) ─────────────────
+        rsi_5m = self._state.get("rsi_5m", 0)
+        if not (50 < rsi_5m < 100 if trend == "ALCISTA" else 0 < rsi_5m < 50):
+            if rsi_5m > 0:
+                self._prev_trend = trend
+            return
+
+        # ── COOLDOWN 300s (salvo volumen extremo > 1000x) ───────────────
+        now = time.time()
+        volume = self._state.get("volume", 0)
+        avg_vol = self._state.get("avg_volume", 0)
+        vol_ratio = volume / max(avg_vol, 0.001)
+        last_ts = getattr(self, '_last_trend_alert_ts', 0.0)
+        sec_since_last = now - last_ts
+        if sec_since_last < 300.0 and vol_ratio < 1000:
+            self._prev_trend = trend
+            return
+
+        # ── Todos los filtros superados — enviar alerta ─────────────────
+        self._prev_trend = trend
+        self._last_trend_alert_ts = now
+        emoji = "\U0001f7e2" if trend == "ALCISTA" else "\U0001f7e3"
+        body = (
+            f"  Nueva tendencia: <code>{trend}</code>\n"
+            f"  Precio: <code>${self._state.get('price', 0):,.0f}</code>\n"
+            f"  RSI 5m: <code>{rsi_5m:.1f}</code>"
+        )
+        await self._send(_format_premium_message(f"{emoji} CAMBIO DE TENDENCIA", body))
 
     async def _check_signal_strength(self):
         """Alert when signal confidence crosses thresholds.
@@ -633,6 +721,36 @@ class TelegramBot:
         price_above_vwap = self._state.get('price_above_vwap', False)
         buy_imb_5 = self._state.get('buy_imbalance_count_5', 0)
 
+        # ── FILTRO A: Choppiness (mercado en rango) ─────────────────────
+        trend_label = self._state.get("trend_label", "")
+        chop_keywords = ("CHOP", "HFT", "SQUEEZE", "WIDE SPREAD", "NO EDGE", "NO CLEAR")
+        if sig == "WAIT" or any(k in trend_label.upper() for k in chop_keywords):
+            self._prev_conf = conf
+            self._prev_conf_sig = sig
+            return
+
+        # ── FILTRO B: RSI 5m debe confirmar dirección ──────────────────
+        rsi_5m = self._state.get("rsi_5m", 0)
+        if sig == "LONG" and not (rsi_5m > 50):
+            self._prev_conf = conf
+            self._prev_conf_sig = sig
+            return
+        if sig == "SHORT" and not (0 < rsi_5m < 50):
+            self._prev_conf = conf
+            self._prev_conf_sig = sig
+            return
+
+        # ── FILTRO C: Cooldown 300s (salvo volumen extremo) ────────────
+        now = time.time()
+        volume = self._state.get("volume", 0)
+        avg_vol = self._state.get("avg_volume", 0)
+        vol_ratio = volume / max(avg_vol, 0.001)
+        last_ts = getattr(self, '_last_strength_alert_ts', 0.0)
+        if now - last_ts < 300.0 and vol_ratio < 1000:
+            self._prev_conf = conf
+            self._prev_conf_sig = sig
+            return
+
         # FILTER 1: Price Action Invalidation
         if sig == 'SHORT' and price_above_vwap and buy_imb_5 >= 3:
             self._prev_conf = conf
@@ -649,6 +767,7 @@ class TelegramBot:
 
         # Original threshold logic
         if diff >= 20 and sig in ("LONG", "SHORT") and self._user_config.get("buy_sell", True):
+            self._last_strength_alert_ts = time.time()
             emoji = "\U0001f7e2" if sig == "LONG" else "\U0001f7e3"
             body = (
                 f"  Senal: <code>{sig}</code> | Confianza: <code>{conf:.0f}%</code>\n"
@@ -850,61 +969,95 @@ class TelegramBot:
 
     # ─── Send helpers ──────────────────────────────────────────────────────
 
-    async def _send(self, text: str, chat_id: int = None) -> bool:
+    async def _send(self, text: str, chat_id: int = None,
+                     reply_markup: Optional[dict] = None) -> bool:
         cid = chat_id or self._chat_id
         if not cid:
             return False
         url = f"https://api.telegram.org/bot{self._bot_token}/sendMessage"
         payload = {"chat_id": cid, "text": text, "parse_mode": "HTML",
                     "disable_web_page_preview": True}
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        session = self._session or aiohttp.ClientSession()
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    if resp.status == 200:
-                        return True
-                    text_resp = await resp.text()
-                    log.warning("Telegram send error %s: %s", resp.status, text_resp)
-                    return False
+            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    return True
+                text_resp = await resp.text()
+                log.warning("Telegram send error %s: %s", resp.status, text_resp)
+                return False
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             log.warning("Telegram send exception: %s", e)
             return False
+        finally:
+            if self._session is None:
+                await session.close()
 
     async def _send_photo(self, photo_bytes: bytes, caption: str = "",
-                           chat_id: int = None) -> bool:
+                           chat_id: int = None,
+                           reply_markup: Optional[dict] = None) -> bool:
         cid = chat_id or self._chat_id
         if not cid:
             return False
         url = f"https://api.telegram.org/bot{self._bot_token}/sendPhoto"
+        session = self._session or aiohttp.ClientSession()
         try:
-            async with aiohttp.ClientSession() as session:
-                data = aiohttp.FormData()
-                data.add_field("chat_id", str(cid))
-                data.add_field("photo", photo_bytes,
-                               filename="chart.png", content_type="image/png")
-                if caption:
-                    data.add_field("caption", caption, content_type="text/plain")
-                    data.add_field("parse_mode", "HTML")
-                async with session.post(url, data=data, timeout=aiohttp.ClientTimeout(total=30)) as resp:
-                    if resp.status == 200:
-                        return True
-                    text_resp = await resp.text()
-                    log.warning("Telegram sendPhoto error %s: %s", resp.status, text_resp)
-                    return False
+            data = aiohttp.FormData()
+            data.add_field("chat_id", str(cid))
+            data.add_field("photo", photo_bytes,
+                           filename="chart.png", content_type="image/png")
+            if caption:
+                data.add_field("caption", caption, content_type="text/plain")
+                data.add_field("parse_mode", "HTML")
+            if reply_markup:
+                data.add_field("reply_markup", json.dumps(reply_markup),
+                               content_type="application/json")
+            async with session.post(url, data=data, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                if resp.status == 200:
+                    return True
+                text_resp = await resp.text()
+                log.warning("Telegram sendPhoto error %s: %s", resp.status, text_resp)
+                return False
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             log.warning("Telegram sendPhoto exception: %s", e)
             return False
+        finally:
+            if self._session is None:
+                await session.close()
 
     async def _edit_message(self, chat_id: int, message_id: int, text: str) -> bool:
         url = f"https://api.telegram.org/bot{self._bot_token}/editMessageText"
         payload = {"chat_id": chat_id, "message_id": message_id,
                     "text": text, "parse_mode": "HTML",
                     "disable_web_page_preview": True}
+        session = self._session or aiohttp.ClientSession()
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    return resp.status == 200
+            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                return resp.status == 200
         except Exception:
             return False
+        finally:
+            if self._session is None:
+                await session.close()
+
+    # ─── Typing indicator ──────────────────────────────────────────────────
+
+    async def _send_typing(self, chat_id: int = None):
+        cid = chat_id or self._chat_id
+        if not cid:
+            return
+        url = f"https://api.telegram.org/bot{self._bot_token}/sendChatAction"
+        payload = {"chat_id": cid, "action": "typing"}
+        session = self._session or aiohttp.ClientSession()
+        try:
+            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                pass
+        except Exception:
+            pass
+        finally:
+            if self._session is None:
+                await session.close()
 
     # ─── Alert senders ─────────────────────────────────────────────────────
 
@@ -936,7 +1089,35 @@ class TelegramBot:
             f"  3\u20e3 Entrada con SL ajustado a la vela anterior\n\n"
             f"\u23f0 {snapshot.get('timestamp', '')}"
         )
-        await self._send(_format_premium_message(f"{emoji} {sig} DETECTADO ({conf:.0f}%)", body))
+        await self._send(_format_premium_message(f"{emoji} {sig} DETECTADO ({conf:.0f}%)", body),
+                         reply_markup=_main_keyboard())
+
+    async def _send_position_with_close(self, executor, chat_id: int):
+        loop = asyncio.get_event_loop()
+        pos = await loop.run_in_executor(None, executor.get_position_with_pnl)
+        if pos is None:
+            await self._send("\u2139\ufe0f No hay posici\u00f3n abierta actualmente.",
+                             chat_id=chat_id, reply_markup=_main_keyboard())
+            return
+        emoji = "\U0001f7e2" if pos["direction"] == "LONG" else "\U0001f7e3"
+        pnl = pos["pnl"]
+        pnl_emoji = "\U0001f7e2" if pnl >= 0 else "\U0001f534"
+        body = (
+            f"{emoji} <b>{pos['direction']}</b> | "
+            f"<code>{pos['entry_qty']} BTC</code>\n"
+            f"Entrada: <code>${pos['entry_price']:,.0f}</code>\n"
+            f"Mark: <code>${pos['mark_price']:,.0f}</code>\n"
+            f"Liq: <code>${pos['liquidation_price']:,.0f}</code>\n"
+            f"{pnl_emoji} P&L: "
+            f"<code>{'$' if pnl >= 0 else '-$'}{abs(pnl):,.2f}</code> "
+            f"({pos['pnl_pct']:+.2f}%)"
+        )
+        close_kb = {"inline_keyboard": [[
+            _btn("\U0001f6aa Cerrar Posici\u00f3n", "close_position")
+        ]]}
+        await self._send(_format_premium_message(
+            "\u26a0\ufe0f YA HAY UNA POSICI\u00d3N ABIERTA", body),
+            chat_id=chat_id, reply_markup=close_kb)
 
     async def _send_brain_alert(self, snapshot: dict):
         bdir = snapshot.get('direction') or snapshot.get('brain_direction', 'INCIERTO')
@@ -944,6 +1125,7 @@ class TelegramBot:
         p = snapshot.get('price', 0)
         delta = snapshot.get('delta', 0)
         cvd = snapshot.get('cvd', 0)
+        rsi = snapshot.get('rsi', 50)
         vol = snapshot.get('volume', 0)
         avg_vol = snapshot.get('avg_volume', 0)
         vol_r = vol / avg_vol if avg_vol > 0 else 0
@@ -954,7 +1136,6 @@ class TelegramBot:
         tp1 = bracket.get('tp1', 0) or snapshot.get('brain_bracket_tp1', 0)
         tp2 = bracket.get('tp2', 0) or snapshot.get('brain_bracket_tp2', 0)
 
-        # Safety: nunca enviar con SL/TP inválidos
         if sl <= 0 or tp1 <= 0:
             log.error(f"[SAFETY] _send_brain_alert ABORTADO — "
                       f"SL=${sl:.0f} TP=${tp1:.0f}")
@@ -967,20 +1148,82 @@ class TelegramBot:
         r_perdida = sl_pct
         r_ganancia = abs((tp1 - sl) / (p - sl)) * r_perdida if abs(p - sl) > 0 else 0
 
-        body = (
-            f"<b>DIRECCION:</b> {emoji} {bdir}\n"
-            f"<b>CONFIANZA:</b> <code>{bconf:.1f}%</code>\n"
-            f"<b>PRECIO:</b> <code>${p:,.0f}</code>\n\n"
-            f"<b>MERCADO:</b>\n"
-            f"  Delta: <code>{delta:+.0f}</code> | CVD: <code>{cvd:.1f}</code>\n"
-            f"  Vol: <code>{vol_r:.1f}x</code>\n\n"
-            f"<b>\U0001f4b0 CAPITAL:</b> <code>${capital:.1f}</code> x <code>{settings.LEVERAGE}x</code>\n"
-            f"<b>\U0001f6a9 SL:</b> <code>${sl:,.0f}</code> ({sl_pct:.1f}% | R {r_perdida:.1f}%)\n"
-            f"<b>\U0001f4c8 TP1:</b> <code>${tp1:,.0f}</code> (R {r_ganancia:.1f}%)\n"
-            + (f"<b>\U0001f4c8 TP2:</b> <code>${tp2:,.0f}</code>\n" if tp2 else "")
-            + f"\n\u23f0 {snapshot.get('timestamp', '')}"
+        # ── 1. AI analysis via Gemini ─────────────────────────────────
+        ai_text = ""
+        if self._gemini_enabled:
+            prompt = (
+                f"Analiza esta señal de trading para {settings.SYMBOL}:\n"
+                f"- Dirección: {bdir}\n- Confianza: {bconf:.1f}%\n"
+                f"- Precio: ${p:,.0f}\n- Delta: {delta:+.0f}, CVD: {cvd:.1f}\n"
+                f"- RSI: {rsi:.1f}, Vol relativo: {vol_r:.1f}x\n"
+                f"- SL: ${sl:,.0f}, TP: ${tp1:,.0f}\n\n"
+                f"Da un análisis técnico breve de 2 líneas explicando "
+                f"por qué esta entrada tiene sentido."
+            )
+            try:
+                raw = await self._chat_gemini_raw(prompt)
+                if raw and "Gemini no disponible" not in raw and "Error Gemini" not in raw:
+                    ai_text = raw.strip()
+            except Exception:
+                pass
+
+        # ── 2. Generate chart with entry/SL/TP lines ─────────────────
+        klines = await self._fetch_klines()
+        chart_bytes = None
+        if klines:
+            chart_bytes = await self._generate_brain_chart(klines, p, sl, tp1)
+
+        # ── 3. Build caption (matches the existing format) ───────────
+        caption = (
+            f"{emoji} <b>{bdir} — Confianza {bconf:.1f}%</b>\n"
+            f"<b>Precio:</b> <code>${p:,.0f}</code>\n"
+            f"<b>SL:</b> <code>${sl:,.0f}</code> | "
+            f"<b>TP:</b> <code>${tp1:,.0f}</code>\n"
+            f"Delta: <code>{delta:+.0f}</code> CVD: <code>{cvd:.1f}</code> "
+            f"RSI: <code>{rsi:.1f}</code>\n"
+            f"Vol: <code>{vol_r:.1f}x</code> | "
+            f"<b>R:</b> <code>{r_ganancia / r_perdida:.1f}R</code>"
+            f"{f'\n\n🤖 <i>{_sanitize_html(ai_text)}</i>' if ai_text else ''}"
         )
-        await self._send(_format_premium_message("\U0001f9e0 SENIAL DEL CEREBRO CUANTICO", body))
+
+        # ── 4. Inline keyboard ──────────────────────────────────────
+        callback_data = (
+            f"exec_order:{bdir}:{p}:{sl}:{tp1}"
+        )
+        keyboard = {
+            "inline_keyboard": [[
+                _btn("\U0001f680 Autorizar Orden a Mercado", callback_data)
+            ]]
+        }
+
+        # ── 5. Send photo (with caption + inline button) or fallback ─
+        if chart_bytes:
+            await self._send_photo(chart_bytes, caption=caption,
+                                    reply_markup=keyboard)
+        else:
+            body = (
+                f"<b>DIRECCION:</b> {emoji} {bdir}\n"
+                f"<b>CONFIANZA:</b> <code>{bconf:.1f}%</code>\n"
+                f"<b>PRECIO:</b> <code>${p:,.0f}</code>\n\n"
+                f"<b>MERCADO:</b>\n"
+                f"  Delta: <code>{delta:+.0f}</code> | CVD: <code>{cvd:.1f}</code>\n"
+                f"  Vol: <code>{vol_r:.1f}x</code>\n\n"
+                f"<b>\U0001f4b0 CAPITAL:</b> <code>${capital:.1f}</code> x "
+                f"<code>{settings.LEVERAGE}x</code>\n"
+                f"<b>\U0001f6a9 SL:</b> <code>${sl:,.0f}</code> ({sl_pct:.1f}% | "
+                f"R {r_perdida:.1f}%)\n"
+                f"<b>\U0001f4c8 TP1:</b> <code>${tp1:,.0f}</code> "
+                f"(R {r_ganancia:.1f}%)\n"
+                + (f"<b>\U0001f4c8 TP2:</b> <code>${tp2:,.0f}</code>\n" if tp2 else "")
+                + (f"\n🤖 <i>{_sanitize_html(ai_text)}</i>\n" if ai_text else "")
+                + f"\n\u23f0 {snapshot.get('timestamp', '')}"
+            )
+            await self._send(
+                _format_premium_message(
+                    "\U0001f9e0 SENIAL DEL CEREBRO CUANTICO", body
+                ),
+                reply_markup=keyboard,
+            )
 
     async def _send_trap_change_alert(self, snapshot: dict, trap: str):
         prob_dir = snapshot.get('directional_probability', 50.0)
@@ -1061,20 +1304,48 @@ class TelegramBot:
     # ─── Chart generation ──────────────────────────────────────────────────
 
     async def _fetch_klines(self) -> list:
+        # Intento 1: usar el binance_client compartido (ahora async nativo)
         try:
             from src.engine.binance_client import binance_client as bc
-            if bc is None:
-                return []
-            loop = asyncio.get_event_loop()
-            klines = await loop.run_in_executor(
-                None, lambda: bc.get_klines(symbol=settings.SYMBOL, interval="1m", limit=120)
-            )
-            return klines if klines else []
+            if bc is not None:
+                klines = await bc.get_historical_klines(interval="1m", limit=120)
+                if klines:
+                    return klines
         except Exception as e:
-            log.warning("Fetch klines error: %s", e)
-            return []
+            log.warning("Fetch klines (shared) error: %s", e)
+
+        # Intento 2: fallback directo a la API vía order_executor._client (sync → thread)
+        try:
+            executor = self._order_executor
+            if executor is not None and executor._client is not None:
+                loop = asyncio.get_event_loop()
+                klines = await loop.run_in_executor(
+                    None, lambda: executor._client.futures_klines(
+                        symbol=settings.SYMBOL, interval="1m", limit=120
+                    ))
+                if klines:
+                    return klines
+        except Exception as e:
+            log.warning("Fetch klines (executor fallback) error: %s", e)
+
+        # Intento 3: HTTP directo a Binance público (sin API key)
+        try:
+            url = ("https://fapi.binance.com/fapi/v1/klines?"
+                   f"symbol={settings.SYMBOL}&interval=1m&limit=120")
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status == 200:
+                        return await resp.json()
+        except Exception as e:
+            log.warning("Fetch klines (HTTP fallback) error: %s", e)
+
+        return []
 
     async def _generate_chart(self, klines: list) -> Optional[bytes]:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self._generate_chart_sync, klines)
+
+    def _generate_chart_sync(self, klines: list) -> Optional[bytes]:
         if not klines or len(klines) < 30:
             return None
         try:
@@ -1084,27 +1355,177 @@ class TelegramBot:
             lows = [float(k[3]) for k in klines]
             volumes = [float(k[5]) for k in klines]
 
-            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 8), gridspec_kw={"height_ratios": [3, 1]})
+            fig, (ax1, ax2, ax3, ax4) = plt.subplots(
+                4, 1, figsize=(14, 12),
+                gridspec_kw={"height_ratios": [3, 1, 1, 1]},
+                sharex=True,
+            )
+            fig.patch.set_facecolor("#0B0B0B")
+            for ax in (ax1, ax2, ax3, ax4):
+                ax.set_facecolor("#0B0B0B")
+
+            UP_COLOR = "#00FF88"
+            DOWN_COLOR = "#BB00FF"
+            # ── Candlesticks ──
+            for i in range(len(klines)):
+                color = UP_COLOR if closes[i] >= float(klines[i][1]) else DOWN_COLOR
+                ax1.plot([dates[i], dates[i]], [lows[i], highs[i]], color=color, linewidth=0.8)
+                ax1.plot([dates[i], dates[i]],
+                         [min(closes[i], float(klines[i][1])),
+                          max(closes[i], float(klines[i][1]))],
+                         color=color, linewidth=3)
+
+            # EMA 9 / 21 / 50
+            ema9 = self._compute_ema(closes, 9)
+            ema21 = self._compute_ema(closes, 21)
+            ema50 = self._compute_ema(closes, 50)
+            if ema9:
+                ax1.plot(dates[-len(ema9):], ema9, color="#FFD700", linewidth=1, alpha=0.9, label="EMA 9")
+            if ema21:
+                ax1.plot(dates[-len(ema21):], ema21, color="#FF69B4", linewidth=1, alpha=0.9, label="EMA 21")
+            if ema50:
+                ax1.plot(dates[-len(ema50):], ema50, color="#00BFFF", linewidth=1, alpha=0.7, label="EMA 50")
+
+            # Bollinger Bands
+            if len(closes) >= 20:
+                sma20 = [sum(closes[i-19:i+1])/20 for i in range(19, len(closes))]
+                std20 = [(sum((closes[i+j-19] - sma20[j])**2 for j in range(20))/20)**0.5
+                         for i in range(19, len(closes))]
+                bb_upper = [sma20[i] + 2 * std20[i] for i in range(len(sma20))]
+                bb_lower = [sma20[i] - 2 * std20[i] for i in range(len(sma20))]
+                bb_dates = dates[19:]
+                ax1.plot(bb_dates, bb_upper, color="#888888", linewidth=0.8, alpha=0.5, linestyle="--")
+                ax1.plot(bb_dates, bb_lower, color="#888888", linewidth=0.8, alpha=0.5, linestyle="--")
+                ax1.fill_between(bb_dates, bb_upper, bb_lower, color="#888888", alpha=0.05)
+
+            # ── Volume ──
+            vol_colors = [UP_COLOR if closes[i] >= float(klines[i][1]) else DOWN_COLOR
+                          for i in range(len(klines))]
+            ax2.bar(dates, volumes, color=vol_colors, width=0.001, alpha=0.7)
+            ax2.set_ylabel("Volume", color="#888888", fontsize=8)
+
+            # ── RSI ──
+            if len(closes) > 14:
+                rsi_vals = []
+                for i in range(14, len(closes)):
+                    deltas = [closes[j] - closes[j-1] for j in range(i-13, i+1)]
+                    gains = sum(d for d in deltas if d > 0) / 14
+                    losses = sum(-d for d in deltas if d < 0) / 14
+                    rs = gains / losses if losses > 0 else 100
+                    rsi_vals.append(100 - 100 / (1 + rs))
+                ax3.plot(dates[14:], rsi_vals, color="#BB00FF", linewidth=1.5, alpha=0.9)
+                ax3.axhline(y=70, color=DOWN_COLOR, linewidth=0.8, linestyle="--", alpha=0.5)
+                ax3.axhline(y=30, color=UP_COLOR, linewidth=0.8, linestyle="--", alpha=0.5)
+                ax3.set_ylabel("RSI", color="#888888", fontsize=8)
+                ax3.set_ylim(0, 100)
+
+            # ── MACD ──
+            if len(closes) > 26:
+                ema12 = self._compute_ema(closes, 12)
+                ema26 = self._compute_ema(closes, 26)
+                if ema12 and ema26:
+                    macd_line = [ema12[i] - ema26[i] for i in range(len(ema26))]
+                    macd_dates = dates[-len(macd_line):]
+                    sig_line = self._compute_ema(macd_line, 9)
+                    if sig_line:
+                        hist = [macd_line[-(len(sig_line)) + i] - sig_line[i] for i in range(len(sig_line))]
+                        hist_dates = macd_dates[-len(hist):]
+                        hist_colors = [UP_COLOR if h >= 0 else DOWN_COLOR for h in hist]
+                        ax4.bar(hist_dates, hist, color=hist_colors, width=0.001, alpha=0.7)
+                        ax4.plot(hist_dates, sig_line[-len(hist):], color="#FFD700", linewidth=1, alpha=0.8, label="Signal")
+                    ax4.axhline(y=0, color="#444444", linewidth=0.8)
+                    ax4.set_ylabel("MACD", color="#888888", fontsize=8)
+
+            # ── Styling ──
+            ax1.legend(loc="upper left", facecolor="#1A1A1A", edgecolor="none",
+                       labelcolor="white", fontsize=8)
+            for ax in (ax1, ax2, ax3, ax4):
+                for spine in ax.spines.values():
+                    spine.set_color("#333333")
+                ax.tick_params(colors="#888888", labelsize=8)
+                ax.grid(True, alpha=0.15, color="#444444")
+
+            ax4.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+            ax4.xaxis.set_major_locator(mdates.MinuteLocator(interval=30))
+            ax1.set_title(f"{settings.SYMBOL} — Análisis Técnico Completo",
+                          color="white", fontsize=12, pad=10)
+
+            buf = io.BytesIO()
+            fig.savefig(buf, format="png", dpi=120, bbox_inches="tight",
+                        facecolor="#0B0B0B", edgecolor="none")
+            plt.close(fig)
+            buf.seek(0)
+            return buf.getvalue()
+        except Exception as e:
+            log.warning("Chart generation error: %s", e)
+            return None
+
+    async def _generate_brain_chart(self, klines: list, entry: float,
+                                     sl: float, tp: float) -> Optional[bytes]:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None, self._generate_brain_chart_sync, klines, entry, sl, tp)
+
+    def _generate_brain_chart_sync(self, klines: list, entry: float,
+                                    sl: float, tp: float) -> Optional[bytes]:
+        """Generate chart with entry / SL / TP horizontal lines."""
+        UP_COLOR = "#00FF88"
+        DOWN_COLOR = "#BB00FF"
+        if not klines or len(klines) < 30:
+            return None
+        try:
+            dates = [datetime.fromtimestamp(k[0] / 1000, tz=timezone.utc) for k in klines]
+            closes = [float(k[4]) for k in klines]
+            highs = [float(k[2]) for k in klines]
+            lows = [float(k[3]) for k in klines]
+            volumes = [float(k[5]) for k in klines]
+
+            fig, (ax1, ax2) = plt.subplots(
+                2, 1, figsize=(14, 8), gridspec_kw={"height_ratios": [3, 1]}
+            )
             fig.patch.set_facecolor("#0B0B0B")
             ax1.set_facecolor("#0B0B0B")
             ax2.set_facecolor("#0B0B0B")
 
-            # Candlesticks
             for i in range(len(klines)):
-                color = "#00FF88" if closes[i] >= klines[i][1] else "#FF3366"
-                ax1.plot([dates[i], dates[i]], [lows[i], highs[i]], color=color, linewidth=0.8)
-                ax1.plot([dates[i], dates[i]], [min(closes[i], float(klines[i][1])),
-                         max(closes[i], float(klines[i][1]))], color=color, linewidth=3)
+                color = UP_COLOR if closes[i] >= float(klines[i][1]) else DOWN_COLOR
+                ax1.plot([dates[i], dates[i]], [lows[i], highs[i]],
+                         color=color, linewidth=0.8)
+                ax1.plot([dates[i], dates[i]],
+                         [min(closes[i], float(klines[i][1])),
+                          max(closes[i], float(klines[i][1]))],
+                         color=color, linewidth=3)
 
-            # EMAs
             ema9 = self._compute_ema(closes, 9)
             ema21 = self._compute_ema(closes, 21)
-            if ema9 and ema21:
-                ax1.plot(dates[-len(ema9):], ema9, color="#FFD700", linewidth=1, alpha=0.9, label="EMA 9")
-                ax1.plot(dates[-len(ema21):], ema21, color="#FF69B4", linewidth=1, alpha=0.9, label="EMA 21")
+            if ema9:
+                ax1.plot(dates[-len(ema9):], ema9, color="#FFD700",
+                         linewidth=1, alpha=0.9, label="EMA 9")
+            if ema21:
+                ax1.plot(dates[-len(ema21):], ema21, color="#FF69B4",
+                         linewidth=1, alpha=0.9, label="EMA 21")
 
-            # Volume bars
-            vol_colors = ["#00FF88" if closes[i] >= float(klines[i][1]) else "#FF3366" for i in range(len(klines))]
+            last_x = dates[-1]
+            y_min, y_max = ax1.get_ylim()
+
+            def draw_hline(price, color, style, label):
+                ax1.axhline(y=price, color=color, linestyle=style,
+                            linewidth=1.5, alpha=0.9)
+                ax1.annotate(label, xy=(last_x, price),
+                             xytext=(10, 0), textcoords="offset points",
+                             color=color, fontsize=9,
+                             bbox=dict(boxstyle="round,pad=0.2",
+                                       facecolor="#0B0B0B", edgecolor=color,
+                                       alpha=0.8))
+
+            draw_hline(entry, "#00FF88", "--", f"ENTRY ${entry:,.0f}")
+            draw_hline(sl, "#FF3366", ":", f"SL ${sl:,.0f}")
+            draw_hline(tp, "#00CCFF", ":", f"TP ${tp:,.0f}")
+
+            vol_colors = [
+                UP_COLOR if closes[i] >= float(klines[i][1]) else DOWN_COLOR
+                for i in range(len(klines))
+            ]
             ax2.bar(dates, volumes, color=vol_colors, width=0.001, alpha=0.7)
 
             ax1.legend(loc="upper left", facecolor="#1A1A1A", edgecolor="none",
@@ -1119,7 +1540,7 @@ class TelegramBot:
             ax1.xaxis.set_major_locator(mdates.MinuteLocator(interval=15))
             ax2.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
 
-            ax1.set_title(f"{settings.SYMBOL} - Analisis Tecnico",
+            ax1.set_title(f"{settings.SYMBOL} — Señal del Cerebro Cuántico",
                           color="white", fontsize=12, pad=10)
             ax1.grid(True, alpha=0.15, color="#444444")
             ax2.grid(True, alpha=0.15, color="#444444")
@@ -1131,7 +1552,7 @@ class TelegramBot:
             buf.seek(0)
             return buf.getvalue()
         except Exception as e:
-            log.warning("Chart generation error: %s", e)
+            log.warning("Brain chart generation error: %s", e)
             return None
 
     @staticmethod
@@ -1157,6 +1578,8 @@ class TelegramBot:
                 chat_id=chat_id)
             return
 
+        await self._send_typing(chat_id)
+
         s = self._state or {}
         snapshot_json = json.dumps({
             "price": s.get("price", 0), "delta": s.get("delta", 0),
@@ -1177,23 +1600,186 @@ class TelegramBot:
             f"Datos del mercado en vivo de {settings.SYMBOL}:\n"
             f"```json\n{snapshot_json}\n```\n\n"
             f"Pregunta del usuario ({user_name}): {user_text}\n\n"
-            f"Responde de forma clara y concisa (max 350 tokens). "
-            f"Usa datos del snapshot cuando sea relevante. "
+            f"Responde de forma clara y concisa (max 350 tokens).\n"
+            f"FORMATO OBLIGATORIO — Usa etiquetas HTML para dar estructura:\n"
+            f"  - <b>texto</b> para títulos y palabras clave\n"
+            f"  - <code>numero</code> para valores numéricos\n"
+            f"  - Emojis profesionales: 📊 📈 📉 🟢 🔴 🟣 🎯 ⚡ 💡 📰 🧠\n"
+            f"  - Separa secciones con \\n y usa viñetas con —\n"
+            f"Ejemplo:\n"
+            f"  <b>📊 PRECIO:</b> <code>$73,600</code>\n"
+            f"  <b>📈 SEÑAL:</b> 🟡 NEUTRAL\n\n"
             f"NO des consejos financieros, solo analisis."
         )
         try:
+            from google.genai import types as genai_types
             resp = await asyncio.get_event_loop().run_in_executor(
                 None, lambda: self._gemini_client.models.generate_content(
                     model="gemini-2.0-flash",
                     contents=prompt,
-                    config={"generation_config": {"max_output_tokens": 350}}
+                    config=genai_types.GenerateContentConfig(max_output_tokens=350)
                 ))
             reply = resp.text.strip()
         except Exception as e:
             reply = f"Error al consultar Gemini: {e}"
             log.warning("Gemini chat error: %s", e)
 
-        await self._send(f"<b>Gemini AI ({user_name}):</b>\n\n{reply}", chat_id=chat_id)
+        await self._send(f"<b>Gemini AI ({user_name}):</b>\n\n{reply}",
+                         chat_id=chat_id, reply_markup=_main_keyboard())
+
+    async def _get_trade_analysis(self, direction: str, entry_price: float,
+                                    sl_price: float, tp_price: float,
+                                    capital: float, leverage: int = 0,
+                                    qty: float = 0) -> Optional[str]:
+        if not self._gemini_enabled:
+            return None
+        await self._send_typing()
+        s = self._state or {}
+        lev = leverage or int(getattr(settings, 'LEVERAGE', 100))
+        qty_str = f"{qty:.4f} BTC" if qty else f"${capital:,.0f} @ {lev}x"
+        direction_upper = direction.upper()
+        is_long = direction_upper in ("BUY", "LONG", "ALZA")
+        side_label = "LONG BTCUSDT" if is_long else "SHORT BTCUSDT"
+        direction_emoji = "\U0001f7e2" if is_long else "\U0001f534"
+        target_text = "subida" if is_long else "caída"
+        sl_valid = sl_price < entry_price if is_long else sl_price > entry_price
+        snap = {
+            "direction": direction_upper,
+            "entry": entry_price,
+            "sl": sl_price,
+            "tp": tp_price,
+            "capital": capital,
+            "leverage": lev,
+            "qty": qty_str,
+            "price": s.get("price", 0),
+            "delta": s.get("delta", 0),
+            "cvd": s.get("cvd", 0),
+            "volume": s.get("volume", 0),
+            "avg_volume": s.get("avg_volume", 0),
+            "rsi": s.get("rsi", 50),
+            "trend_5m": s.get("trend_5m", "NEUTRAL"),
+            "vol_ratio": s.get("volume", 0) / max(s.get("avg_volume", 0), 0.001),
+        }
+        prompt = (
+            f"Eres un gestor de riesgo evaluando una orden {side_label}.\n\n"
+            f"* Tipo: {side_label}\n"
+            f"* Precio de entrada: <code>${entry_price:,.0f}</code>\n"
+            f"* Stop Loss: <code>${sl_price:,.0f}</code>\n"
+            f"* Take Profit: <code>${tp_price:,.0f}</code>\n"
+            f"* Capital: <code>${capital:,.1f}</code> | Apalancamiento: <code>{lev}x</code>\n"
+            f"* Tamaño: <code>{qty_str}</code>\n"
+            f"{'✅ SL es menor que entrada — lógico para LONG' if is_long and sl_valid else ''}"
+            f"{'✅ SL es mayor que entrada — lógico para SHORT' if not is_long and sl_valid else ''}"
+            f"{'⚠️ SL inválido — debería ser menor que entrada en LONG' if is_long and not sl_valid else ''}"
+            f"{'⚠️ SL inválido — debería ser mayor que entrada en SHORT' if not is_long and not sl_valid else ''}\n\n"
+            f"Datos de mercado:\n"
+            f"Precio actual: ${entry_price:,.0f} | Delta: {snap['delta']:+.0f} | CVD: {snap['cvd']:.1f}\n"
+            f"Volumen: {snap['volume']:.1f} | Ratio Vol: {snap['vol_ratio']:.1f}x | RSI: {snap['rsi']:.1f}\n"
+            f"Tendencia 5m: {snap['trend_5m']}\n\n"
+            f"REGLAS:\n"
+            f"  - <b>titulo</b> y <code>valor</code>\n"
+            f"  - Emojis: {direction_emoji} 💰 🎯 ⚠️\n"
+            f"  - Máximo 3 líneas\n"
+            f"  - Evalúa si el bracket SL/TP es coherente con la volatilidad actual\n"
+            f"  - Menciona si el mercado soporta una {target_text}\n"
+            f"  - NO des consejos financieros\n\n"
+            f"Análisis de riesgo:"
+        )
+        try:
+            from google.genai import types as genai_types
+            resp = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: self._gemini_client.models.generate_content(
+                    model="gemini-2.0-flash",
+                    contents=prompt,
+                    config=genai_types.GenerateContentConfig(max_output_tokens=250)
+                ))
+            return resp.text.strip()
+        except Exception as e:
+            log.warning("Trade analysis error: %s", e)
+            return None
+
+    async def _get_ai_analysis(self, analysis_type: str, chat_id: int = None) -> Optional[str]:
+        if not self._gemini_enabled:
+            return None
+        await self._send_typing(chat_id)
+        s = self._state or {}
+        snapshot_json = json.dumps({
+            "price": s.get("price", 0), "delta": s.get("delta", 0),
+            "cvd": s.get("cvd", 0), "volume": s.get("volume", 0),
+            "rsi": s.get("rsi", 50), "signal": s.get("signal_text", "WAIT"),
+            "confidence": s.get("confidence", 0),
+            "brain_direction": s.get("brain_direction", "N/A"),
+            "brain_confidence": s.get("brain_confidence_pct", 0),
+            "trend_5m": s.get("trend_5m", "NEUTRAL"),
+            "trend_1h": s.get("trend_1h", "NEUTRAL"),
+            "ba_ratio": s.get("ba_ratio", 1.0),
+            "tick_speed": s.get("tick_speed", 0),
+            "trap_status": s.get("trap_status", "N/A"),
+            "technical_levels": s.get("technical_levels", {}),
+            "timestamp": s.get("timestamp", ""),
+        }, indent=2)
+
+        prompts = {
+            "market": (
+                "Eres un analista de trading profesional. "
+                "Basándote en los datos en vivo, genera un análisis CONCISO del mercado.\n\n"
+                "REGLAS:\n"
+                "  - Usa <b>texto</b> para títulos, <code>valor</code> para números\n"
+                "  - Emojis: 📊 📈 📉 🟢 🔴 🟣 🎯 ⚡ 💡\n"
+                "  - Máximo 4 líneas\n"
+                "  - Destaca el dato más relevante primero\n"
+                "  - NO des consejos financieros"
+            ),
+            "signal": (
+                "Eres un estratega de trading. "
+                "Analiza la señal generada y su contexto de mercado.\n\n"
+                "REGLAS:\n"
+                "  - <b>título</b> y <code>valor</code>\n"
+                "  - Emojis: 📊 📈 📉 🟢 🔴 🟣 🎯\n"
+                "  - Máximo 3 líneas\n"
+                "  - Explica si la señal tiene confluencia con delta/RSI/volumen\n"
+                "  - NO des consejos financieros"
+            ),
+            "brain": (
+                "Eres un validador de señales de IA. "
+                "Evalúa la señal del cerebro cuántico y el bracket SL/TP.\n\n"
+                "REGLAS:\n"
+                "  - <b>título</b> y <code>valor</code>\n"
+                "  - Emojis: 🧠 📊 🟢 🔴 🟣 🎯\n"
+                "  - Máximo 3 líneas\n"
+                "  - Valida el riesgo de la operación según el bracket\n"
+                "  - NO des consejos financieros"
+            ),
+            "chart": (
+                "Eres un analista técnico experto en gráficos BTC. "
+                "Interpreta el análisis técnico del chart.\n\n"
+                "REGLAS:\n"
+                "  - <b>título</b> y <code>valor</code>\n"
+                "  - Emojis: 📉 📈 🟢 🔴 🟣 🎯 ⚡\n"
+                "  - Máximo 4 líneas\n"
+                "  - Menciona RSI, Bollinger, EMAs y volumen\n"
+                "  - NO des consejos financieros"
+            ),
+        }
+        base_prompt = prompts.get(analysis_type, prompts["market"])
+        prompt = (
+            f"{base_prompt}\n\n"
+            f"Datos del mercado en vivo de {settings.SYMBOL}:\n"
+            f"```json\n{snapshot_json}\n```\n\n"
+            f"Análisis:"
+        )
+        try:
+            from google.genai import types as genai_types
+            resp = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: self._gemini_client.models.generate_content(
+                    model="gemini-2.0-flash",
+                    contents=prompt,
+                    config=genai_types.GenerateContentConfig(max_output_tokens=250)
+                ))
+            return resp.text.strip()
+        except Exception as e:
+            log.warning("AI analysis error (%s): %s", analysis_type, e)
+            return None
 
     # ─── Command handlers ──────────────────────────────────────────────────
 
@@ -1205,29 +1791,29 @@ class TelegramBot:
         if text == "/start":
             await self._send(
                 f"\U0001f916 <b>BB-450 Trading Bot</b>\n\n"
-                f"Bienvenido! Usa /help para ver comandos disponibles.",
-                chat_id=chat_id)
+                f"Bienvenido! Usa los botones o /help para ver todos los comandos.",
+                chat_id=chat_id,
+                reply_markup=_main_keyboard())
             return
 
         if text == "/help":
             await self._send(
                 "\U0001f4d6 <b>COMANDOS DISPONIBLES</b>\n\n"
-                "/start - Iniciar bot\n"
-                "/help - Mostrar comandos\n"
-                "/status - Estado del mercado\n"
-                "/config - Configuración actual\n"
-                "/signal - Última señal generada\n"
-                "/brain - Última señal del cerebro cuántico\n"
-                "/buy [monto] - Abrir LONG con monto opcional\n"
-                "/sell [monto] - Abrir SHORT con monto opcional\n"
-                "/close_all - Cerrar todas las posiciones\n"
-                "/balance - Ver balance de la cuenta\n"
-                "/positions - Ver posiciones abiertas\n"
-                "/gemini [pregunta] - Consultar Gemini AI\n"
-                "/chart - Generar gráfico técnico\n"
-                "/settings - Ver ajustes activos\n\n"
-                "Ejemplo: <code>/gemini que opinas del delta actual?</code>",
-                chat_id=chat_id)
+                "\U0001f4ca /status — Estado del mercado\n"
+                "\U0001f4c8 /signal — Última señal\n"
+                "\U0001f9e0 /brain — Cerebro cuántico\n"
+                "\U0001f4c9 /chart — Gráfico técnico\n"
+                "\U0001f4cf /niveles — Soportes/Resistencias/Fibonacci\n"
+                "\U0001f916 /gemini [texto] — Consultar Gemini AI\n"
+                "\u2699\ufe0f /config — Configuración\n"
+                "\U0001f7e2 /buy [monto] — LONG\n"
+                "\U0001f534 /sell [monto] — SHORT\n"
+                "\U0001f6aa /close_all — Cerrar todo\n"
+                "\U0001f4b0 /balance — Balance\n"
+                "\U0001f4cd /positions — Posiciones\n\n"
+                "<i>Usa los botones de abajo para acceder rápido</i>",
+                chat_id=chat_id,
+                reply_markup=_main_keyboard())
             return
 
         if text.startswith("/gemini"):
@@ -1235,7 +1821,7 @@ class TelegramBot:
             if not user_text:
                 await self._send(
                     "Debes incluir una pregunta. Ej: <code>/gemini que opinas del mercado?</code>",
-                    chat_id=chat_id)
+                    chat_id=chat_id, reply_markup=_main_keyboard())
                 return
             message["text"] = user_text
             await self._handle_gemini_chat(message)
@@ -1269,7 +1855,24 @@ class TelegramBot:
                 f"\u23f0 {s.get('timestamp', 'No data')}"
             )
             await self._send(_format_premium_message("\U0001f4ca ESTADO DEL MERCADO", body),
-                             chat_id=chat_id)
+                             chat_id=chat_id, reply_markup=_main_keyboard())
+            ai = await self._get_ai_analysis("market", chat_id)
+            if ai:
+                await self._send(f"🧠 <b>AI Insight:</b>\n\n{ai}",
+                                 chat_id=chat_id, reply_markup=_main_keyboard())
+            return
+
+        if text == "/niveles":
+            s = self._state or {}
+            price = s.get("price", 0)
+            tech = s.get("technical_levels", {})
+            if not tech or not tech.get("fib_retracement"):
+                await self._send("⏳ Calculando niveles técnicos... intenta de nuevo en 30 segundos.",
+                                 chat_id=chat_id)
+                return
+            from src.engine.technical_levels import format_levels_for_telegram
+            msg = format_levels_for_telegram(tech, price, settings.SYMBOL)
+            await self._send(msg, chat_id=chat_id, reply_markup=_main_keyboard())
             return
 
         if text == "/config" or text == "/settings":
@@ -1289,7 +1892,7 @@ class TelegramBot:
                 f"Gemini AI: {'\u2705' if self._gemini_enabled else '\u274c'}"
             )
             await self._send(_format_premium_message("\u2699\ufe0f CONFIGURACION", body),
-                             chat_id=chat_id)
+                             chat_id=chat_id, reply_markup=_main_keyboard())
             return
 
         if text == "/signal":
@@ -1298,8 +1901,13 @@ class TelegramBot:
             conf = s.get("confidence", 0)
             if sig in ("LONG", "SHORT"):
                 await self._send_signal_alert(s)
+                ai = await self._get_ai_analysis("signal", chat_id)
+                if ai:
+                    await self._send(f"🧠 <b>AI Insight:</b>\n\n{ai}",
+                                     chat_id=chat_id, reply_markup=_main_keyboard())
             else:
-                await self._send(f"\u23f3 No hay señal activa. Esperando...", chat_id=chat_id)
+                await self._send(f"\u23f3 No hay señal activa. Esperando...",
+                                 chat_id=chat_id, reply_markup=_main_keyboard())
             return
 
         if text == "/brain":
@@ -1308,12 +1916,17 @@ class TelegramBot:
             bconf = s.get("brain_confidence_pct", 0)
             if bdir in ("ALZA", "BAJA"):
                 await self._send_brain_alert(s)
+                ai = await self._get_ai_analysis("brain", chat_id)
+                if ai:
+                    await self._send(f"🧠 <b>AI Insight:</b>\n\n{ai}",
+                                     chat_id=chat_id, reply_markup=_main_keyboard())
             else:
                 await self._send(f"\U0001f9e0 Cerebro cuántico: {bdir} ({bconf:.0f}%)",
-                                 chat_id=chat_id)
+                                 chat_id=chat_id, reply_markup=_main_keyboard())
             return
 
         if text == "/chart":
+            await self._send_typing(chat_id)
             klines = await self._fetch_klines()
             if klines:
                 png = await self._generate_chart(klines)
@@ -1321,124 +1934,197 @@ class TelegramBot:
                     s = self._state or {}
                     sig = s.get('signal_text', 'WAIT')
                     conf = s.get('confidence', 0)
-                    caption = f"{settings.SYMBOL} | Señal: {sig} ({conf:.0f}%)"
-                    await self._send_photo(png, caption=caption, chat_id=chat_id)
+                    brain = s.get('brain_direction', 'N/A')
+                    brain_c = s.get('brain_confidence_pct', 0)
+                    delta = s.get('delta', 0)
+                    caption = (
+                        f"<b>{settings.SYMBOL}</b> | Señal: {sig} ({conf:.0f}%) | "
+                        f"Cerebro: {brain} ({brain_c:.0f}%) | "
+                        f"Delta: {delta:+.0f}"
+                    )
+                    await self._send_photo(png, caption=caption,
+                                           chat_id=chat_id,
+                                           reply_markup=_main_keyboard())
+                    ai = await self._get_ai_analysis("chart", chat_id)
+                    if ai:
+                        await self._send(f"🧠 <b>AI Insight:</b>\n\n{ai}",
+                                         chat_id=chat_id, reply_markup=_main_keyboard())
                     return
-            await self._send("No se pudo generar el gráfico.", chat_id=chat_id)
+            await self._send("No se pudo generar el gráfico.",
+                             chat_id=chat_id, reply_markup=_main_keyboard())
             return
 
-        # Trading commands
+        # Trading commands — routed to _execute_trade
+        if text.startswith(("/buy", "/sell", "/close_all", "/balance", "/positions")):
+            await self._execute_trade(message)
+            return
+
+        await self._send(f"\u2753 Comando no reconocido: {text}\nUsa /help para ver los comandos disponibles.",
+                         chat_id=chat_id, reply_markup=_main_keyboard())
+
     async def _execute_trade(self, message: dict):
         text = message.get("text", "").strip().lower()
         chat_id = message.get("chat", {}).get("id", 0)
+        executor = self._order_executor
+
+        if not executor:
+            await self._send("❌ OrderExecutor no disponible", chat_id=chat_id)
+            return
 
         if text.startswith("/buy"):
-            if not self._exchange:
-                await self._send("\u274c Exchange no configurado", chat_id=chat_id)
-                return
             parts = text.split()
             amount = float(parts[1]) if len(parts) > 1 else self._user_config.get("capital", 100)
+            # Get current price from market state
+            current_price = self._state.get("price", 0)
+            if current_price <= 0:
+                await self._send("❌ No hay precio de mercado disponible", chat_id=chat_id)
+                return
+            # Use standard trade signal path (respects safety layers)
+            sl = current_price * 0.985
+            tp = current_price * 1.02
             try:
-                from src.engine.order_executor import OrderExecutor
                 loop = asyncio.get_event_loop()
-                result = await loop.run_in_executor(
-                    None, lambda: OrderExecutor(self._exchange).execute_buy(amount))
-                if result:
-                    await self._send(f"\u2705 LONG ejecutado\nMonto: ${amount:.1f}\n"
-                                     f"Precio: ${result.get('price', 0):,.0f}",
-                                     chat_id=chat_id)
+                queued = await loop.run_in_executor(
+                    None, lambda: executor.execute_trade_signal(
+                        direction="ALZA",
+                        entry_price=current_price,
+                        sl_price=sl,
+                        tp_price=tp,
+                        capital=amount,
+                    ))
+                if queued:
+                    leverage = int(getattr(settings, 'LEVERAGE', 100))
+                    raw_qty = amount * leverage / current_price
+                    await self._send(
+                        f"✅ LONG encolado @ ${current_price:,.0f}\n"
+                        f"Capital: ${amount:.1f} | SL: ${sl:,.0f} | TP: ${tp:,.0f}",
+                        chat_id=chat_id, reply_markup=_main_keyboard())
+                    ai = await self._get_trade_analysis(
+                        "LONG", current_price, sl, tp, amount, leverage, raw_qty)
+                    if ai:
+                        await self._send(f"🧠 <b>AI Insight:</b>\n\n{ai}",
+                                         chat_id=chat_id, reply_markup=_main_keyboard())
                 else:
-                    await self._send("\u274c Error ejecutando LONG", chat_id=chat_id)
+                    reason = getattr(executor, '_last_reject_reason', '')
+                    if "posici\u00f3n existente" in reason.lower():
+                        await self._send_position_with_close(executor, chat_id)
+                    else:
+                        msg = "\u274c Orden rechazada por filtros de seguridad"
+                        if reason:
+                            msg += f"\n   Causa: {reason}"
+                        await self._send(msg, chat_id=chat_id)
             except Exception as e:
-                await self._send(f"\u274c Error: {e}", chat_id=chat_id)
+                await self._send(f"❌ Error: {e}", chat_id=chat_id)
             return
 
         if text.startswith("/sell"):
-            if not self._exchange:
-                await self._send("\u274c Exchange no configurado", chat_id=chat_id)
-                return
             parts = text.split()
             amount = float(parts[1]) if len(parts) > 1 else self._user_config.get("capital", 100)
+            current_price = self._state.get("price", 0)
+            if current_price <= 0:
+                await self._send("❌ No hay precio de mercado disponible", chat_id=chat_id)
+                return
+            sl = current_price * 1.015
+            tp = current_price * 0.985
             try:
-                from src.engine.order_executor import OrderExecutor
                 loop = asyncio.get_event_loop()
-                result = await loop.run_in_executor(
-                    None, lambda: OrderExecutor(self._exchange).execute_sell(amount))
-                if result:
-                    await self._send(f"\u2705 SHORT ejecutado\nMonto: ${amount:.1f}\n"
-                                     f"Precio: ${result.get('price', 0):,.0f}",
-                                     chat_id=chat_id)
+                queued = await loop.run_in_executor(
+                    None, lambda: executor.execute_trade_signal(
+                        direction="BAJA",
+                        entry_price=current_price,
+                        sl_price=sl,
+                        tp_price=tp,
+                        capital=amount,
+                    ))
+                if queued:
+                    leverage = int(getattr(settings, 'LEVERAGE', 100))
+                    raw_qty = amount * leverage / current_price
+                    await self._send(
+                        f"✅ SHORT encolado @ ${current_price:,.0f}\n"
+                        f"Capital: ${amount:.1f} | SL: ${sl:,.0f} | TP: ${tp:,.0f}",
+                        chat_id=chat_id, reply_markup=_main_keyboard())
+                    ai = await self._get_trade_analysis(
+                        "SHORT", current_price, sl, tp, amount, leverage, raw_qty)
+                    if ai:
+                        await self._send(f"🧠 <b>AI Insight:</b>\n\n{ai}",
+                                         chat_id=chat_id, reply_markup=_main_keyboard())
                 else:
-                    await self._send("\u274c Error ejecutando SHORT", chat_id=chat_id)
+                    reason = getattr(executor, '_last_reject_reason', '')
+                    if "posici\u00f3n existente" in reason.lower():
+                        await self._send_position_with_close(executor, chat_id)
+                    else:
+                        msg = "\u274c Orden rechazada por filtros de seguridad"
+                        if reason:
+                            msg += f"\n   Causa: {reason}"
+                        await self._send(msg, chat_id=chat_id)
             except Exception as e:
-                await self._send(f"\u274c Error: {e}", chat_id=chat_id)
+                await self._send(f"❌ Error: {e}", chat_id=chat_id)
             return
 
         if text == "/close_all":
-            if not self._exchange:
-                await self._send("\u274c Exchange no configurado", chat_id=chat_id)
-                return
             try:
-                from src.engine.order_executor import OrderExecutor
                 loop = asyncio.get_event_loop()
                 result = await loop.run_in_executor(
-                    None, lambda: OrderExecutor(self._exchange).close_all_positions())
-                if result:
-                    await self._send("\u2705 Todas las posiciones cerradas", chat_id=chat_id)
+                    None, executor.close_all_positions)
+                if result.get("success"):
+                    await self._send("✅ Todas las posiciones cerradas",
+                                     chat_id=chat_id, reply_markup=_main_keyboard())
+                    await self._send("📊 Riesgo mitigado — posiciones liquidadas manualmente.",
+                                     chat_id=chat_id, reply_markup=_main_keyboard())
                 else:
-                    await self._send("\u274c Error cerrando posiciones", chat_id=chat_id)
+                    await self._send(f"❌ {result.get('message', 'Error')}",
+                                     chat_id=chat_id, reply_markup=_main_keyboard())
             except Exception as e:
-                await self._send(f"\u274c Error: {e}", chat_id=chat_id)
+                await self._send(f"❌ Error: {e}", chat_id=chat_id)
             return
 
         if text == "/balance":
-            if not self._exchange:
-                await self._send("\u274c Exchange no configurado", chat_id=chat_id)
-                return
             try:
-                from src.engine.order_executor import OrderExecutor
                 loop = asyncio.get_event_loop()
-                balance = await loop.run_in_executor(
-                    None, lambda: OrderExecutor(self._exchange).get_balance())
-                if balance:
-                    body = "\n".join(
-                        f"  {asset}: <code>{free:.4f}</code>"
-                        for asset, free in balance.items()
+                bal = await loop.run_in_executor(
+                    None, executor.get_balance)
+                if bal.get("success"):
+                    body = (
+                        f"Balance: <code>${bal['balance']:,.2f}</code>\n"
+                        f"Disponible: <code>${bal.get('available', 0):,.2f}</code>\n"
+                        f"PnL no realizado: <code>${bal.get('unrealized_pnl', 0):,.2f}</code>"
                     )
-                    await self._send(_format_premium_message("\U0001f4b0 BALANCE", body),
-                                     chat_id=chat_id)
+                    await self._send(
+                        _format_premium_message("💰 BALANCE", body),
+                        chat_id=chat_id, reply_markup=_main_keyboard())
                 else:
-                    await self._send("No se pudo obtener balance.", chat_id=chat_id)
+                    await self._send("No se pudo obtener balance.",
+                                     chat_id=chat_id, reply_markup=_main_keyboard())
             except Exception as e:
-                await self._send(f"\u274c Error: {e}", chat_id=chat_id)
+                await self._send(f"❌ Error: {e}", chat_id=chat_id)
             return
 
         if text == "/positions":
-            if not self._exchange:
-                await self._send("\u274c Exchange no configurado", chat_id=chat_id)
-                return
             try:
-                from src.engine.order_executor import OrderExecutor
                 loop = asyncio.get_event_loop()
-                positions = await loop.run_in_executor(
-                    None, lambda: OrderExecutor(self._exchange).get_positions())
-                if positions:
-                    lines = []
-                    for pos in positions:
-                        side_emoji = "\U0001f7e2" if pos.get("side") == "LONG" else "\U0001f7e3"
-                        lines.append(
-                            f"{side_emoji} {pos.get('symbol', settings.SYMBOL)}\n"
-                            f"  Size: <code>{pos.get('size', 0):.4f}</code>\n"
-                            f"  Entry: <code>${pos.get('entry', 0):,.0f}</code>\n"
-                            f"  PnL: <code>{pos.get('pnl', 0):+.2f} USDT</code>\n"
-                        )
-                    body = "\n".join(lines)
-                    await self._send(_format_premium_message("\U0001f4cb POSICIONES", body),
-                                     chat_id=chat_id)
+                info = await loop.run_in_executor(
+                    None, executor.get_position_info)
+                if info:
+                    side = info.get("side", "?")
+                    entry = info.get("entry_price", 0)
+                    qty = info.get("quantity", 0)
+                    mark = info.get("markPrice", 0)
+                    liq = info.get("liquidationPrice", 0)
+                    body = (
+                        f"Dirección: {side}\n"
+                        f"Cantidad: {qty} BTC\n"
+                        f"Entrada: ${entry:,.0f}\n"
+                        f"Mark: ${mark:,.0f}\n"
+                        f"Liquidación: ${liq:,.0f}"
+                    )
+                    await self._send(
+                        _format_premium_message("🔍 POSICIÓN", body),
+                        chat_id=chat_id, reply_markup=_main_keyboard())
                 else:
-                    await self._send("No hay posiciones abiertas.", chat_id=chat_id)
+                    await self._send("No hay posiciones abiertas.",
+                                     chat_id=chat_id, reply_markup=_main_keyboard())
             except Exception as e:
-                await self._send(f"\u274c Error: {e}", chat_id=chat_id)
+                await self._send(f"❌ Error: {e}", chat_id=chat_id)
             return
 
     # ─── Inline callback handler ───────────────────────────────────────────
@@ -1456,7 +2142,7 @@ class TelegramBot:
             conf = s.get("confidence", 0)
             body = (
                 f"<b>PRECIO:</b> <code>${p:,.0f}</code>\n"
-                f"<b>SEÑAL:</b> <code>{sig}</code> ({conf:.0f}%)\n"
+                f"<b>SENAL:</b> <code>{sig}</code> ({conf:.0f}%)\n"
                 f"\u23f0 {s.get('timestamp', '')}"
             )
             await self._edit_message(cid, mid,
@@ -1475,50 +2161,176 @@ class TelegramBot:
                 f"Da tu opinion en 2-3 oraciones."
             )
             reply = await self._chat_gemini_raw(prompt)
-            await self._send(f"\U0001f9e0 <b>Gemini AI:</b>\n\n{reply}", chat_id=cid)
+            await self._send(f"\U0001f9e0 <b>Gemini AI:</b>\n\n{reply}",
+                             chat_id=cid, reply_markup=_main_keyboard())
 
         elif data == "chart":
+            await self._send_typing(cid)
             klines = await self._fetch_klines()
             if klines:
-                png = await self._generate_chart(klines)
+                loop = asyncio.get_event_loop()
+                png = await loop.run_in_executor(None, self._generate_chart_sync, klines)
                 if png:
-                    await self._send_photo(png, caption=f"{settings.SYMBOL} | Chart", chat_id=cid)
+                    s = self._state or {}
+                    sig = s.get('signal_text', 'WAIT')
+                    conf = s.get('confidence', 0)
+                    caption = f"<b>{settings.SYMBOL}</b> | Senal: {sig} ({conf:.0f}%)"
+                    await self._send_photo(png, caption=caption, chat_id=cid,
+                                           reply_markup=_main_keyboard())
+                    ai = await self._get_ai_analysis("chart", cid)
+                    if ai:
+                        await self._send(f"\U0001f9e0 <b>AI Insight:</b>\n\n{ai}",
+                                         chat_id=cid, reply_markup=_main_keyboard())
+
+        elif data == "close_position":
+            await self._answer_callback(callback)
+            executor = self._order_executor
+            if executor is None:
+                await self._send("\u274c OrderExecutor no disponible", chat_id=cid)
+                return
+            try:
+                loop = asyncio.get_event_loop()
+                result = await loop.run_in_executor(
+                    None, executor.close_all_positions)
+                if result.get("success"):
+                    await self._send("\u2705 Posici\u00f3n cerrada exitosamente",
+                                     chat_id=cid, reply_markup=_main_keyboard())
+                else:
+                    msg = result.get("message", "Error desconocido")
+                    await self._send(f"\u274c Error cerrando posici\u00f3n:\n{msg}",
+                                     chat_id=cid, reply_markup=_main_keyboard())
+            except Exception as e:
+                await self._send(f"\u274c Error: {e}", chat_id=cid, reply_markup=_main_keyboard())
+
+        elif data.startswith("exec_order:"):
+            await self._answer_callback(callback)
+            parts = data.split(":")
+            if len(parts) < 5:
+                await self._send("⚠️ Datos de señal inválidos", chat_id=cid)
+                return
+            _, bdir, price_str, sl_str, tp_str = parts[:5]
+            try:
+                entry_price = float(price_str)
+                sl_price = float(sl_str)
+                tp_price = float(tp_str)
+            except ValueError:
+                await self._send("⚠️ Error parsing signal prices", chat_id=cid)
+                return
+            if bdir not in ("ALZA", "BAJA") or entry_price <= 0 or sl_price <= 0 or tp_price <= 0:
+                await self._send("⚠️ Señal inválida — datos en cero", chat_id=cid)
+                return
+            executor = self._order_executor
+            if executor is None:
+                await self._send("❌ OrderExecutor no disponible", chat_id=cid)
+                return
+            try:
+                loop = asyncio.get_event_loop()
+                result = await loop.run_in_executor(
+                    None, lambda: executor.execute_trade_signal(
+                        direction=bdir,
+                        entry_price=entry_price,
+                        sl_price=sl_price,
+                        tp_price=tp_price,
+                    )
+                )
+                if result:
+                    await self._send(
+                        f"\u23f3 Orden {bdir} encolada:\n"
+                        f"Entrada: <code>${entry_price:,.0f}</code>\n"
+                        f"SL: <code>${sl_price:,.0f}</code> | "
+                        f"TP: <code>${tp_price:,.0f}</code>\n"
+                        f"<i>Esperando confirmaci\u00f3n de Binance...</i>",
+                        chat_id=cid,
+                    )
+                else:
+                    reason = getattr(executor, '_last_reject_reason', '')
+                    if "posici\u00f3n existente" in reason.lower():
+                        await self._send_position_with_close(executor, cid)
+                    else:
+                        msg = "\u274c Orden rechazada por filtros de seguridad"
+                        if reason:
+                            msg += f"\n   Causa: {reason}"
+                        await self._send(msg, chat_id=cid)
+            except Exception as e:
+                log.error(f"Callback execute_order error: {e}")
+                await self._send(f"❌ Error ejecutando orden: {e}", chat_id=cid)
+
+    async def _answer_callback(self, callback: dict):
+        """Acknowledge callback query to remove loading spinner."""
+        qid = callback.get("id", "")
+        if not qid:
+            return
+        url = f"https://api.telegram.org/bot{self._bot_token}/answerCallbackQuery"
+        payload = {"callback_query_id": qid}
+        session = self._session or aiohttp.ClientSession()
+        try:
+            async with session.post(url, json=payload,
+                                    timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    log.warning("answerCallbackQuery error: %s", text)
+        except Exception as e:
+            log.warning("answerCallbackQuery exception: %s", e)
+        finally:
+            if self._session is None:
+                await session.close()
 
     # ─── Polling ───────────────────────────────────────────────────────────
 
     async def _poll_updates(self):
         offset = 0
+        poll_failures = 0
+        max_poll_delay = 120.0
         while self._running:
             try:
                 url = f"https://api.telegram.org/bot{self._bot_token}/getUpdates"
                 params = {"offset": offset, "timeout": 30, "allowed_updates":
                           ["message", "callback_query"]}
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(url, params=params,
-                                            timeout=aiohttp.ClientTimeout(total=35)) as resp:
-                        if resp.status != 200:
-                            await asyncio.sleep(5)
-                            continue
-                        data = await resp.json()
-                        if not data.get("ok"):
-                            continue
-                        for update in data.get("result", []):
-                            offset = update["update_id"] + 1
-                            if "message" in update:
-                                msg = update["message"]
-                                text = msg.get("text", "")
-                                if text.startswith("/"):
-                                    await self._handle_command(msg)
-                                elif text:
-                                    msg["text"] = text
-                                    await self._handle_gemini_chat(msg)
-                            elif "callback_query" in update:
-                                await self._handle_callback(update["callback_query"])
+                async with self._session.get(url, params=params,
+                                             timeout=aiohttp.ClientTimeout(total=35)) as resp:
+                    if resp.status != 200:
+                        poll_failures += 1
+                        delay = min(5.0 * (2 ** (poll_failures - 1)), max_poll_delay)
+                        await asyncio.sleep(delay)
+                        continue
+                    poll_failures = 0
+                    data = await resp.json()
+                    if not data.get("ok"):
+                        continue
+                    BUTTON_MAP = {
+                        "\U0001f4ca Status": "/status", "\U0001f4c8 Signal": "/signal",
+                        "\U0001f9e0 Brain": "/brain", "\U0001f4c9 Chart": "/chart",
+                        "\U0001f916 Gemini": "/gemini", "\u2699\ufe0f Config": "/config",
+                        "\U0001f7e2 Buy": "/buy", "\U0001f534 Sell": "/sell",
+                        "\U0001f6aa Close": "/close_all",
+                        "\U0001f4b0 Balance": "/balance", "\U0001f4cd Positions": "/positions",
+                        "\u2753 Help": "/help",
+                    }
+                    for update in data.get("result", []):
+                        offset = update["update_id"] + 1
+                        if "message" in update:
+                            msg = update["message"]
+                            text = msg.get("text", "")
+                            cmd = BUTTON_MAP.get(text)
+                            if cmd:
+                                msg["text"] = cmd
+                                await self._handle_command(msg)
+                            elif text.startswith("/"):
+                                await self._handle_command(msg)
+                            elif text:
+                                msg["text"] = text
+                                await self._handle_gemini_chat(msg)
+                        elif "callback_query" in update:
+                            await self._handle_callback(update["callback_query"])
             except asyncio.TimeoutError:
+                poll_failures = 0
                 continue
             except Exception as e:
-                log.warning("Polling error: %s", e)
-                await asyncio.sleep(5)
+                poll_failures += 1
+                delay = min(5.0 * (2 ** (poll_failures - 1)), max_poll_delay)
+                if poll_failures <= 3 or poll_failures % 6 == 0:
+                    log.warning("Polling error (%d): %s — reconnecting in %.0fs", poll_failures, e, delay)
+                await asyncio.sleep(delay)
 
     # ─── Public entry points ───────────────────────────────────────────────
 

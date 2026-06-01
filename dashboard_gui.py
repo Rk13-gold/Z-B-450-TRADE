@@ -1,11 +1,21 @@
 #!/usr/bin/env python3
-import sys
+# ═══════════════════════════════════════════════════════════════════════════════
+# CARGA GLOBAL del .env — ANTES de cualquier import que use settings
+# ═══════════════════════════════════════════════════════════════════════════════
+from dotenv import load_dotenv
 import os
+_env_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '.env'))
+load_dotenv(_env_path)
+print(f"[ENTRY] .env cargado desde: {_env_path}")
+
+import sys
+import asyncio
 import threading
 import time
 import subprocess
 import sqlite3
 import re
+import math
 from collections import deque
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -29,14 +39,15 @@ def play_notification_sound():
         pass
 
 
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QGridLayout,
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QGridLayout, QTableWidgetItem,
                              QLabel, QFrame, QVBoxLayout, QHBoxLayout,
                              QTabWidget, QShortcut, QPushButton, QOpenGLWidget,
                              QSplitter, QPlainTextEdit, QTextBrowser,
-                             QProgressBar, QSlider,
-                             QListWidget, QFileDialog)
+                             QProgressBar, QSlider, QScrollArea,
+                             QListWidget, QFileDialog, QLineEdit,
+                             QTableWidget, QHeaderView, QDoubleSpinBox, QSpinBox)
 from PyQt5.QtCore import Qt, QTimer, QRectF, QPointF, QThread, pyqtSignal, QSettings
-from PyQt5.QtGui import QFont, QColor, QPalette, QKeySequence, QPainter, QPainterPath, QPen, QStaticText, QPixmap, QFontDatabase
+from PyQt5.QtGui import QFont, QColor, QPalette, QKeySequence, QPainter, QPainterPath, QPen, QPolygonF, QStaticText, QPixmap, QFontDatabase
 
 from binance.client import Client
 from config.settings import settings
@@ -49,10 +60,13 @@ from src.database.supabase_manager import supabase_manager
 from src.engine.gemini_brain import GeminiBrainManager, GeminiTradingDecision
 
 
+# ── Validación temprana de variables de entorno ────────────────────────────
+settings.validate()
+
 try:
-    client = Client(settings.BINANCE_API_KEY, settings.BINANCE_SECRET_KEY, testnet=False)
+    client = Client(settings.BINANCE_REAL_API_KEY, settings.BINANCE_REAL_SECRET_KEY, testnet=False)
 except Exception as e:
-    print(f"[DASHBOARD] ⚠ No se pudo conectar con Binance (python-binance): {e}")
+    print(f"[DASHBOARD] ⚠ No se pudo conectar con Binance REAL: {e}")
     client = None
 
 COLORS = {
@@ -1830,50 +1844,95 @@ class GalaxyOrderFlowChart(QOpenGLWidget):
                     painter.setPen(Qt.NoPen); painter.setBrush(QColor(187, 0, 255, 100))
                     painter.drawRect(int(vp_x), int(y) - 1, int(bww), 3)
 
-        # PREDICTIVE GHOST CANDLES
-        if self.predicted_candles:
+        # VOLATILITY CONE (replaces ghost candles)
+        if self.predicted_candles and len(self.klines) > 1:
+            last_close = float(self.klines[-1][4])
+            atr = self.indicators.get('atr', 10)
+            n_cells = len(self.predicted_candles)
             sep_x = draw_rect.left() + (nc * cw)
-            painter.setPen(QPen(QColor(COLORS['accent_gold']), 1, Qt.DashLine))
-            painter.drawLine(int(sep_x), draw_rect.top(), int(sep_x), draw_rect.bottom())
-            
+
+            # Cone vertices (polygon: upper 2σ → upper 1σ → lower 1σ → lower 2σ)
+            cone_poly = QPolygonF()
+            # Upper edge (right to left for closed polygon)
+            for i in range(n_cells - 1, -1, -1):
+                dx = (i + 1) * cw
+                upper_1 = py(last_close + atr * 1.0 * (i + 1) / n_cells)
+                cone_poly << QPointF(sep_x + dx, upper_1)
+            # Lower edge (left to right)
+            for i in range(n_cells):
+                dx = (i + 1) * cw
+                lower_1 = py(last_close - atr * 1.0 * (i + 1) / n_cells)
+                cone_poly << QPointF(sep_x + dx, lower_1)
+
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(100, 200, 255, 20))
+            painter.drawPolygon(cone_poly)
+
+            # 2σ outer band (wider cone)
+            cone_poly_2 = QPolygonF()
+            for i in range(n_cells - 1, -1, -1):
+                dx = (i + 1) * cw
+                upper_2 = py(last_close + atr * 2.0 * (i + 1) / n_cells)
+                cone_poly_2 << QPointF(sep_x + dx, upper_2)
+            for i in range(n_cells):
+                dx = (i + 1) * cw
+                lower_2 = py(last_close - atr * 2.0 * (i + 1) / n_cells)
+                cone_poly_2 << QPointF(sep_x + dx, lower_2)
+
+            painter.setBrush(QColor(100, 200, 255, 10))
+            painter.drawPolygon(cone_poly_2)
+
+            # Center dashed line (mean projection)
+            painter.setPen(QPen(QColor(100, 200, 255, 80), 1, Qt.DashLine))
+            for i in range(n_cells):
+                dx = (i + 1) * cw
+                mean_y = py(last_close)
+                painter.drawPoint(QPointF(sep_x + dx, mean_y))
+
+            # Label
             p_font = QFont(font); p_font.setPointSize(6); p_font.setBold(True); painter.setFont(p_font)
-            painter.setPen(QColor(COLORS['accent_gold']))
-            painter.drawText(int(sep_x + 3), draw_rect.top() + 10, "PREDICTION")
-            
-            for pi, pc in enumerate(self.predicted_candles):
-                idx = nc + pi
-                xl_cell = draw_rect.left() + (idx * cw)
-                if xl_cell > vp_max_x or (xl_cell + cw) < vp_min_x: continue
-                xc = xl_cell + (candle_zone_w / 2)
-                
-                yo = py(pc['o']); yc_p = py(pc['c']); yh = py(pc['h']); yl = py(pc['l'])
-                bull = pc['c'] >= pc['o']
-                conf = pc['confidence']
-                
-                alpha_body = max(30, int(conf * 0.8))
-                alpha_wick = max(20, int(conf * 0.5))
-                
-                if bull:
-                    body_c = QColor(0, 255, 102, alpha_body)
-                    wick_c = QColor(0, 255, 102, alpha_wick)
-                    border_c = QColor(0, 255, 102, alpha_wick + 30)
-                else:
-                    body_c = QColor(187, 0, 255, alpha_body)
-                    wick_c = QColor(187, 0, 255, alpha_wick)
-                    border_c = QColor(187, 0, 255, alpha_wick + 30)
-                
-                painter.setPen(QPen(wick_c, 1, Qt.DashLine))
-                painter.drawLine(int(xc), int(yh), int(xc), int(yl))
-                
-                bt = min(yo, yc_p); bh = max(1, abs(yo - yc_p))
-                painter.setPen(QPen(border_c, 1, Qt.DashLine))
-                painter.setBrush(body_c)
-                painter.drawRect(int(xc - bw / 2), int(bt), int(bw), int(bh))
-                
-                if pi == 0 or pi == len(self.predicted_candles) - 1:
-                    painter.setPen(QColor(COLORS['text_primary']))
-                    label_y = int(min(yh, yl)) - 5
-                    painter.drawText(int(xc - 10), label_y, f"{conf:.0f}%")
+            painter.setPen(QColor(100, 200, 255))
+            painter.drawText(int(sep_x + 3), draw_rect.top() + 10, "VOLATILITY CONE")
+
+        # LIQUIDITY ARROW (from current price → nearest high-volume wall)
+        if self.order_state:
+            current_price = float(self.klines[-1][4]) if self.klines else 0
+            bids = sorted([(float(b[0]), float(b[1])) for b in self.order_state.get('bids', [])],
+                          key=lambda x: x[0], reverse=True)
+            asks = sorted([(float(a[0]), float(a[1])) for a in self.order_state.get('asks', [])],
+                          key=lambda x: x[0])
+            all_walls = [(p, q, 'BID') for p, q in bids if q >= 5.0] + \
+                        [(p, q, 'ASK') for p, q in asks if q >= 5.0]
+            if all_walls and current_price > 0:
+                target = max(all_walls, key=lambda x: x[1])  # highest volume wall
+                tgt_p, tgt_q, tgt_side = target
+                if min_p <= tgt_p <= max_p:
+                    src_y = py(current_price)
+                    tgt_y = py(tgt_p)
+                    src_x = sep_x if self.predicted_candles else draw_rect.right()
+                    tgt_x = draw_rect.right() - 10 if tgt_side == 'ASK' else draw_rect.left() + 10
+                    arrow_color = QColor(0, 255, 102) if tgt_side == 'BID' else QColor(187, 0, 255)
+                    painter.setPen(QPen(arrow_color, 2, Qt.SolidLine))
+                    painter.drawLine(int(src_x), int(src_y), int(tgt_x), int(tgt_y))
+                    # Arrowhead
+                    angle = math.atan2(tgt_y - src_y, tgt_x - src_x)
+                    arrow_sz = 8
+                    ax = int(tgt_x - arrow_sz * math.cos(angle - 0.4))
+                    ay = int(tgt_y - arrow_sz * math.sin(angle - 0.4))
+                    bx = int(tgt_x - arrow_sz * math.cos(angle + 0.4))
+                    by = int(tgt_y - arrow_sz * math.sin(angle + 0.4))
+                    painter.setBrush(arrow_color)
+                    painter.setPen(Qt.NoPen)
+                    painter.drawPolygon(QPolygonF([
+                        QPointF(tgt_x, tgt_y), QPointF(ax, ay), QPointF(bx, by)
+                    ]))
+                    # Volume label
+                    painter.setFont(p_font)
+                    painter.setPen(arrow_color)
+                    label_x = int((src_x + tgt_x) / 2)
+                    label_y = int((src_y + tgt_y) / 2) - 8
+                    painter.drawText(label_x, label_y,
+                                     f"{tgt_side} {tgt_q:.1f}₿")
                 
         # PULSE ANIMATIONS (Radar Effect)
         import time
@@ -3539,9 +3598,16 @@ class QuantSidebarWidget(QFrame):
         self.depth_bar_fill.setStyleSheet(f"background: {'#00ff66' if imb > 0 else '#bb00ff'}; border-radius: 5px; border: none;")
 
 class MarketNarrativePanel(QFrame):
+    PANEL_NORMAL_BORDER = "1px solid #1a1f2e"
+    PANEL_DIM_BORDER = "1px solid #1a1f2e"
+    PANEL_ALERT_BORDER = "2px solid #ffcc00"
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setStyleSheet("background: #080a0f; border-radius: 8px; border: 1px solid #1a1f2e;")
+        self._dimmed = False
+        self._decision_state = ""
+        self._liquidation_feed: deque = deque(maxlen=12)
+        self._last_liq_update: str = ""
         self.setMinimumWidth(270)
         self.setMaximumWidth(310)
 
@@ -3614,11 +3680,20 @@ class MarketNarrativePanel(QFrame):
         self.flash_timer.timeout.connect(self.reset_flash)
         self.last_state = ""
 
+    def _build_stylesheet(self, border_style: str = PANEL_NORMAL_BORDER) -> str:
+        return (f"background: #080a0f; border-radius: 8px; border: {border_style};"
+                + (" opacity: 0.7;" if self._dimmed else ""))
+
+    def set_dimmed(self, dimmed: bool):
+        self._dimmed = dimmed
+        border = self.PANEL_DIM_BORDER if dimmed else self.PANEL_NORMAL_BORDER
+        self.setStyleSheet(self._build_stylesheet(border))
+
     def reset_flash(self):
-        self.setStyleSheet("background: #080a0f; border-radius: 8px; border: 1px solid #1a1f2e;")
+        self.setStyleSheet(self._build_stylesheet(self.PANEL_NORMAL_BORDER))
 
     def trigger_flash(self, color):
-        self.setStyleSheet(f"background: #080a0f; border-radius: 8px; border: 2px solid {color};")
+        self.setStyleSheet(self._build_stylesheet(f"2px solid {color}"))
         self.flash_timer.start(120)
 
     @staticmethod
@@ -3675,6 +3750,8 @@ class MarketNarrativePanel(QFrame):
         ba_ratio = buy_vol / max(0.001, sell_vol)
 
         # ── 1. WHALE SONAR ─────────────────────────────────────────────────
+        hft_speed = state.get('hft_speed', 0.0)
+        hft_color = "#FF6644" if hft_speed > 5 else "#ffcc00" if hft_speed > 2 else "#445566"
         if abs(delta_pct) > 35 and total_vol > 3:
             direction = "🔵 BALLENA COMPRADORA" if delta > 0 else "🔴 BALLENA VENDEDORA"
             w_color   = "#00ff66" if delta > 0 else "#bb00ff"
@@ -3693,6 +3770,9 @@ class MarketNarrativePanel(QFrame):
         else:
             whale_html = (f"<span style='color:#445566; font-family:monospace;'>⚪ Sin anomalías &nbsp; Δ {delta:+.2f} ₿ ({delta_pct:+.1f}%)</span>")
 
+        whale_html += (f"<div style='margin-top:4px; font-family:monospace; font-size:10px;'>"
+                       f"<span style='color:{hft_color};'>HFT Speed: {hft_speed:.1f} inst/s</span>"
+                       f"</div>")
         self.lbl_whale.setText(whale_html)
 
         # ── 2. INSTITUTIONAL POSITIONS ─────────────────────────────────────
@@ -3774,6 +3854,24 @@ class MarketNarrativePanel(QFrame):
 
         if not trap_html:
             trap_html = "<span style='color:#334455; font-family:monospace;'>Sin trampas detectadas</span>"
+
+        # ── Liquidation Tracker mini-feed ────────────────────────────────
+        liq_list = state.get('liquidation_events', [])
+        if liq_list:
+            liq_html = "<div style='margin-top:4px; border-top:1px solid #1a1f2e; padding-top:4px;'>"
+            for liq in liq_list[-6:]:  # last 6
+                is_long_liq = liq.get('side') == 'SELL'
+                lcolor = "#00ff66" if is_long_liq else "#FF2244"
+                badge = "LONG⬆" if is_long_liq else "SHORT⬇"
+                lsize = liq.get('total_value', 0)
+                liq_html += (f"<div style='display:inline-block; background:#0d1117; margin:1px; padding:1px 4px; "
+                             f"border-left:2px solid {lcolor}; border-radius:2px; font-size:9px; font-family:monospace;'>"
+                             f"<span style='color:{lcolor};'>{badge}</span> "
+                             f"<span style='color:#aaa;'>${lsize:,.0f}</span>"
+                             f"</div>")
+            liq_html += "</div>"
+            trap_html += liq_html
+
         self.lbl_traps.setText(trap_html)
 
         # ── 4. MARKET IMBALANCE BAR ────────────────────────────────────────
@@ -3801,12 +3899,17 @@ class MarketNarrativePanel(QFrame):
         ba_color    = "#00ff66"   if ba_ratio > 1.2 else "#bb00ff" if ba_ratio < 0.8 else "#888"
         sv_color    = "#bb00ff"   if spread_vel > 10 else "#888"
 
+        cancel_rate_narr = state.get('cancel_rate', 0.0)
+        spoofing_risk = state.get('spoofing_risk', 0.0)
+        spoof_color = "#FF2244" if spoofing_risk > 70 else "#ffcc00" if spoofing_risk > 40 else "#445566"
+
         micro_html = (f"<table width='100%' style='font-family:monospace; font-size:11px;'>"
                       f"{self._row('CVD Trend', cvd_label, cvd_color)}"
                       f"{self._row('Kaufman Eff.', kauf_label, kauf_color)}"
                       f"{self._row('Vol B/A', f'{ba_ratio:.2f}x', ba_color)}"
                       f"{self._row('Spread Vel.', f'{spread_vel:.1f}ms', sv_color)}"
                       f"{self._row('Tick Speed', f'{ts:.1f}/s', '#aaa')}"
+                      f"{self._row('Spoofing Risk', f'{spoofing_risk:.0f}%', spoof_color)}"
                       f"</table>")
         self.lbl_micro.setText(micro_html)
 
@@ -3835,6 +3938,11 @@ class MarketNarrativePanel(QFrame):
             f"background: #0d1117; padding: 10px; border-radius: 6px; "
             f"border: 2px solid {dec_color};"
         )
+
+        # ── Emergency dimming: SEÑAL PARCIAL / SIN VENTAJA ──────────────
+        should_dim = ("SEÑAL PARCIAL" in decision or "SIN VENTAJA" in decision)
+        self.set_dimmed(should_dim)
+
         new_state = decision.split()[0]
         if new_state != self.last_state:
             self.trigger_flash(dec_color)
@@ -4000,6 +4108,1946 @@ class GeminiInferenceWorker(QThread):
             self.gemini_finished.emit(None)
 
 
+class F4Worker(QThread):
+    """Background worker for F4 API calls — prevents UI freezing."""
+
+    balance_updated = pyqtSignal(float, float, float)
+    leverage_result = pyqtSignal(bool, int)
+    margin_result = pyqtSignal(bool, str)
+    order_result_signal = pyqtSignal(bool, str, float, float, str, str)
+    env_toggled = pyqtSignal(bool, bool, float, float, float)
+
+    def __init__(self, executor):
+        super().__init__()
+        self._executor = executor
+        self._pending = None
+
+    def fetch_balance(self):
+        self._pending = "balance"
+        if not self.isRunning():
+            self.start()
+
+    def set_leverage(self, lev: int):
+        self._pending = ("leverage", lev)
+        if not self.isRunning():
+            self.start()
+
+    def set_margin(self, mode: str):
+        self._pending = ("margin", mode)
+        if not self.isRunning():
+            self.start()
+
+    def place_order(self, side: str, qty: float, price: float):
+        self._pending = ("order", side, qty, price)
+        if not self.isRunning():
+            self.start()
+
+    def switch_env(self, testnet: bool):
+        self._pending = ("switch_env", testnet)
+        if not self.isRunning():
+            self.start()
+
+    def run(self):
+        if self._executor is None:
+            return
+        pending = self._pending
+        self._pending = None
+
+        if pending == "balance":
+            result = self._executor.get_balance()
+            if result.get("success"):
+                self.balance_updated.emit(
+                    result["balance"],
+                    result.get("available", 0),
+                    result.get("unrealized_pnl", 0),
+                )
+
+        elif isinstance(pending, tuple):
+            cmd = pending[0]
+            if cmd == "leverage":
+                lev = pending[1]
+                res = self._executor.change_leverage_direct(lev)
+                self.leverage_result.emit(res.get("success", False), lev)
+            elif cmd == "margin":
+                mode = pending[1]
+                res = self._executor.change_margin_type(mode)
+                self.margin_result.emit(res.get("success", False), mode)
+            elif cmd == "order":
+                side, qty, price = pending[1], pending[2], pending[3]
+                res = self._executor.market_order_direct(side, qty, price)
+                success = res.get("success", False)
+                oid = res.get("order_id", "")
+                fill = res.get("fill_price", 0)
+                qty_filled = res.get("quantity", qty)
+                msg = res.get("message", "")
+                self.order_result_signal.emit(success, side, qty_filled, fill, oid, msg)
+            elif cmd == "switch_env":
+                testnet = pending[1]
+                result = self._executor.switch_environment(testnet)
+                self.env_toggled.emit(
+                    result.get("success", False),
+                    self._executor.is_testnet,
+                    result.get("balance", 0),
+                    result.get("available", 0),
+                    result.get("unrealized_pnl", 0),
+                )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SignalDataWorker — dedicated worker for REAL account data (balance, position, leverage)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SignalDataWorker(QThread):
+    """Worker for REAL account data. Auto-reconnect with exponential backoff."""
+
+    balance_updated = pyqtSignal(float, float, float)
+    position_updated = pyqtSignal(object)
+    leverage_updated = pyqtSignal(int)
+    connection_status = pyqtSignal(bool, str)
+
+    def __init__(self):
+        super().__init__()
+        self._running = True
+        self._client = None
+        self._backoff = 1.0
+
+    def _ensure_client(self):
+        if self._client is not None:
+            return True
+        try:
+            api_key = settings.BINANCE_REAL_API_KEY
+            secret = settings.BINANCE_REAL_SECRET_KEY
+            if not api_key or not secret:
+                raise ValueError("Missing REAL API keys — check BINANCE_REAL_API_KEY/SECRET")
+            self._client = Client(api_key, secret, testnet=False)
+            self._backoff = 1.0
+            self.connection_status.emit(True, "Conectado a Binance REAL")
+            return True
+        except Exception as exc:
+            self._client = None
+            self.connection_status.emit(False, f"Error REAL: {exc}")
+            return False
+
+    def fetch_all(self):
+        if not self._ensure_client():
+            self.connection_status.emit(False, f"Reconectando en {self._backoff:.0f}s...")
+            return
+        try:
+            account = self._client.futures_account()
+            for asset in account.get("assets", []):
+                if asset.get("asset") == "USDT":
+                    self.balance_updated.emit(
+                        float(asset.get("walletBalance", 0)),
+                        float(asset.get("availableBalance", 0)),
+                        float(asset.get("unrealizedProfit", 0)),
+                    )
+                    break
+
+            positions = self._client.futures_position_information(symbol=settings.SYMBOL or "BTCUSDT")
+            pos = None
+            lev = 0
+            for p in positions:
+                amt = float(p.get("positionAmt", 0))
+                raw_lev = int(float(p.get("leverage", 0)))
+                if raw_lev > 0:
+                    lev = raw_lev
+                if amt != 0:
+                    pos = {
+                        "amt": amt,
+                        "entry": float(p.get("entryPrice", 0)),
+                        "mark": float(p.get("markPrice", 0)),
+                        "upnl": float(p.get("unRealizedProfit", 0)),
+                        "liq": float(p.get("liquidationPrice", 0)),
+                        "leverage": raw_lev,
+                    }
+                    break
+            self.position_updated.emit(pos)
+            if lev > 0:
+                self.leverage_updated.emit(lev)
+
+            self._backoff = 1.0
+            self.connection_status.emit(True, "Conectado a Binance REAL")
+
+        except Exception as exc:
+            self._backoff = min(self._backoff * 2, 60.0)
+            self.connection_status.emit(False, f"Reconexión en {self._backoff:.0f}s...")
+            print(f"[SignalDataWorker] Error: {exc}")
+            self._client = None
+
+    def stop(self):
+        self._running = False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SignalMonitorTab — F2: Signal monitoring & professional trading station
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SignalMonitorTab(QFrame):
+    """F2: Signal monitoring dashboard with AI analysis, P&L calculator, and execution."""
+
+    _on_ai_result_signal = pyqtSignal(str, str, float, str, float, float, float, object)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._executor = None
+        self._f4worker = None
+        self._gemini_brain = None
+        self._brain_agent = None
+        self._data_worker = None
+
+        # Signal state
+        self._signal_direction = "NEUTRAL"
+        self._signal_confidence = 0.0
+        self._prev_signal = "NEUTRAL"
+        self._trend_label = "◆ WAIT"
+        self._price = 0.0
+        self._change_pct = 0.0
+        self._current_price = 0.0
+
+        # Account state (from SignalDataWorker)
+        self._balance = 0.0
+        self._available = 0.0
+        self._unrealized_pnl = 0.0
+        self._leverage = 0
+        self._position = None
+        self._data_connected = False
+
+        # AI state
+        self._auto_ai = True
+        self._last_gemini = None
+        self._last_brain = None
+        self._ai_busy = False
+
+        # Execution state
+        self._order_busy = False
+        self._risk_pct = 2.5
+        self._capital_preset = 100
+
+        # Market/indicator data cache
+        self._rsi = 50.0
+        self._macd = 0.0
+        self._macd_signal = 0.0
+        self._macd_hist = 0.0
+        self._bb_upper = 0.0
+        self._bb_middle = 0.0
+        self._bb_lower = 0.0
+        self._atr = 0.0
+        self._delta = 0.0
+        self._cvd = 0.0
+        self._buy_vol = 0.0
+        self._sell_vol = 0.0
+        self._imbalance = 0.0
+        self._tech_levels = {}
+        self._mtf_trend = {}
+        self._signal_text = "NINGUNA"
+
+        self._on_ai_result_signal.connect(self._on_ai_result)
+        self._init_ui()
+        self._init_timers()
+
+    # ── Public: wire external dependencies ───────────────────────────────
+
+    def set_executor(self, executor, f4worker=None):
+        self._executor = executor
+        self._f4worker = f4worker
+        if f4worker:
+            f4worker.order_result_signal.connect(self._on_order_result_f4)
+        self._data_worker = SignalDataWorker()
+        self._data_worker.balance_updated.connect(self._on_balance)
+        self._data_worker.position_updated.connect(self._on_position)
+        self._data_worker.leverage_updated.connect(self._on_leverage)
+        self._data_worker.connection_status.connect(self._on_connection_status)
+
+    def set_ai_references(self, gemini_brain=None, brain_agent=None):
+        self._gemini_brain = gemini_brain
+        self._brain_agent = brain_agent
+
+    # ── Public: update signal data from MainDashboard (1Hz) ─────────────
+
+    def update_signal_data(self, data: dict):
+        self._price = data.get("price", self._price)
+        self._change_pct = data.get("change_pct", self._change_pct)
+        self._current_price = self._price
+        self._signal_direction = data.get("direction", self._signal_direction)
+        self._signal_confidence = data.get("confidence", self._signal_confidence)
+        self._trend_label = data.get("trend_label", self._trend_label)
+        self._signal_text = data.get("signal", self._signal_text)
+
+        # Indicator cache
+        self._rsi = data.get("rsi", self._rsi)
+        self._macd = data.get("macd", self._macd)
+        self._macd_signal = data.get("macd_signal", self._macd_signal)
+        self._macd_hist = data.get("macd_hist", self._macd_hist)
+        self._bb_upper = data.get("bb_upper", self._bb_upper)
+        self._bb_middle = data.get("bb_middle", self._bb_middle)
+        self._bb_lower = data.get("bb_lower", self._bb_lower)
+        self._atr = data.get("atr", self._atr)
+        self._delta = data.get("delta", self._delta)
+        self._cvd = data.get("cvd", self._cvd)
+        self._buy_vol = data.get("buy_volume", self._buy_vol)
+        self._sell_vol = data.get("sell_volume", self._sell_vol)
+        self._imbalance = data.get("imbalance", self._imbalance)
+        self._tech_levels = data.get("technical_levels", self._tech_levels) or {}
+        self._mtf_trend = data.get("mtf_trend", self._mtf_trend) or {}
+
+        self._refresh_ui()
+
+        # Detect signal change (minimum confidence threshold = 55%)
+        if self._signal_direction != self._prev_signal:
+            if self._signal_direction in ("LONG", "SHORT") and self._prev_signal == "NEUTRAL":
+                if self._signal_confidence >= 55:
+                    self._on_signal_detected()
+            self._prev_signal = self._signal_direction
+
+    # ── UI Construction ─────────────────────────────────────────────────
+
+    def _init_ui(self):
+        self.setStyleSheet("background: #000; border: none;")
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet(
+            "QScrollArea { border: none; background: #000; }"
+            "QScrollBar:vertical { width: 6px; background: #111; }"
+            "QScrollBar::handle:vertical { background: #333; border-radius: 3px; }"
+        )
+        self._scroll_content = QWidget()
+        self._scroll_content.setStyleSheet("background: #000;")
+        layout = QVBoxLayout(self._scroll_content)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        self._build_header(layout)
+        self._build_account_panel(layout)
+        self._build_signal_panel(layout)
+        self._build_technical_panel(layout)
+        self._build_pnl_panel(layout)
+        self._build_ai_panel(layout)
+        self._build_execution_panel(layout)
+
+        layout.addStretch()
+        scroll.setWidget(self._scroll_content)
+
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.addWidget(scroll)
+
+    def _make_card(self, title, title_color):
+        card = QFrame()
+        card.setStyleSheet(
+            "background: rgba(10,10,15,0.85); "
+            "border: 1px solid rgba(255,255,255,0.06); "
+            "border-radius: 6px; padding: 6px;")
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(8, 6, 8, 6)
+        card_layout.setSpacing(4)
+        if title:
+            hdr = QLabel(title)
+            hdr.setStyleSheet(f"color: {title_color}; font-size: 12px; font-weight: 900; "
+                              "background: transparent; border: none; padding-bottom: 4px;")
+            card_layout.addWidget(hdr)
+        return card, card_layout
+
+    def _sl(self, text, color, size=10, bold=True):
+        lb = QLabel(text)
+        w = "bold" if bold else "normal"
+        lb.setStyleSheet(f"color: {color}; font-size: {size}px; font-weight: {w}; background: transparent; border: none;")
+        return lb
+
+    # ── 1. HEADER ───────────────────────────────────────────────────────
+
+    def _build_header(self, layout):
+        card, cl = self._make_card("SIGNAL MONITOR — REAL", "#00ff66")
+        hrow = QHBoxLayout()
+        hrow.setSpacing(12)
+
+        self._h_price = QLabel("$0.00")
+        self._h_price.setStyleSheet("font-size: 22px; font-weight: 900; color: #ffcc00; background: transparent;")
+        hrow.addWidget(self._h_price)
+
+        self._h_change = QLabel("0.00%")
+        self._h_change.setStyleSheet("font-size: 14px; font-weight: bold; background: transparent;")
+        hrow.addWidget(self._h_change)
+
+        self._h_signal_tag = QLabel("⚪ ESPERANDO")
+        self._h_signal_tag.setStyleSheet(
+            "font-size: 13px; font-weight: 900; background: transparent; "
+            "border: 1px solid #666; border-radius: 4px; padding: 2px 8px;")
+        hrow.addWidget(self._h_signal_tag)
+
+        hrow.addStretch()
+        self._h_status = QLabel("")
+        self._h_status.setStyleSheet("font-size: 10px; color: #666; background: transparent;")
+        hrow.addWidget(self._h_status)
+
+        cl.addLayout(hrow)
+        layout.addWidget(card)
+
+    # ── 2. CUENTA REAL ──────────────────────────────────────────────────
+
+    def _build_account_panel(self, layout):
+        card, cl = self._make_card("CUENTA REAL — FUTURES", "#00ff66")
+        row = QHBoxLayout()
+        row.setSpacing(20)
+
+        self._a_bal = self._sl("Balance: $0.00", "#ccc", 11)
+        row.addWidget(self._a_bal)
+        self._a_avail = self._sl("Disponible: $0.00", "#ccc", 11)
+        row.addWidget(self._a_avail)
+        self._a_upnl = self._sl("PnL no realizado: $0.00", "#666", 11)
+        row.addWidget(self._a_upnl)
+        self._a_lev = self._sl("Apalancamiento: —", "#aaa", 11)
+        row.addWidget(self._a_lev)
+        row.addStretch()
+        self._a_conn = self._sl("⏳ Conectando...", "#ffcc00", 10)
+        row.addWidget(self._a_conn)
+
+        cl.addLayout(row)
+
+        self._a_pos_frame = QFrame()
+        self._a_pos_frame.setStyleSheet("border: 1px solid #333; border-radius: 4px; background: rgba(255,255,255,0.02);")
+        pf = QHBoxLayout(self._a_pos_frame)
+        pf.setContentsMargins(6, 3, 6, 3)
+        self._a_pos_text = self._sl("Sin posición abierta", "#666", 10)
+        pf.addWidget(self._a_pos_text)
+        pf.addStretch()
+        cl.addWidget(self._a_pos_frame)
+
+        layout.addWidget(card)
+
+    # ── 3. SEÑAL ACTIVA ─────────────────────────────────────────────────
+
+    def _build_signal_panel(self, layout):
+        card, cl = self._make_card("SEÑAL ACTIVA — ESTRATEGIA", "#bb00ff")
+
+        # Giant direction indicator
+        sig_row = QHBoxLayout()
+        sig_row.setSpacing(12)
+        self._sig_indicator = QLabel("⚪ ESPERANDO")
+        self._sig_indicator.setStyleSheet(
+            "font-size: 26px; font-weight: 900; background: transparent; "
+            "border: 2px solid #555; border-radius: 8px; padding: 6px 16px;")
+        sig_row.addWidget(self._sig_indicator)
+
+        self._sig_conf_label = self._sl("Confianza: 0%", "#ffcc00", 14)
+        sig_row.addWidget(self._sig_conf_label)
+        sig_row.addStretch()
+        cl.addLayout(sig_row)
+
+        # Confidence bar
+        self._conf_bar = QProgressBar()
+        self._conf_bar.setRange(0, 100)
+        self._conf_bar.setValue(0)
+        self._conf_bar.setFixedHeight(10)
+        self._conf_bar.setTextVisible(False)
+        self._conf_bar.setStyleSheet(
+            "QProgressBar { background: #111; border: 1px solid #333; border-radius: 4px; }"
+            "QProgressBar::chunk { background: qlineargradient(x1:0,y1:0,x2:1,y2:0,"
+            "stop:0 #333, stop:0.5 #bb00ff, stop:1 #00ff66); border-radius: 3px; }")
+        cl.addWidget(self._conf_bar)
+
+        # 6 conditions checklist
+        cond_grid = QHBoxLayout()
+        cond_grid.setSpacing(8)
+        self._cond_labels = {}
+        cond_names = [
+            ("d", "Delta > 0"),
+            ("cvd", "CVD > 0"),
+            ("rsi", "RSI en zona"),
+            ("bb", "BB Position"),
+            ("macd", "MACD Cross"),
+            ("trend", "Trend Align"),
+        ]
+        for key, name in cond_names:
+            vb = QVBoxLayout()
+            vb.setSpacing(1)
+            lb = self._sl(name, "#888", 8, False)
+            vb.addWidget(lb)
+            val = self._sl("—", "#555", 9)
+            vb.addWidget(val)
+            self._cond_labels[key] = val
+            cond_grid.addLayout(vb)
+        cl.addLayout(cond_grid)
+
+        # Reason label
+        self._sig_reason = self._sl("◆ Analizando mercado...", "#aaa", 10)
+        cl.addWidget(self._sig_reason)
+
+        layout.addWidget(card)
+
+    # ── 4. ANÁLISIS TÉCNICO (2 columns) ─────────────────────────────────
+
+    def _build_technical_panel(self, layout):
+        card, cl = self._make_card("ANÁLISIS TÉCNICO", "#00ff88")
+        cols = QHBoxLayout()
+        cols.setSpacing(6)
+
+        # LEFT: Technical Levels + Order Flow
+        left_frame = QFrame()
+        left_frame.setStyleSheet("border: 1px solid rgba(255,255,255,0.04); border-radius: 4px; background: rgba(0,0,0,0.3);")
+        left_l = QVBoxLayout(left_frame)
+        left_l.setContentsMargins(6, 4, 6, 4)
+        left_l.setSpacing(2)
+        left_l.addWidget(self._sl("NIVELES TÉCNICOS", "#00ff66", 10))
+        self._t_fib = self._sl("Fibonacci: —", "#bb00ff", 9)
+        left_l.addWidget(self._t_fib)
+        self._t_sr = self._sl("S/R: —", "#ffcc00", 9)
+        left_l.addWidget(self._t_sr)
+        self._t_conf = self._sl("Confluencia: —", "#00ff88", 9)
+        left_l.addWidget(self._t_conf)
+        self._t_struct = self._sl("Estructura: —", "#aaa", 9)
+        left_l.addWidget(self._t_struct)
+        left_l.addWidget(self._sl("ORDER FLOW", "#00ff66", 10))
+        self._t_delta = self._sl("Delta: —", "#ccc", 9)
+        left_l.addWidget(self._t_delta)
+        self._t_cvd = self._sl("CVD: —", "#ccc", 9)
+        left_l.addWidget(self._t_cvd)
+        self._t_bvol = self._sl("Buy Vol: —", "#00cc6a", 9)
+        left_l.addWidget(self._t_bvol)
+        self._t_svol = self._sl("Sell Vol: —", "#bb00ff", 9)
+        left_l.addWidget(self._t_svol)
+        self._t_imb = self._sl("Imbalance: —", "#ffcc00", 9)
+        left_l.addWidget(self._t_imb)
+
+        # RIGHT: Momentum + MTF
+        right_frame = QFrame()
+        right_frame.setStyleSheet("border: 1px solid rgba(255,255,255,0.04); border-radius: 4px; background: rgba(0,0,0,0.3);")
+        right_l = QVBoxLayout(right_frame)
+        right_l.setContentsMargins(6, 4, 6, 4)
+        right_l.setSpacing(2)
+        right_l.addWidget(self._sl("MOMENTUM & MTF", "#bb00ff", 10))
+        self._t_rsi = self._sl("RSI: —", "#ffcc00", 9)
+        right_l.addWidget(self._t_rsi)
+        self._t_macd = self._sl("MACD: —", "#ccc", 9)
+        right_l.addWidget(self._t_macd)
+        self._t_bb = self._sl("BB: —", "#aaa", 9)
+        right_l.addWidget(self._t_bb)
+        self._t_atr = self._sl("ATR: —", "#ffcc00", 9)
+        right_l.addWidget(self._t_atr)
+        right_l.addWidget(self._sl("TENDENCIAS MTF", "#bb00ff", 10))
+        self._t_trends = self._sl("1M→ 5M→ 15M→ 1H→ 4H→", "#aaa", 9)
+        right_l.addWidget(self._t_trends)
+        self._t_conf_score = self._sl("Confluencia: —", "#00ff88", 9)
+        right_l.addWidget(self._t_conf_score)
+
+        cols.addWidget(left_frame)
+        cols.addWidget(right_frame)
+        cl.addLayout(cols)
+        layout.addWidget(card)
+
+    # ── 5. CALCULADORA P&L ──────────────────────────────────────────────
+
+    def _build_pnl_panel(self, layout):
+        card, cl = self._make_card("CALCULADORA P&L REAL", "#ffcc00")
+        self._pnl_frame = card
+        self._pnl_frame.setVisible(False)
+
+        row1 = QHBoxLayout()
+        row1.setSpacing(16)
+        self._pnl_risk = self._sl("Riesgo: 2.5%", "#ffcc00", 11)
+        row1.addWidget(self._pnl_risk)
+
+        self._risk_slider = QSlider(Qt.Horizontal)
+        self._risk_slider.setRange(5, 100)
+        self._risk_slider.setValue(25)
+        self._risk_slider.setFixedWidth(180)
+        self._risk_slider.setStyleSheet(
+            "QSlider::groove:horizontal { height: 4px; background: #333; border-radius: 2px; }"
+            "QSlider::handle:horizontal { background: #ffcc00; width: 12px; border-radius: 6px; margin: -4px 0; }"
+            "QSlider::sub-page:horizontal { background: #ffcc00; border-radius: 2px; }")
+        self._risk_slider.valueChanged.connect(self._on_risk_change)
+        row1.addWidget(self._risk_slider)
+
+        self._pnl_size = self._sl("Tamaño: — BTC", "#ccc", 10)
+        row1.addWidget(self._pnl_size)
+        row1.addStretch()
+        cl.addLayout(row1)
+
+        grid = QHBoxLayout()
+        grid.setSpacing(12)
+        self._pnl_loss = self._sl("Si SL → Pérdida: —", "#bb00ff", 11)
+        grid.addWidget(self._pnl_loss)
+        self._pnl_gain1 = self._sl("Si TP1 → Ganancia: —", "#00ff66", 11)
+        grid.addWidget(self._pnl_gain1)
+        self._pnl_gain2 = self._sl("Si TP2 → Ganancia: —", "#00ff88", 11)
+        grid.addWidget(self._pnl_gain2)
+        self._pnl_rr = self._sl("R/R: —", "#ffcc00", 11)
+        grid.addWidget(self._pnl_rr)
+        grid.addStretch()
+        cl.addLayout(grid)
+
+        layout.addWidget(card)
+
+    # ── 6. AI COMENTARIO ────────────────────────────────────────────────
+
+    def _build_ai_panel(self, layout):
+        card, cl = self._make_card("AI — COMENTARIO DE MERCADO", "#bb00ff")
+
+        # Controls row
+        ctrl = QHBoxLayout()
+        ctrl.setSpacing(8)
+
+        self._ai_toggle_btn = QPushButton("🤖 Auto ON")
+        self._ai_toggle_btn.setCheckable(True)
+        self._ai_toggle_btn.setChecked(True)
+        self._ai_toggle_btn.setStyleSheet(
+            "QPushButton { background: #0a2e0a; color: #00ff66; border: 1px solid #00ff66; "
+            "border-radius: 3px; padding: 3px 10px; font-size: 10px; font-weight: bold; }"
+            "QPushButton:checked { background: #3a0a0a; color: #ff4444; border: 1px solid #ff4444; }")
+        self._ai_toggle_btn.clicked.connect(self._toggle_auto_ai)
+        ctrl.addWidget(self._ai_toggle_btn)
+
+        self._ai_gemini_btn = QPushButton("🧠 Gemini")
+        self._ai_gemini_btn.setStyleSheet(
+            "QPushButton { background: #1a0a2e; color: #bb00ff; border: 1px solid #bb00ff; "
+            "border-radius: 3px; padding: 3px 10px; font-size: 10px; font-weight: bold; }"
+            "QPushButton:hover { background: #2a0f3f; }"
+            "QPushButton:disabled { color: #555; border-color: #333; }")
+        self._ai_gemini_btn.clicked.connect(self._run_gemini)
+        ctrl.addWidget(self._ai_gemini_btn)
+
+        self._ai_brain_btn = QPushButton("⚡ Quantum Brain")
+        self._ai_brain_btn.setStyleSheet(
+            "QPushButton { background: #0a1a2e; color: #00ff66; border: 1px solid #00ff66; "
+            "border-radius: 3px; padding: 3px 10px; font-size: 10px; font-weight: bold; }"
+            "QPushButton:hover { background: #0f2a3f; }"
+            "QPushButton:disabled { color: #555; border-color: #333; }")
+        self._ai_brain_btn.clicked.connect(self._run_brain)
+        ctrl.addWidget(self._ai_brain_btn)
+
+        self._ai_status = self._sl("✅ Listo", "#666", 9)
+        ctrl.addWidget(self._ai_status)
+        ctrl.addStretch()
+        cl.addLayout(ctrl)
+
+        # Result card
+        self._ai_result_frame = QFrame()
+        self._ai_result_frame.setStyleSheet("border: 1px solid #333; border-radius: 4px; background: rgba(0,0,0,0.3);")
+        ai_rl = QVBoxLayout(self._ai_result_frame)
+        ai_rl.setContentsMargins(6, 4, 6, 4)
+        ai_rl.setSpacing(2)
+        self._ai_decision = self._sl("Decisión: —", "#aaa", 12)
+        ai_rl.addWidget(self._ai_decision)
+        self._ai_reasoning = self._sl("", "#ccc", 9)
+        self._ai_reasoning.setWordWrap(True)
+        ai_rl.addWidget(self._ai_reasoning)
+        scores = QHBoxLayout()
+        self._ai_score_of = self._sl("OF: —", "#00ff66", 9)
+        scores.addWidget(self._ai_score_of)
+        self._ai_score_mom = self._sl("Mom: —", "#ffcc00", 9)
+        scores.addWidget(self._ai_score_mom)
+        self._ai_score_trend = self._sl("Trend: —", "#bb00ff", 9)
+        scores.addWidget(self._ai_score_trend)
+        scores.addStretch()
+        ai_rl.addLayout(scores)
+
+        bracket_info = QHBoxLayout()
+        self._ai_bracket_info = self._sl("Bracket: —", "#aaa", 9)
+        bracket_info.addWidget(self._ai_bracket_info)
+        bracket_info.addStretch()
+        ai_rl.addLayout(bracket_info)
+        cl.addWidget(self._ai_result_frame)
+
+        layout.addWidget(card)
+
+    # ── 7. EJECUCIÓN ────────────────────────────────────────────────────
+
+    def _build_execution_panel(self, layout):
+        card, cl = self._make_card("EJECUCIÓN PROFESIONAL", "#ff4444")
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+
+        self._ex_long = QPushButton("🟢 ABRIR LONG")
+        self._ex_long.setStyleSheet(
+            "QPushButton { background: #0a2e0a; color: #00ff66; border: 2px solid #00ff66; "
+            "border-radius: 6px; padding: 8px 20px; font-size: 13px; font-weight: 900; }"
+            "QPushButton:hover { background: #0f3f0f; }"
+            "QPushButton:pressed { background: #1a5a1a; }"
+            "QPushButton:disabled { color: #333; border-color: #222; background: #0a0a0a; }")
+        self._ex_long.clicked.connect(lambda: self._execute_market("BUY"))
+        row.addWidget(self._ex_long)
+
+        self._ex_short = QPushButton("🔴 ABRIR SHORT")
+        self._ex_short.setStyleSheet(
+            "QPushButton { background: #3a0a0a; color: #ff4444; border: 2px solid #ff4444; "
+            "border-radius: 6px; padding: 8px 20px; font-size: 13px; font-weight: 900; }"
+            "QPushButton:hover { background: #4f0f0f; }"
+            "QPushButton:pressed { background: #5a1a1a; }"
+            "QPushButton:disabled { color: #333; border-color: #222; background: #0a0a0a; }")
+        self._ex_short.clicked.connect(lambda: self._execute_market("SELL"))
+        row.addWidget(self._ex_short)
+
+        self._ex_autorizar = QPushButton("🔒 Autorizar Señal")
+        self._ex_autorizar.setStyleSheet(
+            "QPushButton { background: #1a1a0a; color: #ffcc00; border: 2px solid #ffcc00; "
+            "border-radius: 6px; padding: 8px 16px; font-size: 13px; font-weight: 900; }"
+            "QPushButton:hover { background: #2a2a0f; }"
+            "QPushButton:pressed { background: #3a3a1a; }"
+            "QPushButton:disabled { color: #333; border-color: #222; background: #0a0a0a; }")
+        self._ex_autorizar.clicked.connect(self._execute_signal)
+        row.addWidget(self._ex_autorizar)
+
+        row.addStretch()
+        self._ex_status = self._sl("", "#666", 10)
+        row.addWidget(self._ex_status)
+        cl.addLayout(row)
+
+        # Capital preset
+        cap_row = QHBoxLayout()
+        cap_row.setSpacing(4)
+        cap_row.addWidget(self._sl("Capital:", "#aaa", 9))
+        for pct in [25, 50, 75, 100]:
+            btn = QPushButton(f"{pct}%")
+            btn.setStyleSheet(
+                "QPushButton { background: #111; color: #aaa; border: 1px solid #333; "
+                "border-radius: 3px; padding: 2px 8px; font-size: 9px; }"
+                "QPushButton:hover { background: #222; color: #fff; }"
+                f"QPushButton[pct='{pct}'] {{ }}")
+            btn.clicked.connect(lambda checked, p=pct: self._set_capital(pct))
+            if pct == 100:
+                btn.setStyleSheet(
+                    "QPushButton { background: #222; color: #00ff66; border: 1px solid #00ff66; "
+                    "border-radius: 3px; padding: 2px 8px; font-size: 9px; }")
+            cap_row.addWidget(btn)
+        cap_row.addStretch()
+        cl.addLayout(cap_row)
+
+        layout.addWidget(card)
+
+    # ── Timers ──────────────────────────────────────────────────────────
+
+    def _init_timers(self):
+        self._data_timer = QTimer(self)
+        self._data_timer.timeout.connect(self._poll_data)
+        self._data_timer.start(5000)
+
+    def _poll_data(self):
+        if self._data_worker and not self._data_worker.isRunning():
+            self._data_worker.fetch_all()
+
+    # ── Data Handlers ───────────────────────────────────────────────────
+
+    def _on_balance(self, bal, avail, upnl):
+        self._balance = bal
+        self._available = avail
+        self._unrealized_pnl = upnl
+        self._update_account_display()
+
+    def _on_position(self, pos):
+        self._position = pos
+        self._update_account_display()
+
+    def _on_leverage(self, lev):
+        self._leverage = lev
+        self._update_account_display()
+
+    def _on_connection_status(self, ok, msg):
+        self._data_connected = ok
+        color = "#00ff66" if ok else "#ff4444"
+        self._a_conn.setText(msg)
+        self._a_conn.setStyleSheet(f"color: {color}; font-size: 10px; background: transparent; border: none;")
+
+    def _on_risk_change(self, val):
+        self._risk_pct = val / 10.0
+        self._update_pnl_calc()
+
+    def _on_order_result_f4(self, success, side, qty, fill, oid, msg):
+        self._order_busy = False
+        self._ex_long.setEnabled(True)
+        self._ex_short.setEnabled(True)
+        self._ex_autorizar.setEnabled(True)
+        icon = "✅" if success else "❌"
+        self._ex_status.setText(f"{icon} {side} {qty:.4f} @ ${fill:.2f} id={oid}" if success else f"{icon} {msg}")
+        self._ex_status.setStyleSheet(
+            f"color: {'#00ff66' if success else '#ff4444'}; font-size: 10px; background: transparent; border: none;")
+
+    # ── Signal Detection ────────────────────────────────────────────────
+
+    def _on_signal_detected(self):
+        print(f"[SIGNAL MONITOR] Señal detectada: {self._signal_direction} ({self._signal_confidence:.0f}%)")
+        self._pnl_frame.setVisible(True)
+        self._update_pnl_calc()
+        if self._auto_ai:
+            self._run_gemini()
+
+    def _toggle_auto_ai(self):
+        self._auto_ai = self._ai_toggle_btn.isChecked()
+        self._ai_toggle_btn.setText("🤖 Auto ON" if self._auto_ai else "🤖 Auto OFF")
+
+    # ── AI Analysis ─────────────────────────────────────────────────────
+
+    def _run_gemini(self):
+        if self._ai_busy or self._gemini_brain is None:
+            return
+        self._ai_busy = True
+        self._ai_status.setText("⟳ Analizando Gemini...")
+        self._ai_status.setStyleSheet("color: #ffcc00; font-size: 9px; background: transparent; border: none;")
+        self._ai_gemini_btn.setEnabled(False)
+        self._ai_brain_btn.setEnabled(False)
+
+        snapshot = self._build_snapshot()
+        threading.Thread(target=self._gemini_worker, args=(snapshot,), daemon=True).start()
+
+    def _gemini_worker(self, snapshot):
+        try:
+            result = asyncio.run(self._gemini_brain.execute_inference(snapshot))
+            if result:
+                self._last_gemini = result
+                self._on_ai_result_signal.emit("gemini", result.decision, result.confidence,
+                                               result.reasoning, result.score_order_flow,
+                                               result.score_momentum, result.score_trend,
+                                               result.bracket)
+            else:
+                self._on_ai_result_signal.emit("gemini", "ERROR", 0, "Error en inferencia Gemini", 0, 0, 0, None)
+        except Exception as exc:
+            self._on_ai_result_signal.emit("gemini", "ERROR", 0, str(exc), 0, 0, 0, None)
+
+    def _run_brain(self):
+        if self._ai_busy or self._brain_agent is None:
+            return
+        self._ai_busy = True
+        self._ai_status.setText("⟳ Analizando Quantum Brain...")
+        self._ai_status.setStyleSheet("color: #ffcc00; font-size: 9px; background: transparent; border: none;")
+        self._ai_gemini_btn.setEnabled(False)
+        self._ai_brain_btn.setEnabled(False)
+
+        snapshot = self._build_snapshot()
+        threading.Thread(target=self._brain_worker, args=(snapshot,), daemon=True).start()
+
+    def _brain_worker(self, snapshot):
+        try:
+            result = self._brain_agent.infer_sync(snapshot)
+            if result and result.get("direction"):
+                self._last_brain = result
+                bdir = result["direction"]
+                bracket = result.get("risk_bracket") or result.get("risk", {})
+                self._on_ai_result_signal.emit("brain", bdir, result.get("confidence_pct", 0),
+                                               result.get("market_rationale", ""),
+                                               0, 0, 0, bracket)
+            else:
+                self._on_ai_result_signal.emit("brain", "ERROR", 0, "Sin resultado", 0, 0, 0, None)
+        except Exception as exc:
+            self._on_ai_result_signal.emit("brain", "ERROR", 0, str(exc), 0, 0, 0, None)
+
+    def _on_ai_result(self, source, decision, confidence, reasoning, score_of, score_mom, score_trend, bracket):
+        self._ai_busy = False
+        self._ai_gemini_btn.setEnabled(True)
+        self._ai_brain_btn.setEnabled(True)
+        if decision == "ERROR":
+            self._ai_status.setText(f"❌ {reasoning}")
+            self._ai_status.setStyleSheet("color: #ff4444; font-size: 9px; background: transparent; border: none;")
+            return
+
+        self._ai_status.setText(f"✅ {source.upper()} OK — {time.strftime('%H:%M:%S')}")
+        self._ai_status.setStyleSheet("color: #00ff66; font-size: 9px; background: transparent; border: none;")
+
+        dir_icon = "🟢" if decision == "ALZA" else "🔴" if decision == "BAJA" else "⚪"
+        self._ai_decision.setText(f"{dir_icon} Decisión: {decision} — Confianza: {confidence:.1f}%")
+        self._ai_decision.setStyleSheet(
+            f"color: {'#00ff66' if decision == 'ALZA' else '#ff4444' if decision == 'BAJA' else '#ffcc00'}; "
+            "font-size: 12px; background: transparent; border: none;")
+
+        self._ai_reasoning.setText(reasoning)
+        self._ai_reasoning.setStyleSheet("color: #ccc; font-size: 9px; background: transparent; border: none;")
+
+        self._ai_score_of.setText(f"OF: {score_of:.1f}/10")
+        self._ai_score_mom.setText(f"Mom: {score_mom:.1f}/10")
+        self._ai_score_trend.setText(f"Trend: {score_trend:.1f}/10")
+
+        if bracket:
+            if hasattr(bracket, "stop_loss") and hasattr(bracket, "take_profit_1"):
+                sl = bracket.stop_loss
+                tp1 = bracket.take_profit_1
+                tp2 = getattr(bracket, "take_profit_2", 0)
+            else:
+                sl = bracket.get("sl", 0)
+                tp1 = bracket.get("tp1", 0)
+                tp2 = bracket.get("tp2", 0)
+            self._ai_bracket_info.setText(
+                f"Bracket: SL ${sl:,.0f} | TP1 ${tp1:,.0f}" +
+                (f" | TP2 ${tp2:,.0f}" if tp2 else ""))
+            self._ai_bracket_info.setStyleSheet("color: #ffcc00; font-size: 9px; background: transparent; border: none;")
+        else:
+            self._ai_bracket_info.setText("Bracket: —")
+
+        self._update_pnl_calc()
+
+    def _build_snapshot(self):
+        return {
+            "price": self._price,
+            "change_pct": self._change_pct,
+            "rsi": self._rsi,
+            "macd": self._macd,
+            "macd_signal": self._macd_signal,
+            "macd_hist": self._macd_hist,
+            "bb_upper": self._bb_upper,
+            "bb_middle": self._bb_middle,
+            "bb_lower": self._bb_lower,
+            "atr": self._atr,
+            "delta": self._delta,
+            "cvd": self._cvd,
+            "buy_volume": self._buy_vol,
+            "sell_volume": self._sell_vol,
+            "imbalance": self._imbalance,
+            "volume": self._buy_vol + self._sell_vol,
+            "avg_volume": (self._buy_vol + self._sell_vol) / max(self._atr, 1),
+            "technical_levels": self._tech_levels,
+            "signal": self._signal_text,
+            "trend": self._mtf_trend.get("t_1m", "NEUTRAL"),
+            "trend_5m": self._mtf_trend.get("t_5m", "NEUTRAL"),
+            "trend_15m": self._mtf_trend.get("t_15m", "NEUTRAL"),
+            "trend_1h": self._mtf_trend.get("t_1h", "NEUTRAL"),
+            "trend_4h": self._mtf_trend.get("t_4h", "NEUTRAL"),
+            "confluence_score": self._mtf_trend.get("confluence_score", 50),
+            "direction": self._signal_direction,
+            "confidence_pct": self._signal_confidence,
+        }
+
+    # ── Execution ──────────────────────────────────────────────────────
+
+    def _execute_market(self, side):
+        if self._order_busy or not self._f4worker:
+            return
+        self._order_busy = True
+        self._ex_long.setEnabled(False)
+        self._ex_short.setEnabled(False)
+        self._ex_autorizar.setEnabled(False)
+        capital = max(self._available, self._balance, 100) * self._capital_preset / 100.0
+        lev = max(self._leverage, 1)
+        qty = (capital * lev) / max(self._price, 1)
+        self._f4worker.place_order(side, qty, self._price)
+        self._ex_status.setText(f"⟳ Enviando {side}...")
+        self._ex_status.setStyleSheet("color: #ffcc00; font-size: 10px; background: transparent; border: none;")
+
+    def _execute_signal(self):
+        if self._order_busy or self._executor is None or self._signal_direction == "NEUTRAL":
+            return
+        self._order_busy = True
+        self._ex_long.setEnabled(False)
+        self._ex_short.setEnabled(False)
+        self._ex_autorizar.setEnabled(False)
+
+        bdir = "ALZA" if self._signal_direction == "LONG" else "BAJA"
+        entry = self._price
+        sl = 0
+        tp1 = 0
+        bracket = None
+        if self._last_gemini and hasattr(self._last_gemini, "bracket"):
+            bracket = self._last_gemini.bracket
+        elif self._last_brain:
+            bracket = self._last_brain.get("risk_bracket") or self._last_brain.get("risk", {})
+
+        if bracket:
+            if self._signal_direction == "LONG":
+                sl = bracket.stop_loss if hasattr(bracket, "stop_loss") else bracket.get("sl", entry * 0.98)
+                tp1 = bracket.take_profit_1 if hasattr(bracket, "take_profit_1") else bracket.get("tp1", entry * 1.02)
+            else:
+                sl = bracket.stop_loss if hasattr(bracket, "stop_loss") else bracket.get("sl", entry * 1.02)
+                tp1 = bracket.take_profit_1 if hasattr(bracket, "take_profit_1") else bracket.get("tp1", entry * 0.98)
+        else:
+            sl = entry * (0.98 if self._signal_direction == "LONG" else 1.02)
+            tp1 = entry * (1.02 if self._signal_direction == "LONG" else 0.98)
+
+        cap = max(self._available, self._balance, 100) * self._capital_preset / 100.0
+        lev = max(self._leverage, 10) if self._leverage > 0 else 10
+        success = self._executor.execute_trade_signal(
+            bdir, entry, sl, tp1, lev, cap,
+            confidence=self._signal_confidence)
+        if success:
+            self._ex_status.setText("✅ Señal enviada a ejecución con bracket SL/TP")
+        else:
+            self._ex_status.setText(f"❌ Rechazado: {getattr(self._executor, '_last_reject_reason', 'desconocido')}")
+        self._ex_status.setStyleSheet(f"color: {'#00ff66' if success else '#ff4444'}; font-size: 10px; background: transparent; border: none;")
+        self._order_busy = False
+        self._ex_long.setEnabled(True)
+        self._ex_short.setEnabled(True)
+        self._ex_autorizar.setEnabled(True)
+
+    def _set_capital(self, pct):
+        self._capital_preset = pct
+        self._update_pnl_calc()
+
+    # ── UI Refresh ──────────────────────────────────────────────────────
+
+    def _refresh_ui(self):
+        self._update_header()
+        self._update_signal_display()
+        self._update_technical_display()
+        self._update_pnl_calc()
+
+    def _update_header(self):
+        price_color = "#00ff66" if self._change_pct >= 0 else "#bb00ff"
+        self._h_price.setText(f"${self._price:,.2f}")
+        self._h_price.setStyleSheet(f"font-size: 22px; font-weight: 900; color: {price_color}; background: transparent;")
+        self._h_change.setText(f"{self._change_pct:+.3f}%")
+        self._h_change.setStyleSheet(f"font-size: 14px; font-weight: bold; color: {price_color}; background: transparent;")
+
+        if self._signal_direction == "LONG":
+            tag_text = "🟢 LONG"
+            tag_color = "#00ff66"
+            tag_border = "#00ff66"
+        elif self._signal_direction == "SHORT":
+            tag_text = "🔴 SHORT"
+            tag_color = "#ff4444"
+            tag_border = "#ff4444"
+        else:
+            tag_text = "⚪ ESPERANDO"
+            tag_color = "#ffcc00"
+            tag_border = "#666"
+
+        self._h_signal_tag.setText(tag_text)
+        self._h_signal_tag.setStyleSheet(
+            f"font-size: 13px; font-weight: 900; color: {tag_color}; background: transparent; "
+            f"border: 1px solid {tag_border}; border-radius: 4px; padding: 2px 8px;")
+
+        self._h_status.setText(time.strftime("%H:%M:%S UTC"))
+
+    def _update_account_display(self):
+        self._a_bal.setText(f"Balance: ${self._balance:,.2f}")
+        self._a_avail.setText(f"Disponible: ${self._available:,.2f}")
+        pnl_color = "#00ff66" if self._unrealized_pnl >= 0 else "#bb00ff"
+        self._a_upnl.setText(f"PnL no realizado: ${self._unrealized_pnl:+,.2f}")
+        self._a_upnl.setStyleSheet(f"color: {pnl_color}; font-size: 11px; background: transparent; border: none;")
+        if self._leverage > 0:
+            self._a_lev.setText(f"Apalancamiento: {self._leverage}x")
+            self._a_lev.setStyleSheet("color: #ffcc00; font-size: 11px; background: transparent; border: none;")
+
+        if self._position:
+            amt = self._position.get("amt", 0)
+            direction = "LONG" if amt > 0 else "SHORT"
+            entry = self._position.get("entry", 0)
+            mark = self._position.get("mark", 0)
+            upnl = self._position.get("upnl", 0)
+            liq = self._position.get("liq", 0)
+            pnl_pct = (mark / max(entry, 1) - 1) * 100 * (1 if amt > 0 else -1)
+            pnl_c = "#00ff66" if upnl >= 0 else "#bb00ff"
+            self._a_pos_text.setText(
+                f"⚠ {direction} {abs(amt):.4f} BTC @ ${entry:,.0f} | "
+                f"Mark ${mark:,.0f} | PnL ${upnl:+,.2f} ({pnl_pct:+.2f}%) | "
+                f"Liquidación ${liq:,.0f}")
+            self._a_pos_text.setStyleSheet(f"color: {pnl_c}; font-size: 10px; background: transparent; border: none;")
+            self._a_pos_frame.setVisible(True)
+        else:
+            self._a_pos_text.setText("Sin posición abierta")
+            self._a_pos_text.setStyleSheet("color: #666; font-size: 10px; background: transparent; border: none;")
+            self._a_pos_frame.setVisible(True)
+
+    def _update_signal_display(self):
+        if self._signal_direction == "LONG":
+            sig_text = "🟢 LONG"
+            sig_color = "#00ff66"
+            sig_border = "#00ff66"
+            sig_bg = "rgba(0,255,102,0.05)"
+        elif self._signal_direction == "SHORT":
+            sig_text = "🔴 SHORT"
+            sig_color = "#ff4444"
+            sig_border = "#ff4444"
+            sig_bg = "rgba(255,68,68,0.05)"
+        else:
+            sig_text = "⚪ ESPERANDO"
+            sig_color = "#ffcc00"
+            sig_border = "#555"
+            sig_bg = "transparent"
+
+        self._sig_indicator.setText(sig_text)
+        self._sig_indicator.setStyleSheet(
+            f"font-size: 26px; font-weight: 900; color: {sig_color}; background: {sig_bg}; "
+            f"border: 2px solid {sig_border}; border-radius: 8px; padding: 6px 16px;")
+        self._sig_conf_label.setText(f"Confianza: {self._signal_confidence:.0f}%")
+        self._sig_conf_label.setStyleSheet(f"color: {sig_color}; font-size: 14px; background: transparent; border: none;")
+        self._conf_bar.setValue(int(min(100, self._signal_confidence)))
+        self._sig_reason.setText(self._trend_label)
+
+        # Update conditions
+        delta_ok = self._delta > 0
+        cvd_ok = self._cvd > 0
+        trend = self._mtf_trend.get("t_1m", "NEUTRAL")
+        rsi_val = self._rsi
+        if trend == "ALCISTA":
+            rsi_ok = rsi_val < 40 or rsi_val > 60
+        elif trend == "BAJISTA":
+            rsi_ok = rsi_val < 40 or rsi_val > 60
+        else:
+            rsi_ok = rsi_val < 30 or rsi_val > 70
+
+        bb_pos = ((self._price - self._bb_lower) / max(self._bb_upper - self._bb_lower, 1)) * 100 if self._bb_upper > 0 else 50
+        bb_ok = bb_pos < 20 or bb_pos > 80
+        macd_ok = self._macd > self._macd_signal
+        t1h = self._mtf_trend.get("t_1h", "NEUTRAL")
+        t4h = self._mtf_trend.get("t_4h", "NEUTRAL")
+        trend_ok = (t1h == "ALCISTA" and t4h == "ALCISTA") or (t1h == "BAJISTA" and t4h == "BAJISTA")
+
+        cond_values = {
+            "d": (delta_ok, f"{self._delta:+.1f}"),
+            "cvd": (cvd_ok, f"{self._cvd:+.1f}"),
+            "rsi": (rsi_ok, f"RSI={rsi_val:.0f}"),
+            "bb": (bb_ok, f"pos={bb_pos:.0f}%"),
+            "macd": (macd_ok, "bull" if macd_ok else "bear"),
+            "trend": (trend_ok, f"1H={t1h} 4H={t4h}"),
+        }
+        for key, (ok, val) in cond_values.items():
+            lbl = self._cond_labels.get(key)
+            if lbl:
+                icon = "✅" if ok else "❌"
+                c = "#00ff66" if ok else "#ff4444"
+                lbl.setText(f"{icon} {val}")
+                lbl.setStyleSheet(f"color: {c}; font-size: 9px; background: transparent; border: none;")
+
+        # ── Macro filter: block Autorizar in REAL when confidence < 40% due to TF misalignment ──
+        is_real = (self._executor is not None and hasattr(self._executor, 'is_testnet')
+                   and not self._executor.is_testnet)
+        macro_blocked = is_real and self._signal_confidence < 40 and not trend_ok
+        if macro_blocked:
+            self._ex_autorizar.setText("🚨 FILTRO MACRO RECHAZADO")
+            self._ex_autorizar.setEnabled(False)
+        else:
+            self._ex_autorizar.setText("🔒 Autorizar Señal")
+            self._ex_autorizar.setEnabled(True)
+
+    def _update_technical_display(self):
+        tech = self._tech_levels
+        price = self._price
+
+        # Fibonacci
+        fib_r = tech.get("fib_retracement", [])
+        if fib_r:
+            parts = [f"{fb['ratio']}→${fb['price']:,.0f}" for fb in fib_r[:4]]
+            self._t_fib.setText(f"Fibonacci: {' | '.join(parts)}")
+            self._t_fib.setStyleSheet("color: #bb00ff; font-size: 9px; background: transparent; border: none;")
+        else:
+            self._t_fib.setText("Fibonacci: —")
+
+        # S/R
+        ns = tech.get("nearest_support")
+        nr = tech.get("nearest_resistance")
+        parts = []
+        if ns:
+            npct = (ns["price"] / max(price, 1) - 1) * 100
+            parts.append(f"Soporte ${ns['price']:,.0f} ({npct:+.2f}%)")
+        if nr:
+            npct = (nr["price"] / max(price, 1) - 1) * 100
+            parts.append(f"Resistencia ${nr['price']:,.0f} ({npct:+.2f}%)")
+        if parts:
+            self._t_sr.setText(" | ".join(parts))
+            self._t_sr.setStyleSheet("color: #ffcc00; font-size: 9px; background: transparent; border: none;")
+        else:
+            self._t_sr.setText("S/R: —")
+
+        # Confluence
+        cz = tech.get("confluence_zones", [])
+        if cz:
+            top_z = cz[0]
+            self._t_conf.setText(f"Confluencia: ${top_z['price']:,.0f} (score:{top_z['score']})")
+            self._t_conf.setStyleSheet("color: #00ff88; font-size: 9px; background: transparent; border: none;")
+        else:
+            self._t_conf.setText("Confluencia: —")
+
+        # Market structure
+        ms = tech.get("market_structure", "")
+        if ms:
+            self._t_struct.setText(f"Estructura: {ms}")
+            self._t_struct.setStyleSheet("color: #ffcc00; font-size: 9px; background: transparent; border: none;")
+        else:
+            self._t_struct.setText("Estructura: —")
+
+        # Order flow
+        dc = "#00ff66" if self._delta >= 0 else "#bb00ff"
+        self._t_delta.setText(f"Delta: {self._delta:+.2f}")
+        self._t_delta.setStyleSheet(f"color: {dc}; font-size: 9px; background: transparent; border: none;")
+        cc = "#00ff66" if self._cvd >= 0 else "#bb00ff"
+        self._t_cvd.setText(f"CVD: {self._cvd:+.2f}")
+        self._t_cvd.setStyleSheet(f"color: {cc}; font-size: 9px; background: transparent; border: none;")
+        self._t_bvol.setText(f"Buy Vol: {self._buy_vol:.2f} BTC")
+        self._t_svol.setText(f"Sell Vol: {self._sell_vol:.2f} BTC")
+        ratio = self._buy_vol / max(self._sell_vol, 0.001)
+        ic = "#00ff66" if ratio > 1.1 else "#bb00ff" if ratio < 0.9 else "#ffcc00"
+        self._t_imb.setText(f"Imbalance: {self._imbalance:+.3f}")
+        self._t_imb.setStyleSheet(f"color: {ic}; font-size: 9px; background: transparent; border: none;")
+
+        # RSI
+        rsi_color = "#bb00ff" if self._rsi > 70 else "#00ff66" if self._rsi < 30 else "#ffcc00"
+        self._t_rsi.setText(f"RSI: {self._rsi:.1f}")
+        self._t_rsi.setStyleSheet(f"color: {rsi_color}; font-size: 9px; background: transparent; border: none;")
+
+        # MACD
+        mc = "#00ff66" if self._macd >= self._macd_signal else "#bb00ff"
+        self._t_macd.setText(f"MACD: {self._macd:.3f} (signal: {self._macd_signal:.3f})")
+        self._t_macd.setStyleSheet(f"color: {mc}; font-size: 9px; background: transparent; border: none;")
+
+        # BB
+        if self._bb_upper > 0:
+            squeeze = "SQUEEZE" if (self._bb_upper - self._bb_lower) < self._atr * 2 else "EXPANSION"
+            sc = "#bb00ff" if squeeze == "SQUEEZE" else "#00ff88"
+            self._t_bb.setText(f"BB: ↑${self._bb_upper:,.0f} ↓${self._bb_lower:,.0f} ({squeeze})")
+            self._t_bb.setStyleSheet(f"color: {sc}; font-size: 9px; background: transparent; border: none;")
+        else:
+            self._t_bb.setText("BB: —")
+
+        # ATR
+        self._t_atr.setText(f"ATR: ${self._atr:.2f}")
+
+        # MTF Trends
+        mtf = self._mtf_trend
+        trend_map = {"ALCISTA": "↗", "BAJISTA": "↘", "NEUTRAL": "→", "WAIT": "→"}
+        t1 = trend_map.get(mtf.get("t_1m", "NEUTRAL"), "→")
+        t5 = trend_map.get(mtf.get("t_5m", "NEUTRAL"), "→")
+        t15 = trend_map.get(mtf.get("t_15m", "NEUTRAL"), "→")
+        t1h = trend_map.get(mtf.get("t_1h", "NEUTRAL"), "→")
+        t4h = trend_map.get(mtf.get("t_4h", "NEUTRAL"), "→")
+        self._t_trends.setText(f"1M {t1}  5M {t5}  15M {t15}  1H {t1h}  4H {t4h}")
+        self._t_trends.setStyleSheet("color: #aaa; font-size: 9px; background: transparent; border: none;")
+
+        cs = mtf.get("confluence_score", 50)
+        cs_color = "#00ff66" if cs >= 70 else "#ffcc00" if cs >= 40 else "#bb00ff"
+        self._t_conf_score.setText(f"Confluencia: {cs:.0f}%")
+        self._t_conf_score.setStyleSheet(f"color: {cs_color}; font-size: 9px; background: transparent; border: none;")
+
+    def _update_pnl_calc(self):
+        if self._signal_direction == "NEUTRAL" or self._price <= 0:
+            return
+        self._pnl_frame.setVisible(True)
+        self._pnl_risk.setText(f"Riesgo: {self._risk_pct:.1f}%")
+
+        cap_base = max(self._available, self._balance, 100)
+        cap_risk = cap_base * self._risk_pct / 100.0 * self._capital_preset / 100.0
+        lev = max(self._leverage, 1) if self._leverage > 0 else 10
+        pos_size = (cap_risk * lev) / max(self._price, 1)
+        self._pnl_size.setText(f"Tamaño: {pos_size:.4f} BTC")
+
+        bracket = None
+        if self._last_gemini and hasattr(self._last_gemini, "bracket"):
+            bracket = self._last_gemini.bracket
+        elif self._last_brain:
+            bracket = self._last_brain.get("risk_bracket") or self._last_brain.get("risk", {})
+
+        sl_price = 0
+        tp1_price = 0
+        tp2_price = 0
+        if bracket:
+            sl_price = bracket.stop_loss if hasattr(bracket, "stop_loss") else bracket.get("sl", 0)
+            tp1_price = bracket.take_profit_1 if hasattr(bracket, "take_profit_1") else bracket.get("tp1", 0)
+            tp2_price = bracket.take_profit_2 if hasattr(bracket, "take_profit_2") else bracket.get("tp2", 0)
+
+        is_long = self._signal_direction == "LONG"
+        if sl_price <= 0:
+            sl_price = self._price * 0.98 if is_long else self._price * 1.02
+        if tp1_price <= 0:
+            tp1_price = self._price * 1.02 if is_long else self._price * 0.98
+
+        loss = (self._price - sl_price) * pos_size if is_long else (sl_price - self._price) * pos_size
+        gain1 = (tp1_price - self._price) * pos_size if is_long else (self._price - tp1_price) * pos_size
+        gain2 = (tp2_price - self._price) * pos_size if is_long and tp2_price > 0 else \
+                (self._price - tp2_price) * pos_size if not is_long and tp2_price > 0 else 0
+
+        loss_pct = loss / max(self._available, 1) * 100
+        gain1_pct = gain1 / max(self._available, 1) * 100
+        gain2_pct = gain2 / max(self._available, 1) * 100 if gain2 != 0 else 0
+
+        rr1 = abs(gain1 / max(abs(loss), 0.01))
+        rr2 = abs(gain2 / max(abs(loss), 0.01)) if gain2 != 0 else 0
+
+        self._pnl_loss.setText(f"SL ${sl_price:,.0f} → ${loss:+,.2f} ({loss_pct:+.2f}%)")
+        self._pnl_loss.setStyleSheet(f"color: #bb00ff; font-size: 11px; background: transparent; border: none;")
+        self._pnl_gain1.setText(f"TP1 ${tp1_price:,.0f} → ${gain1:+,.2f} ({gain1_pct:+.2f}%)")
+        self._pnl_gain1.setStyleSheet(f"color: #00ff66; font-size: 11px; background: transparent; border: none;")
+        if gain2 != 0:
+            self._pnl_gain2.setText(f"TP2 ${tp2_price:,.0f} → ${gain2:+,.2f} ({gain2_pct:+.2f}%)")
+            self._pnl_gain2.setStyleSheet(f"color: #00ff88; font-size: 11px; background: transparent; border: none;")
+            self._pnl_gain2.setVisible(True)
+        else:
+            self._pnl_gain2.setVisible(False)
+
+        rr_text = f"1:{rr1:.2f}" if rr2 == 0 else f"1:{rr1:.2f} / 1:{rr2:.2f}"
+        self._pnl_rr.setText(f"R/R: {rr_text}")
+        self._pnl_rr.setStyleSheet(f"color: #ffcc00; font-size: 11px; background: transparent; border: none;")
+
+
+class RiskManagementTab(QFrame):
+    """F4: Registro y Gestión de Riesgo — Dual-env, bitácora aislada, métricas."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._executor = None
+        self._f4worker = None
+        self._current_price = 0.0
+        self._balance = 0.0
+        self._available = 0.0
+        self._unrealized_pnl = 0.0
+        self._journal_data: list = []
+
+        # ── Trading panel state ───────────────────────────────────────
+        self._margin_mode = "ISOLATED"  # ISOLATED or CROSSED
+        self._leverage = 10
+        self._position_preset = 50  # percent 25/50/100
+        self._order_busy = False  # prevent double-clicks
+
+        self._init_db()
+        self._init_ui()
+        self._load_journal()
+        self._recalc_metrics()
+
+    # ── Public: wire executor after construction ─────────────────────────────
+
+    def set_executor(self, executor):
+        self._executor = executor
+        self._f4worker = F4Worker(executor)
+        self._f4worker.balance_updated.connect(self._on_balance_fetched)
+        self._f4worker.leverage_result.connect(self._on_leverage_result)
+        self._f4worker.margin_result.connect(self._on_margin_result)
+        self._f4worker.order_result_signal.connect(self._on_order_result_f4)
+        self.refresh_env_data()
+
+    def _on_balance_fetched(self, balance, available, upnl):
+        self._balance = balance
+        self._available = available
+        self._unrealized_pnl = upnl
+        self._update_env_display()
+        self._calc_position_size()
+
+    def _on_leverage_result(self, success, leverage):
+        if success:
+            self._leverage = leverage
+            if hasattr(self, '_calc_lev_label'):
+                self._calc_lev_label.setText(f"Apalancamiento Real: {leverage}x")
+                self._calc_lev_label.setStyleSheet(
+                    "color: #00ff66; font-size: 11px; font-weight: bold; background: transparent;")
+        else:
+            print(f"[F4 WORKER] ❌ Leverage change to {leverage}x failed")
+
+    def _on_margin_result(self, success, margin_type):
+        if not success:
+            print(f"[F4 WORKER] ❌ Margin change to {margin_type} failed")
+
+    def _on_order_result_f4(self, success, side, qty, fill_price, oid, msg):
+        self._order_busy = False
+        self._calc_order_btn.setEnabled(True)
+        if success:
+            print(f"[F4 PANEL] ✅ {side} {qty:.4f} BTC @ ${fill_price:.2f} (id={oid}) [REAL]")
+        else:
+            print(f"[F4 PANEL] ❌ {side} — {msg}")
+
+    def refresh_env_data(self):
+        if self._f4worker:
+            self._f4worker.fetch_balance()
+        elif self._executor:
+            result = self._executor.get_balance()
+            if result.get("success"):
+                self._balance = result["balance"]
+                self._available = result.get("available", 0)
+                self._unrealized_pnl = result.get("unrealized_pnl", 0)
+            self._update_env_display()
+        self._calc_position_size()
+
+    # ── UI ─────────────────────────────────────────────────────────────────
+
+    def _init_ui(self):
+        self.setStyleSheet("background: #000; border: none;")
+
+        # ── Header (balance/env strip) ─────────────────────────────────────
+        header = QFrame()
+        header.setStyleSheet(
+            f"background: rgba(10,10,15,0.85); "
+            f"border: 1px solid {COLORS['border_glow']}; "
+            f"border-radius: 6px; padding: 4px;")
+        hl = QHBoxLayout(header)
+        hl.setContentsMargins(10, 4, 10, 4)
+        self._env_label = QLabel("🔴 REAL — PRODUCCIÓN")
+        self._env_label.setStyleSheet(
+            "font-size: 11px; font-weight: bold; padding: 2px 10px; "
+            "border-radius: 4px; color: #ff4444; "
+            "background: #3a0a0a; border: 1px solid #ff4444;")
+        hl.addWidget(self._env_label)
+        hl.addSpacing(10)
+        self._bal_label = QLabel()
+        self._bal_label.setStyleSheet("font-size: 11px; color: #ccc; background: transparent;")
+        hl.addWidget(self._bal_label)
+        hl.addSpacing(8)
+        self._pnl_label = QLabel()
+        self._pnl_label.setStyleSheet("font-size: 12px; font-weight: bold; background: transparent;")
+        hl.addWidget(self._pnl_label)
+        hl.addStretch()
+
+        # ── QTabWidget with 4 sub-tabs ─────────────────────────────────────
+        self._tab_widget = QTabWidget()
+        _bg = COLORS['border_glow']
+        self._tab_widget.setStyleSheet(
+            "QTabWidget::pane { border: 1px solid #222; background: #000; }"
+            "QTabBar::tab { background: #0a0a0a; color: #888; padding: 6px 14px; "
+            "font-size: 10px; font-weight: bold; border: 1px solid #1a1a1a; "
+            "border-bottom: none; border-top-left-radius: 4px; border-top-right-radius: 4px; }"
+            "QTabBar::tab:selected { background: #000; color: #DEFF9A; "
+            f"border-color: {_bg}; }}"
+            "QTabBar::tab:hover { color: #ccc; }")
+
+        self._build_journal_tab()
+        self._build_dashboard_tab()
+        self._build_calculator_tab()
+        self._build_guide_tab()
+
+        # ── Main layout ───────────────────────────────────────────────────
+        ml = QVBoxLayout(self)
+        ml.setContentsMargins(6, 4, 6, 4)
+        ml.setSpacing(4)
+        ml.addWidget(header)
+        ml.addWidget(self._tab_widget)
+
+        self._update_env_display()
+
+    # ── Sub-tab 1: 📋 Registro Automatizado ────────────────────────────────
+
+    def _build_journal_tab(self):
+        tab = QWidget()
+        tab.setStyleSheet("background: #000;")
+        lay = QVBoxLayout(tab)
+        lay.setContentsMargins(4, 4, 4, 4)
+
+        self.journal_table = QTableWidget()
+        self.journal_table.setColumnCount(26)
+        self.journal_table.setHorizontalHeaderLabels([
+            "Fecha", "Par", "Dirección", "Estado",
+            "Tipo Señal", "Delta Ent.", "CVD Ent.",
+            "Apalanc.", "Margen USDT",
+            "Precio Ent.", "SL", "TP",
+            "Tamaño Pos", "Precio Sal.",
+            "PNL Neto", "ROE %",
+            "R:R", "DD Acum", "Comisión Est.",
+            "Ciclo", "Confianza", "Score OF",
+            "Score Mom", "Score Trend", "Latencia",
+            "Notas",
+        ])
+        hh = self.journal_table.horizontalHeader()
+        hh.setStyleSheet("QHeaderView::section { background: #111; color: #aaa; "
+                         "border: 1px solid #222; padding: 2px; font-size: 9px; }")
+        self.journal_table.setAlternatingRowColors(True)
+        self.journal_table.setStyleSheet(
+            "QTableWidget { background: #050505; color: #ccc; "
+            "gridline-color: #1a1a1a; border: none; font-size: 10px; "
+            "alternate-background-color: #0a0a0a; }"
+            "QTableWidget::item { padding: 1px 3px; }"
+            "QTableWidget::item:selected { background: #1a1a2e; color: #fff; }")
+        self.journal_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.journal_table.setSelectionBehavior(QTableWidget.SelectRows)
+        lay.addWidget(self.journal_table)
+
+        self._tab_widget.addTab(tab, "📋 Registro Automatizado")
+
+    # ── Sub-tab 2: 📊 Dashboard Ejecutivo ──────────────────────────────────
+
+    def _build_dashboard_tab(self):
+        tab = QWidget()
+        tab.setStyleSheet("background: #000;")
+        lay = QVBoxLayout(tab)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(8)
+
+        # KPI grid
+        grid = QGridLayout()
+        grid.setSpacing(8)
+
+        def _kpi_card(title, label_ref, default="$0.00", color="#DEFF9A"):
+            card = QFrame()
+            card.setStyleSheet("background: #0a0a0f; border: 1px solid #222; border-radius: 6px; padding: 8px;")
+            cl = QVBoxLayout(card)
+            cl.setSpacing(2)
+            t = QLabel(title)
+            t.setStyleSheet("color: #888; font-size: 10px; background: transparent;")
+            cl.addWidget(t)
+            v = QLabel(default)
+            v.setStyleSheet(f"color: {color}; font-size: 18px; font-weight: bold; background: transparent;")
+            cl.addWidget(v)
+            setattr(self, label_ref, v)
+            return card
+
+        grid.addWidget(_kpi_card("Balance Inicial", "_kpi_init_bal", "$14.61"), 0, 0)
+        grid.addWidget(_kpi_card("Balance Actual", "_kpi_cur_bal", "—"), 0, 1)
+        grid.addWidget(_kpi_card("Beneficio Neto Total", "_kpi_net_pnl", "$0.00"), 0, 2)
+        grid.addWidget(_kpi_card("Win Rate", "_kpi_win_rate", "0.0%"), 1, 0)
+        grid.addWidget(_kpi_card("Profit Factor", "_kpi_profit_factor", "0.00"), 1, 1)
+        grid.addWidget(_kpi_card("Total Operaciones", "_kpi_total_trades", "0"), 1, 2)
+
+        lay.addLayout(grid)
+
+        # Realized PnL chart placeholder
+        info = QLabel(
+            "📈 <b>Seguimiento Automatizado</b><br>"
+            "Los KPI se actualizan en tiempo real con cada "
+            "operación cerrada desde el motor de ejecución.")
+        info.setStyleSheet("color: #666; font-size: 10px; background: transparent; padding: 8px;")
+        info.setWordWrap(True)
+        lay.addWidget(info)
+        lay.addStretch()
+
+        self._tab_widget.addTab(tab, "📊 Dashboard Ejecutivo")
+
+    # ── Sub-tab 3: 🧮 Calculadora de Sizing Avanzada ──────────────────────
+
+    def _build_calculator_tab(self):
+        tab = QWidget()
+        tab.setStyleSheet("background: #000;")
+        lay = QVBoxLayout(tab)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(8)
+
+        # Balance header
+        self._calc_bal = QLabel("Balance Real: —")
+        self._calc_bal.setStyleSheet("color: #DEFF9A; font-size: 13px; font-weight: bold; background: transparent;")
+        lay.addWidget(self._calc_bal)
+
+        # Form grid
+        fg = QGridLayout()
+        fg.setSpacing(6)
+
+        def _labeled_field(label, obj_name, default="0.00", placeholder=""):
+            lbl = QLabel(label)
+            lbl.setStyleSheet("color: #aaa; font-size: 10px; background: transparent;")
+            inp = QLineEdit(default)
+            inp.setPlaceholderText(placeholder)
+            inp.setStyleSheet(
+                "QLineEdit { background: #0a0a0a; color: #fff; "
+                "border: 1px solid #333; border-radius: 3px; padding: 4px 6px; "
+                "font-size: 12px; }"
+                "QLineEdit:focus { border-color: #DEFF9A; }")
+            setattr(self, obj_name, inp)
+            return lbl, inp
+
+        row = 0
+        lbl, inp = _labeled_field("Margen Manual a Usar (USDT):", "_calc_margin_input", "14.61")
+        fg.addWidget(lbl, row, 0)
+        fg.addWidget(inp, row, 1)
+        row += 1
+
+        lbl, inp = _labeled_field("Pérdida Máxima Estricta (USD):", "_calc_max_loss_input", "2.00")
+        fg.addWidget(lbl, row, 0)
+        fg.addWidget(inp, row, 1)
+        row += 1
+
+        # Real leverage readout
+        self._calc_lev_label = QLabel("Apalancamiento Real: —")
+        self._calc_lev_label.setStyleSheet("color: #ffcc00; font-size: 11px; font-weight: bold; background: transparent;")
+        fg.addWidget(self._calc_lev_label, row, 0, 1, 2)
+
+        lay.addLayout(fg)
+
+        # Output section
+        out_frame = QFrame()
+        out_frame.setStyleSheet("background: #0a0a0f; border: 1px solid #222; border-radius: 6px; padding: 8px;")
+        out_lay = QVBoxLayout(out_frame)
+        self._calc_size_label = QLabel("Tamaño calculado: — BTC (mín. 0.001)")
+        self._calc_size_label.setStyleSheet("color: #ccc; font-size: 11px; background: transparent;")
+        out_lay.addWidget(self._calc_size_label)
+        self._calc_max_loss_label = QLabel("Pérdida máxima: $— (—% del balance)")
+        self._calc_max_loss_label.setStyleSheet("color: #bb00ff; font-size: 11px; background: transparent;")
+        out_lay.addWidget(self._calc_max_loss_label)
+        lay.addWidget(out_frame)
+
+        # Quick order button
+        self._calc_order_btn = QPushButton("⚠️ CALCULANDO...")
+        self._calc_order_btn.setFixedHeight(44)
+        self._calc_order_btn.setEnabled(False)
+        self._calc_order_btn.setStyleSheet(
+            "QPushButton { background: #111; color: #555; border: 2px solid #333; "
+            "border-radius: 6px; padding: 8px; font-size: 14px; font-weight: bold; }")
+        self._calc_order_btn.clicked.connect(self._on_calc_order)
+        lay.addWidget(self._calc_order_btn)
+
+        # Connect input changes to recalc
+        self._calc_margin_input.textChanged.connect(self._recalc_calculator)
+        self._calc_max_loss_input.textChanged.connect(self._recalc_calculator)
+
+        lay.addStretch()
+
+        self._tab_widget.addTab(tab, "🧮 Calculadora de Sizing Avanzada")
+
+    # ── Sub-tab 4: 📖 Guía de Lógica de la Estrategia ─────────────────────
+
+    def _build_guide_tab(self):
+        tab = QWidget()
+        tab.setStyleSheet("background: #000;")
+        lay = QVBoxLayout(tab)
+        lay.setContentsMargins(10, 10, 10, 10)
+
+        tb = QTextBrowser()
+        tb.setOpenExternalLinks(True)
+        tb.setStyleSheet(
+            "QTextBrowser { background: #050505; color: #ccc; border: 1px solid #222; "
+            "border-radius: 4px; padding: 10px; font-size: 11px; }")
+        tb.setHtml("""
+        <style>
+            body { font-family: monospace; }
+            h2 { color: #DEFF9A; border-bottom: 1px solid #333; padding-bottom: 4px; }
+            h3 { color: #00ccff; }
+            .bull { color: #00ff66; }
+            .bear { color: #bb00ff; }
+            .highlight { color: #ffcc00; }
+            code { color: #DEFF9A; background: #0a0a0a; padding: 1px 4px; border-radius: 2px; }
+        </style>
+        <h2>📖 BB-450 — Lógica de la Estrategia</h2>
+
+        <h3>🎯 Filosofía Central</h3>
+        <p>
+        Scalping de alta frecuencia en BTCUSDT Futuros. El bot opera exclusivamente
+        en temporalidades de <b>1 minuto</b>, detectando micro-estructuras de
+        <span class="bull">absorción de liquidez</span> y
+        <span class="bear">divergencias de CVD</span> para anticipar
+        giros de precio de 0.5–2 %.
+        </p>
+
+        <h3>📊 Deltas Institucionales (Order Flow)</h3>
+        <p>
+        <b>Delta</b> = Volumen comprador − Volumen vendedor en la temporalidad actual.<br>
+        - Delta <span class="bull">positiva creciente</span> → presión compradora institucional.<br>
+        - Delta <span class="bear">negativa creciente</span> → distribución / venta agresiva.<br>
+        - <span class="highlight">Divergencia Delta-Precio</span>: si el precio sube pero la delta
+        baja, es <b>trampa alcista</b> (posible giro a SHORT).
+        </p>
+
+        <h3>🌊 CVD (Cumulative Volume Delta)</h3>
+        <p>
+        El CVD acumula la delta en el tiempo para filtrar ruido de micro-órdenes.
+        <br><br>
+        <b>Señales CVD:</b><br>
+        - <span class="bull">CVD alcista + precio lateral</span> → acumulación silenciosa.
+        - <span class="bear">CVD bajista + precio lateral</span> → distribución.
+        - <span class="highlight">Divergencia CVD</span>: precio haciendo
+        <b>nuevo máximo</b> pero CVD no lo confirma → <b>SHORT</b>.
+        </p>
+
+        <h3>🐋 Absorciones en Zonas de Ballenas</h3>
+        <p>
+        Cuando el precio llega a un nivel de soporte/resistencia clave y el
+        <b>order book</b> muestra órdenes masivas siendo <b>absorbidass</b>
+        (sin mover el precio), indica que una ballena está acumulando
+        posiciones. El bot detecta estas pausas como
+        <span class="highlight">Zonas de Confluencia</span> y espera la
+        ruptura.
+        </p>
+
+        <h3>⚙️ Reglas de Ejecución</h3>
+        <p>
+        - <b>LONG</b>: Delta > 0, CVD > 0, precio sobre VWAP, RSI entre 30–50.<br>
+        - <b>SHORT</b>: Delta < 0, CVD < 0, precio bajo VWAP, RSI entre 50–70.<br>
+        - <b>Apalancamiento dinámico</b>: 10x (confianza 40–60%), 25x (>60%).<br>
+        - <b>Trailing stop</b>: breakeven en +$6, trail por MA7 o 0.2%.<br>
+        - <b>Cooldown</b>: 15 min post-cierre antes de reingresar.
+        </p>
+
+        <h3>🚨 Gestión de Riesgo</h3>
+        <p>
+        - Capital máximo por operación: 2.5% del balance (40–60% conf) o 7% (>60%).<br>
+        - Filtro macro: si 1H y 4H están desalineados y confianza < 40%,
+          el bot <span class="bear">RECHAZA</span> automáticamente la señal.<br>
+        - Las órdenes usan <b>STOP_MARKET</b> y <b>TAKE_PROFIT_MARKET</b> de
+          Binance Algo Service (bracket completo).
+        </p>
+
+        <h3>📡 Conectividad</h3>
+        <p>
+        BB-450 opera <b>exclusivamente en producción REAL</b>
+        (https://fapi.binance.com).<br>
+        Cualquier intento de conectar a testnet es bloqueado en el
+        arranque. Señales vía Telegram, ejecución local vía
+        <code>OrderExecutor</code> (QThread+queue).
+        </p>
+        """)
+        lay.addWidget(tb)
+
+        self._tab_widget.addTab(tab, "📖 Guía de Lógica de la Estrategia")
+
+    # ── Helpers ────────────────────────────────────────────────────────────
+
+    def _make_small_label(self, text):
+        lbl = QLabel(text)
+        lbl.setStyleSheet("color: #888; font-size: 10px; background: transparent;")
+        return lbl
+
+    def _update_env_display(self):
+        env_tag = "REAL"
+        env_color = "#ff4444"
+        bal_text = f"Balance: <b>${self._balance:,.2f}</b>" if self._balance > 0 else "Balance: <b>—</b>"
+        avail_text = f"Disponible: <b>${self._available:,.2f}</b>" if self._available > 0 else "Disponible: <b>—</b>"
+        self._bal_label.setText(
+            f"<span style='color:{env_color}'>{env_tag}</span>  │  "
+            f"{bal_text}  │  {avail_text}")
+        pnl_color = "#00ff66" if self._unrealized_pnl >= 0 else "#bb00ff"
+        self._pnl_label.setText(
+            f"PnL: <span style='color:{pnl_color}'>"
+            f"<b>${self._unrealized_pnl:+,.2f}</b></span>")
+        # Update calculator balance
+        if hasattr(self, '_calc_bal'):
+            if self._balance > 0:
+                self._calc_bal.setText(f"Balance Real: ${self._balance:,.2f}")
+            else:
+                self._calc_bal.setText("Balance Real: —")
+
+    # ── Calculator handlers ────────────────────────────────────────────────
+
+    def _recalc_calculator(self):
+        """Recompute position size from calculator inputs."""
+        try:
+            margin = float(self._calc_margin_input.text() or 0)
+            max_loss = float(self._calc_max_loss_input.text() or 0)
+        except ValueError:
+            return
+        lev = max(self._leverage, 1)
+        price = max(self._current_price, 1)
+        btc_size = (margin * lev) / price
+        loss_pct = (max_loss / max(margin, 1)) * 100 if margin > 0 else 0
+        bal = max(self._balance, 1)
+        loss_bal_pct = (max_loss / bal) * 100 if bal > 0 else 0
+
+        self._calc_size_label.setText(
+            f"Tamaño calculado: {btc_size:.4f} BTC  (mín. 0.001)")
+        self._calc_max_loss_label.setText(
+            f"Pérdida máxima: ${max_loss:.2f} ({loss_bal_pct:.1f}% del balance)")
+
+        can_trade = btc_size >= 0.001
+        self._calc_order_btn.setEnabled(can_trade)
+        if can_trade:
+            self._calc_order_btn.setText("▴▾ EJECUTAR ORDEN (elige lado abajo)")
+            self._calc_order_btn.setStyleSheet(
+                "QPushButton { background: #0a2e0a; color: #DEFF9A; "
+                "border: 2px solid #DEFF9A; border-radius: 6px; "
+                "padding: 8px; font-size: 14px; font-weight: bold; }"
+                "QPushButton:hover { background: #0f4f0f; }")
+            self._calc_btc_size = btc_size
+        else:
+            self._calc_order_btn.setText("⚠️ TAMAÑO INSUFICIENTE (< 0.001 BTC)")
+            self._calc_order_btn.setStyleSheet(
+                "QPushButton { background: #1a1a0a; color: #ffcc00; "
+                "border: 2px solid #ffcc00; border-radius: 6px; "
+                "padding: 8px; font-size: 14px; font-weight: bold; }")
+
+    def _on_calc_order(self):
+        """Quick LONG/SHORT from calculator tab via popup or inline buttons."""
+        btc_size = getattr(self, '_calc_btc_size', 0)
+        if btc_size < 0.001 or self._order_busy:
+            return
+        # Ask direction via a small inline dialog or toggle
+        from PyQt5.QtWidgets import QMessageBox
+        reply = QMessageBox.question(
+            self, "Dirección de la orden",
+            f"¿LONG (BUY) o SHORT (SELL)?\n\n"
+            f"Tamaño: {btc_size:.4f} BTC @ ${self._current_price:,.0f}",
+            QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel)
+        if reply == QMessageBox.Yes:
+            side = "BUY"
+        elif reply == QMessageBox.No:
+            side = "SELL"
+        else:
+            return
+
+        self._order_busy = True
+        self._calc_order_btn.setEnabled(False)
+        if self._f4worker:
+            self._f4worker.place_order(side, btc_size, self._current_price)
+        else:
+            self._order_busy = False
+            self._calc_order_btn.setEnabled(True)
+
+    # ── Market-order handlers (for legacy buttons in other tabs) ──────────
+
+    def _on_market_order(self, side: str):
+        """Execute immediate MARKET order from legacy panel settings via F4Worker."""
+        if self._order_busy:
+            return
+        self._order_busy = True
+
+        bal = self._balance
+        if bal <= 0 or self._current_price <= 0:
+            self._order_busy = False
+            return
+
+        pct = 100.0  # Use full balance for quick orders
+        capital_used = bal * pct / 100.0
+        raw_qty = (capital_used * self._leverage) / self._current_price
+
+        if self._f4worker and self._executor:
+            self._f4worker.place_order(side, raw_qty, self._current_price)
+        else:
+            self._order_busy = False
+
+    # ── SQLite persistence (two isolated tables) ──────────────────────────
+
+    def _init_db(self):
+        db_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), 'bb450_trades.db')
+        self._db = sqlite3.connect(db_path)
+        for tbl in ('trade_journal_demo', 'trade_journal_real'):
+            self._db.execute(f"""
+                CREATE TABLE IF NOT EXISTS {tbl} (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    entry_price REAL DEFAULT 0,
+                    exit_price REAL DEFAULT 0,
+                    capital REAL DEFAULT 0,
+                    leverage INTEGER DEFAULT 1,
+                    pnl REAL DEFAULT 0,
+                    delta REAL DEFAULT 0,
+                    cvd REAL DEFAULT 0,
+                    is_open INTEGER DEFAULT 1
+                )""")
+        self._db.commit()
+
+    def _journal_table_name(self):
+        return 'trade_journal_real'
+
+    def _load_journal(self):
+        tbl = self._journal_table_name()
+        try:
+            cur = self._db.execute(
+                f"SELECT timestamp, symbol, direction, entry_price, exit_price, "
+                f"capital, leverage, pnl, delta, cvd, is_open "
+                f"FROM {tbl} ORDER BY id DESC")
+            self._journal_data = list(cur.fetchall())
+        except Exception:
+            self._journal_data = []
+        self._refresh_table()
+
+    # ── Table refresh ─────────────────────────────────────────────────────
+
+    def _refresh_table(self):
+        self.journal_table.setRowCount(len(self._journal_data))
+        for row, rec in enumerate(self._journal_data):
+            ts, sym, direction, entry_p, exit_p, cap, lev, pnl, delta, cvd, is_open = rec
+            direction_display = f"{'🟢' if direction.upper()=='LONG' else '🔴'} {direction}"
+            if is_open:
+                direction_display += " ⏳"
+            entry_str = f"${entry_p:,.0f}" if entry_p else "—"
+            exit_str = f"${exit_p:,.0f}" if exit_p else "—"
+            conflu = f"Δ{delta:+.1f}  CVD{cvd:+.1f}" if delta or cvd else "—"
+            vals = [
+                ts, sym, direction_display,
+                entry_str, exit_str,
+                f"${pnl:+,.2f}", conflu,
+            ]
+            for col, val in enumerate(vals):
+                item = QTableWidgetItem(val)
+                if col == 5:
+                    item.setForeground(
+                        QColor("#DEFF9A") if pnl >= 0 else QColor("#F87171"))
+                self.journal_table.setItem(row, col, item)
+        self.journal_table.resizeColumnsToContents()
+
+    # ── Public API ────────────────────────────────────────────────────────
+
+    def add_trade(self, symbol: str, direction: str, entry_price: float,
+                  capital: float, leverage: int, pnl: float = 0,
+                  delta: float = 0, cvd: float = 0, is_open: bool = True):
+        from datetime import datetime
+        ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        tbl = self._journal_table_name()
+        self._db.execute(
+            f"INSERT INTO {tbl} "
+            f"(timestamp, symbol, direction, entry_price, capital, leverage, "
+            f"pnl, delta, cvd, is_open) "
+            f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (ts, symbol, direction, entry_price, capital, leverage,
+             pnl, delta, cvd, int(is_open)))
+        self._db.commit()
+        self._load_journal()
+        self._recalc_metrics()
+
+    def close_last_trade(self, final_pnl: float,
+                         last_entry: float = 0, last_exit: float = 0):
+        """Update the most recent open trade with its final PnL + exit price."""
+        tbl = self._journal_table_name()
+        cur = self._db.execute(
+            f"SELECT id FROM {tbl} WHERE is_open=1 ORDER BY id DESC LIMIT 1")
+        row = cur.fetchone()
+        if row:
+            self._db.execute(
+                f"UPDATE {tbl} SET pnl=?, exit_price=?, is_open=0 WHERE id=?",
+                (final_pnl, last_exit, row[0]))
+            self._db.commit()
+            self._load_journal()
+            self._recalc_metrics()
+
+    def update_live_data(self, balance: float, available: float,
+                         pnl: float, env_type: str = "REAL",
+                         current_price: float = 0,
+                         technical_levels: dict = None):
+        self._current_price = current_price
+        self._balance = balance
+        self._available = available
+        self._unrealized_pnl = pnl
+        self._update_env_display()
+        self._calc_position_size()
+        self._update_position_display()
+        if technical_levels:
+            self._update_tech_levels(technical_levels, current_price)
+
+    def _update_tech_levels(self, tech: dict, price: float):
+        """Update the NIVELES CLAVE panel with latest levels."""
+        fib_r = tech.get("fib_retracement", [])
+        if fib_r:
+            parts = [f"{fb['ratio']}→${fb['price']}" for fb in fib_r[:3]]
+            self.fib_levels_label.setText(f"Fibonacci: {' | '.join(parts)}")
+            self.fib_levels_label.setStyleSheet("color: #bb00ff; font-size: 10px; background: transparent;")
+        else:
+            self.fib_levels_label.setText("Fibonacci: —")
+            self.fib_levels_label.setStyleSheet("color: #666; font-size: 10px; background: transparent;")
+
+        supports = tech.get("supports", [])
+        resistances = tech.get("resistances", [])
+        parts = []
+        if resistances:
+            parts.append(f"🔺{' | '.join(f'${p}' for p in resistances[:3])}")
+        if supports:
+            parts.append(f"🔻{' | '.join(f'${p}' for p in supports[:3])}")
+        self.sr_levels_label.setText(f"S/R: {'  '.join(parts) if parts else '—'}")
+        self.sr_levels_label.setStyleSheet("color: #00ff66; font-size: 10px; background: transparent;")
+
+        cz = tech.get("confluence_zones", [])
+        if cz:
+            z = cz[0]
+            pct = abs(z["price"] - price) / max(price, 1) * 100 if price > 0 else 0
+            self.confluence_label.setText(
+                f"Confluencia: ${z['price']} ({'/'.join(z['types'][:2])}, {pct:.2f}%)")
+            self.confluence_label.setStyleSheet("color: #00ccff; font-size: 10px; background: transparent;")
+        else:
+            self.confluence_label.setText("Confluencia: —")
+            self.confluence_label.setStyleSheet("color: #666; font-size: 10px; background: transparent;")
+
+        ms = tech.get("market_structure", {})
+        trend = ms.get("trend", "NEUTRAL")
+        emoji = "📈" if trend == "UPTREND" else "📉" if trend == "DOWNTREND" else "📊"
+        self.structure_label.setText(f"Estructura: {emoji} {trend}")
+        self.structure_label.setStyleSheet("color: #ffcc00; font-size: 10px; background: transparent;")
+
+    # ── Metric calculations ──────────────────────────────────────────────
+
+    def _calc_position_size(self):
+        self._recalc_calculator()
+
+    def _recalc_metrics(self):
+        if not self._journal_data:
+            for ref in ('_kpi_net_pnl', '_kpi_win_rate', '_kpi_profit_factor',
+                         '_kpi_total_trades'):
+                lb = getattr(self, ref, None)
+                if lb is not None:
+                    lb.setText("0")
+            return
+        pnls = [r[7] for r in self._journal_data if not r[10]]
+        wins = [p for p in pnls if p > 0]
+        losses = [p for p in pnls if p < 0]
+        total = len(pnls)
+        wr = len(wins) / total * 100 if total else 0
+        pf = abs(sum(wins) / sum(losses)) if sum(losses) else float("inf")
+        net = sum(pnls)
+        if hasattr(self, '_kpi_net_pnl'):
+            sign = "+" if net >= 0 else ""
+            self._kpi_net_pnl.setText(f"${sign}{net:,.2f}")
+        if hasattr(self, '_kpi_win_rate'):
+            self._kpi_win_rate.setText(f"{wr:.1f}%")
+        if hasattr(self, '_kpi_profit_factor'):
+            self._kpi_profit_factor.setText(f"{pf:.2f}" if pf != float("inf") else "∞")
+        if hasattr(self, '_kpi_total_trades'):
+            self._kpi_total_trades.setText(str(total))
+
+
 class MainDashboard(QMainWindow):
 
     def __init__(self):
@@ -4007,6 +6055,8 @@ class MainDashboard(QMainWindow):
         self.data = {}
         self.running = True
         self._refresh_busy = False
+        self.grid_labels = {}
+        self.bottom_widgets = []
 
         # Set leverage once at startup, never in the hot loop
         try:
@@ -4022,14 +6072,29 @@ class MainDashboard(QMainWindow):
 
         self.init_ui()
         self.init_data()
+
+        # Crear un único cliente Binance compartido — REAL production only
+        from binance.client import Client
+        _shared_api_key = settings.BINANCE_REAL_API_KEY
+        _shared_secret = settings.BINANCE_REAL_SECRET_KEY
+        self._shared_client = Client(
+            _shared_api_key,
+            _shared_secret,
+            testnet=False,
+            ping=False,
+        )
+
+        # Wire up OrderExecutor FIRST (valida credenciales antes de arrancar nada)
+        self.order_executor = OrderExecutor(client=self._shared_client)
+        self.order_executor.order_result.connect(self._on_order_result)
+        self.risk_tab.set_executor(self.order_executor)
+        self.signal_tab.set_executor(self.order_executor, self.risk_tab._f4worker)
+
         self.start_update_thread()
 
-        self.telegram_bot = TelegramBot()
+        # TelegramBot recibe el executor en el constructor (singleton forzado)
+        self.telegram_bot = TelegramBot(order_executor=self.order_executor)
         self.telegram_bot.start()
-
-        # Wire up OrderExecutor (unified trade execution, REAL / TESTNET)
-        self.order_executor = OrderExecutor()
-        self.order_executor.order_result.connect(self._on_order_result)
 
         # Wire up BrainAgent (Quantum Brain)
         try:
@@ -4055,6 +6120,12 @@ class MainDashboard(QMainWindow):
         except Exception as e:
             print(f"[⚠️ GEMINI BRAIN] Error inicializando: {e}")
             self.gemini_brain = None
+
+        # Wire AI references into SignalMonitorTab
+        self.signal_tab.set_ai_references(
+            gemini_brain=getattr(self, 'gemini_brain', None),
+            brain_agent=getattr(self, 'brain_agent', None),
+        )
 
         # Auto-load last knowledge base from SQLite on startup
         self._load_persisted_knowledge_base()
@@ -4082,6 +6153,14 @@ class MainDashboard(QMainWindow):
         self._last_brain_decision: dict | None = None
         self._prev_cvd: float = 0.0
 
+        # ── HFT Speed tracking (large trades/sec) ──────────────────────
+        self._hft_trades: deque = deque(maxlen=300)
+        self._hft_speed: float = 0.0
+        self._hft_threshold_btc: float = 0.5
+
+        # ── Liquidation events ring buffer ─────────────────────────────
+        self._liquidation_events: deque = deque(maxlen=100)
+
         # ── Gemini inference throttle ───────────────────────────────────
         self._last_gemini_time: float = 0.0
         self._gemini_cooldown: float = 3.0         # seconds — Gemini is slower
@@ -4093,6 +6172,13 @@ class MainDashboard(QMainWindow):
         self._last_alert_snapshot: dict | None = None
         self._last_alert_time: float = 0.0
         self._journal_pending: bool = False
+
+        # ── Single-position tracking ───────────────────────────────────
+        self._last_pos_track_time: float = 0.0
+        self._was_position_open: bool = False
+        self._last_pos_pnl: float = 0.0
+        self._last_pos_entry_price: float = 0.0
+        self._last_pos_exit_price: float = 0.0
     
     def init_ui(self):
         self.panels = {}
@@ -4192,159 +6278,9 @@ class MainDashboard(QMainWindow):
         tab1.setLayout(tab1_layout)
         self.tabs.addTab(tab1, "📈 ORDER FLOW (F1)")
         
-        # ─── TAB 2: QUANTITATIVE MATRIX ───
-        tab2 = QWidget()
-        tab2_layout = QVBoxLayout()
-        tab2_layout.setContentsMargins(5, 5, 5, 5)
-        tab2_layout.setSpacing(4)
-        
-        # Matrix Header
-        panel_header = QLabel("⚡ QUANT DATA MATRIX — MTF & ALGORITHMIC METRICS")
-        panel_header.setStyleSheet(f"color: {COLORS['accent_gold']}; font-size: 16px; font-weight: 900; background: transparent;")
-        panel_header.setAlignment(Qt.AlignCenter)
-        panel_header.setFixedHeight(24)
-        tab2_layout.addWidget(panel_header)
-        
-        # 5 Columns Grid
-        columns_widget = QWidget()
-        columns_layout = QHBoxLayout()
-        columns_layout.setContentsMargins(0, 0, 0, 0)
-        columns_layout.setSpacing(6)
-        
-        self.grid_labels = {}
-        
-        # Define the 5 columns with EXTENDED metrics for Tab 2
-        column_defs = [
-            {
-                'title': 'ORDER FLOW & OI',
-                'color': COLORS['accent_cyan'],
-                'metrics': [
-                    'PRICE', 'CHANGE', 'BUY VOL', 'SELL VOL', 
-                    'BUY/SELL RATIO', 'OB IMBALANCE', 'INS BLOCKS',
-                    'OPEN INTEREST', 'FUNDING RATE', 'OI TREND'
-                ],
-                'bottom_widget': OIMomentumWidget
-            },
-            {
-                'title': 'DELTA & LIQUIDITY',
-                'color': COLORS['accent_turquoise'],
-                'metrics': [
-                    'CVD DELTA', 'DELTA VELOCITY', 'DELTA DIV',
-                    'WALL BID #1', 'WALL BID #2', 
-                    'WALL ASK #1', 'WALL ASK #2',
-                    'LIQ ZONES', 'SUPPORT', 'RESISTANCE'
-                ],
-                'bottom_widget': LiquidityPoolWidget
-            },
-            {
-                'title': 'MTF TREND (MULTI-TIMEFRAME)',
-                'color': COLORS['accent_emerald'],
-                'metrics': [
-                    'TREND 1M', 'TREND 5M', 'TREND 15M', 'TREND 1H', 'TREND 4H',
-                    'RSI 5M', 'RSI 15M', 'MACD 15M', 'MACD 1H', 'GLOBAL MACRO'
-                ],
-                'bottom_widget': ConfluenceMatrixWidget
-            },
-            {
-                'title': 'MOMENTUM & VOLATILITY',
-                'color': COLORS['accent_gold'],
-                'metrics': [
-                    'RSI (1M)', 'MACD (1M)', 'MACD HIST', 'FORCE',
-                    'ATR (VOLATILITY)', 'BB UPPER', 'BB LOWER',
-                    'BB SQUEEZE', 'TICK SPEED'
-                ],
-                'bottom_widget': HFTRiskWidget
-            },
-            {
-                'title': 'AI ENGINE & LOG',
-                'color': COLORS['accent_magenta'],
-                'metrics': [
-                    'AI SIGNAL', 'WIN RATE', 'LATENCY', 'EXHAUSTION',
-                    'SCORE: ORDER FLOW', 'SCORE: MOMENTUM', 'SCORE: TREND',
-                    'FINAL PREDICTION', 'LAST TRADE #1', 'LAST TRADE #2'
-                ],
-                'bottom_widget': AIBracketWidget
-            },
-        ]
-        
-        COLUMN_STYLE = (
-            f"background: rgba(10,10,15,0.85); "
-            f"border: 1px solid rgba(255,255,255,0.06); "
-            f"border-radius: 8px;"
-        )
-        
-        self.bottom_widgets = []
-        
-        for col_def in column_defs:
-            col_frame = QFrame()
-            col_frame.setStyleSheet(COLUMN_STYLE)
-            col_layout = QVBoxLayout()
-            col_layout.setContentsMargins(10, 10, 10, 10)
-            col_layout.setSpacing(8)
-            
-            # Column header
-            hdr = QLabel(col_def['title'])
-            hdr.setStyleSheet(
-                f"color: {col_def['color']}; font-size: 14px; font-weight: 900; "
-                f"border-bottom: 2px solid {col_def['color']}; padding-bottom: 6px; "
-                f"background: transparent;"
-            )
-            hdr.setAlignment(Qt.AlignCenter)
-            col_layout.addWidget(hdr)
-            
-            # Top Panel (1/3 approx)
-            top_panel = QWidget()
-            top_panel.setStyleSheet("background: transparent;")
-            top_layout = QVBoxLayout()
-            top_layout.setContentsMargins(0, 0, 0, 0)
-            top_layout.setSpacing(4)
-            
-            # Metric rows
-            for metric in col_def['metrics']:
-                row_w = QWidget()
-                row_w.setStyleSheet("background: transparent;")
-                row_l = QHBoxLayout()
-                row_l.setContentsMargins(4, 0, 4, 0)
-                row_l.setSpacing(4)
-                
-                nl = QLabel(metric)
-                nl.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 12px; font-weight: bold; background: transparent;")
-                
-                vl = QLabel("—")
-                vl.setStyleSheet(f"color: {COLORS['text_primary']}; font-size: 13px; font-weight: bold; background: transparent;")
-                vl.setAlignment(Qt.AlignRight)
-                
-                row_l.addWidget(nl)
-                row_l.addWidget(vl)
-                row_w.setLayout(row_l)
-                top_layout.addWidget(row_w)
-                
-                self.grid_labels[metric] = vl
-            
-            top_layout.addStretch()
-            top_panel.setLayout(top_layout)
-            col_layout.addWidget(top_panel, stretch=1)
-            
-            # Bottom Panel (2/3 approx)
-            bottom_widget = col_def['bottom_widget']()
-            col_layout.addWidget(bottom_widget, stretch=2)
-            self.bottom_widgets.append(bottom_widget)
-            
-            col_frame.setLayout(col_layout)
-            columns_layout.addWidget(col_frame)
-        
-        columns_widget.setLayout(columns_layout)
-        tab2_layout.addWidget(columns_widget, stretch=1)
-        
-        # Footer
-        footer = QLabel("POWERED BY BB-450 AI ⚡ DUAL-TAB PRO ARCHITECTURE")
-        footer.setStyleSheet(f"color: {COLORS['accent_purple']}; font-size: 12px; font-weight: bold; background: transparent;")
-        footer.setAlignment(Qt.AlignCenter)
-        footer.setFixedHeight(20)
-        tab2_layout.addWidget(footer)
-        
-        tab2.setLayout(tab2_layout)
-        self.tabs.addTab(tab2, "📊 QUANT DATA (F2)")
+        # ─── TAB 2: SIGNAL MONITOR ───
+        self.signal_tab = SignalMonitorTab()
+        self.tabs.addTab(self.signal_tab, "📡 SIGNAL (F2)")
         
         # Keyboard shortcuts to switch tabs
         QShortcut(QKeySequence("F1"), self).activated.connect(lambda: self.tabs.setCurrentIndex(0))
@@ -4700,6 +6636,17 @@ class MainDashboard(QMainWindow):
         QShortcut(QKeySequence("F3"), self).activated.connect(
             lambda: self.tabs.setCurrentIndex(2))
 
+        # ── TAB 4: RISK MANAGEMENT ───────────────────────────────────────
+        tab4 = QWidget()
+        tab4_layout = QVBoxLayout(tab4)
+        tab4_layout.setContentsMargins(0, 0, 0, 0)
+        self.risk_tab = RiskManagementTab()
+        tab4_layout.addWidget(self.risk_tab)
+        tab4.setLayout(tab4_layout)
+        self.tabs.addTab(tab4, "\U0001f6a8 RIESGO (F4)")
+        QShortcut(QKeySequence("F4"), self).activated.connect(
+            lambda: self.tabs.setCurrentIndex(3))
+
         # Wire up brain UI signals
         self.btn_load_knowledge.clicked.connect(self._on_load_knowledge)
         self.temp_slider.valueChanged.connect(self._on_temp_changed)
@@ -4724,11 +6671,12 @@ class MainDashboard(QMainWindow):
             self.restoreGeometry(geo)
 
     def closeEvent(self, event):
-        """Save window geometry on close."""
+        """Save window geometry and perform clean shutdown."""
+        self.running = False
         settings = QSettings("BB-450", "Dashboard")
         settings.setValue("window_geometry", self.saveGeometry())
-        self.running = False
-        super().closeEvent(event)
+        self.close_application_cleanly()
+        event.accept()
 
     # ── Brain control callbacks ─────────────────────────────────────────
 
@@ -5003,6 +6951,11 @@ class MainDashboard(QMainWindow):
             'order_book': {'bids': [], 'asks': []},
             'liquidity_data': {'buy_walls': [], 'sell_walls': [], 'imbalance': 0, 'signal': 'NEUTRAL'}
         }
+
+        # Position tracking timer (must be created here, independent of klines)
+        self._pos_timer = QTimer()
+        self._pos_timer.timeout.connect(self._check_position_tracking)
+        self._pos_timer.start(5000)
         
         self.market_state = {
             "order_flow": {
@@ -5056,7 +7009,20 @@ class MainDashboard(QMainWindow):
     def start_update_thread(self):
         import time
         self.stats['start_time'] = time.time()
-        
+
+        # ── Delta-CatchUp: retroactive kline sync ─────────────────────────
+        try:
+            from src.engine.delta_catchup import run_catch_up
+            client = getattr(self, '_shared_client', None)
+            if client is not None:
+                n = run_catch_up(client, trading_strategy)
+                if n > 0:
+                    print(f"[Δ CATCH-UP] {n} klines cargados retroactivamente")
+            else:
+                print("[Δ CATCH-UP] Cliente Binance no disponible — saltando")
+        except Exception as e:
+            print(f"[Δ CATCH-UP] Error: {e}")
+
         # Start the async data engine in background thread
         self._async_engine = AsyncDataEngine(self.market_state)
         self._async_engine.start()
@@ -5458,11 +7424,18 @@ class MainDashboard(QMainWindow):
                          'day_high', 'day_low', 'avg_volume', 'trend'):
                 self.data[key] = ind.get(key, self.data.get(key, 0))
 
+            # ── Copy technical levels (Fibonacci, S/R, confluence) ──
+            tl = ms.get('technical_levels')
+            if tl:
+                self.data['technical_levels'] = tl
+
             # ── Copy order flow (pre-computed by AsyncDataEngine) ──
             self.data['delta'] = of.get('delta', self.data.get('delta', 0))
             self.data['cvd'] = of.get('cvd', self.data.get('cvd', 0))
             self.data['buy_volume'] = of.get('buy_volume', self.data.get('buy_volume', 0))
             self.data['sell_volume'] = of.get('sell_volume', self.data.get('sell_volume', 0))
+            self.data['window_buy_volume'] = of.get('window_buy_volume', of.get('buy_volume', self.data.get('window_buy_volume', 0)))
+            self.data['window_sell_volume'] = of.get('window_sell_volume', of.get('sell_volume', self.data.get('window_sell_volume', 0)))
 
             # ── Copy signal (pre-computed by AsyncDataEngine from indicators) ──
             self.data['signal'] = ms.get('signal', self.data.get('signal', 'NINGUNA'))
@@ -5478,6 +7451,15 @@ class MainDashboard(QMainWindow):
             self.stats['api_connected'] = self.data['price'] > 0
             if self.stats['start_time']:
                 self.stats['uptime_seconds'] = int(time.time() - self.stats['start_time'])
+
+            # ── Heartbeat log cada 5 minutos ──
+            if self.stats['update_count'] > 0 and self.stats['update_count'] % 300 == 0:
+                uptime_str = f"{self.stats['uptime_seconds'] // 3600}h{(self.stats['uptime_seconds'] % 3600) // 60}m"
+                print(f"💓 [HEARTBEAT] BB-450 GUI activo | "
+                      f"updates={self.stats['update_count']} | "
+                      f"uptime={uptime_str} | "
+                      f"price=${self.data['price']:,.0f} | "
+                      f"latency={self.stats['latency_ms']}ms")
 
             # ── Feed trades to HeatMap chart (from shared cache) ──
             trades = ms.get('trades', [])
@@ -5520,8 +7502,8 @@ class MainDashboard(QMainWindow):
                 of = self.market_state.get('order_flow', {})
                 mtf = self.market_state.get('mtf_trend', {})
                 ai = self.market_state.get('ai_engine', {})
-                bv = self.data.get('buy_volume', 0)
-                sv = self.data.get('sell_volume', 0)
+                bv = self.data.get('window_buy_volume', self.data.get('buy_volume', 0))
+                sv = self.data.get('window_sell_volume', self.data.get('sell_volume', 0))
                 total_vol = bv + sv
                 ld = self.data.get('liquidity_data', {})
                 cl = self.data.get('klines', [])
@@ -5548,6 +7530,7 @@ class MainDashboard(QMainWindow):
                     # Tendencia y señal
                     'trend': self.data.get('trend', 'NEUTRAL'),
                     'signal_text': self.battle_bar.trend_direction if hasattr(self, 'battle_bar') else 'WAIT',
+                    'trend_label': self.battle_bar.trend_label if hasattr(self, 'battle_bar') else '',
                     'confidence': self.battle_bar.confidence if hasattr(self, 'battle_bar') else 0,
                     'signal': self.data.get('signal', 'NINGUNA'),
 
@@ -5742,8 +7725,16 @@ class MainDashboard(QMainWindow):
                         now = time.time()
                         if now - self._last_retrain_time >= 14400:  # 4h
                             self._last_retrain_time = now
-                            import asyncio
-                            asyncio.run(self.brain_agent.background_retrain())
+                            async def _retrain():
+                                try:
+                                    await self.brain_agent.background_retrain()
+                                except Exception:
+                                    pass
+                            threading.Thread(
+                                target=lambda: asyncio.run(_retrain()),
+                                daemon=True,
+                                name="BrainRetrain",
+                            ).start()
                     except Exception:
                         pass
 
@@ -5756,18 +7747,114 @@ class MainDashboard(QMainWindow):
                             journal_snap = dict(snapshot)
                             before = self._last_alert_snapshot
                             if getattr(self, 'gemini_brain', None) is not None:
-                                import asyncio
-                                asyncio.run(
-                                    self.gemini_brain.journal_event(
-                                        before, journal_snap,
-                                        brain_direction=before.get('brain_direction'),
-                                        brain_confidence=before.get('brain_confidence_pct', 0),
-                                    )
-                                )
+                                async def _journal():
+                                    try:
+                                        await self.gemini_brain.journal_event(
+                                            before, journal_snap,
+                                            brain_direction=before.get('brain_direction'),
+                                            brain_confidence=before.get('brain_confidence_pct', 0),
+                                        )
+                                    except Exception:
+                                        pass
+                                threading.Thread(
+                                    target=lambda: asyncio.run(_journal()),
+                                    daemon=True,
+                                    name="BrainJournal",
+                                ).start()
                     except Exception:
                         pass
         finally:
             self._refresh_busy = False
+
+    def _check_position_tracking(self):
+        """Check open position status and update risk tab live data."""
+        executor = getattr(self, 'order_executor', None)
+        if executor is None:
+            return
+        now = time.time()
+
+        try:
+            pos = executor.check_position_status()
+        except Exception:
+            return
+
+        if pos is None:
+            was_open = self._was_position_open
+            if was_open:
+                self._last_pos_track_time = 0
+                self._was_position_open = False
+                # Record close PnL in journal
+                final_pnl = getattr(self, '_last_pos_pnl', 0)
+                entry_p = getattr(self, '_last_pos_entry_price', 0)
+                exit_p = getattr(self, '_last_pos_exit_price', 0)
+                rt = getattr(self, 'risk_tab', None)
+                if rt is not None:
+                    rt.close_last_trade(final_pnl, entry_p, exit_p)
+                try:
+                    if hasattr(self, 'telegram_bot') and self.telegram_bot is not None:
+                        self.telegram_bot._queue.put_nowait({
+                            "type": "position_tracking",
+                            "text": "<b>⚠️ [BB-450 LIVE OPERATIONS]</b>\n"
+                                    "<b>✅ POSICIÓN CERRADA</b>\n\n"
+                                    "La operación ha finalizado. "
+                                    "El bot está listo para la próxima señal.",
+                        })
+                except Exception:
+                    pass
+
+        else:
+            self._was_position_open = True
+            last_track = getattr(self, '_last_pos_track_time', 0)
+            if now - last_track >= 120.0:
+                self._last_pos_track_time = now
+                try:
+                    direction = "LONG" if float(pos.get("positionAmt", 0)) > 0 else "SHORT"
+                    entry = float(pos.get("entryPrice", 0))
+                    mark = float(pos.get("markPrice", 0))
+                    upnl = float(pos.get("unRealizedProfit", 0))
+                    liq = float(pos.get("liquidationPrice", 0))
+                    leverage = int(float(pos.get("leverage", 0)))
+                    pnl_pct = (mark - entry) / entry * 100 * leverage if entry > 0 else 0
+
+                    # Store PnL + prices for journal close (when position closes next cycle)
+                    self._last_pos_pnl = upnl
+                    self._last_pos_entry_price = entry
+                    self._last_pos_exit_price = mark
+
+                    text = (
+                        f"<b>⚠️ [BB-450 LIVE OPERATIONS]</b>\n"
+                        f"<b>📊 SEGUIMIENTO DE POSICIÓN</b>\n"
+                        f"<b>Dirección:</b> {direction}\n"
+                        f"<b>Entrada:</b> <code>${entry:,.2f}</code>\n"
+                        f"<b>Mark:</b> <code>${mark:,.2f}</code>\n"
+                        f"<b>PnL:</b> <code>${upnl:+.2f}</code> ({pnl_pct:+.2f}%)\n"
+                        f"<b>Apalancamiento:</b> {leverage}x\n"
+                        f"<b>Liquidación:</b> <code>${liq:,.2f}</code>"
+                    )
+
+                    if hasattr(self, 'telegram_bot') and self.telegram_bot is not None:
+                        self.telegram_bot._queue.put_nowait({
+                            "type": "position_tracking",
+                            "text": text,
+                        })
+                except Exception:
+                    pass
+
+        # ── Always update risk tab live data (every 5s, regardless of position) ──
+        try:
+            bal = executor.get_balance()
+            if bal.get("success"):
+                b = bal["balance"]
+                a = bal.get("available", 0)
+                u = bal.get("unrealized_pnl", 0)
+                env = "REAL"
+                price = float(self.data.get("price", 0))
+                rt = getattr(self, 'risk_tab', None)
+                if rt is not None:
+                    tech = self.data.get("technical_levels", {})
+                    rt.update_live_data(b, a, u, env, price, tech)
+        except Exception:
+            pass
 
     def _on_inference_finished(self, brain: dict):
         """Handle BrainInferenceWorker result — runs in main thread."""
@@ -5807,26 +7894,16 @@ class MainDashboard(QMainWindow):
                 self._last_alert_time = time.time()
                 self._journal_pending = True
 
-                # ── Auto-execute trade signal (solo quantum_brain) ──
-                bracket = brain.get('risk_bracket', {})
-                entry_price = snapshot.get('price', 0)
-                sl_price = bracket.get('sl', 0)
-                tp_price = bracket.get('tp1', 0)
-                if (sl_price > 0 and tp_price > 0 and entry_price > 0
-                        and hasattr(self, 'order_executor')
-                        and self.order_executor is not None):
-                    self.order_executor.execute_trade_signal(
-                        direction=direction,
-                        entry_price=entry_price,
-                        sl_price=sl_price,
-                        tp_price=tp_price,
-                    )
+                # ── Trade signal routed through Telegram inline confirmation ─
+                #   El ejecutor no corre aquí. La señal se envía al canal de
+                #   Telegram con botón inline "Autorizar Orden a Mercado" y
+                #   solo se ejecuta cuando el usuario pulsa ese botón.
+                #   Esto evita que se abran posiciones sin supervisión.
 
         except Exception as e:
             print(f"[⚠️ BRAIN] Error en _on_inference_finished: {e}")
 
     def _on_order_result(self, success: bool, message: str, data: dict):
-        env = data.get("environment", "?")
         direction = data.get("direction", "?")
         entry = data.get("entry_price", 0)
         qty = data.get("entry_qty", 0)
@@ -5836,29 +7913,81 @@ class MainDashboard(QMainWindow):
         sl_id = data.get("sl_order_id", "")
         tp_id = data.get("tp_order_id", "")
 
+        # ── Anti-falso-positivo: solo cuando el executor ya reportó fallo ─
+        #   Si el order executor dice success=True, confiamos en que
+        #   Binance confirmó la orden; cualquier error posterior (ej. -4067
+        #   en la creación de brackets SL/TP) se reporta aparte, sin
+        #   falsear el resultado de la entrada.
+        entry_id_valid = bool(entry_id) and entry_id != "None"
+        entry_price_valid = entry > 0
+        bracket_errs = data.get("bracket_errors", "")
+        error_detail = ""
+        if not success and (not entry_id_valid or not entry_price_valid):
+            error_detail = "Credenciales inválidas al ejecutar orden"
+            api_error = data.get("error", "")
+            if api_error:
+                error_detail += f"\n{api_error}"
+        elif bracket_errs:
+            error_detail = f"⚠ Bracket: {bracket_errs}"
+
         status_icon = "✅" if success else "❌"
         log_msg = (
-            f"[ORDEN {env}] {status_icon} {direction} "
+            f"[REAL] {status_icon} {direction} "
             f"{qty} BTC @ ${entry:,.0f} "
             f"SL=${sl:,.0f} TP=${tp:,.0f} "
             f"entry={entry_id} sl={sl_id} tp={tp_id}"
         )
         print(log_msg)
 
-        # Enviar notificación a Telegram
-        bracket_errs = data.get("bracket_errors", "")
-        bracket_info = f" | ⚠ {bracket_errs}" if bracket_errs else ""
+        # ── Journal trade on successful execution ───────────────────────
+        if success:
+            lev = data.get("leverage", 100)
+            cap = data.get("capital", 100)
+            ms = getattr(self, 'market_state', {})
+            of = ms.get("order_flow", {})
+            delta_entry = of.get("delta", 0)
+            cvd_entry = of.get("cvd", 0)
+            rt = getattr(self, 'risk_tab', None)
+            if rt is not None:
+                sym = settings.SYMBOL or "BTCUSDT"
+                dir_j = "LONG" if direction.upper() == "BUY" or direction.upper() == "ALZA" else "SHORT"
+                rt.add_trade(sym, dir_j, entry, cap, lev, 0, delta_entry, cvd_entry, is_open=True)
+
+        # ── Telegram alert: institutional format ─────────────────────────
+        bracket_info = f" ⚠ {bracket_errs}" if bracket_errs else ""
+        trailing_info = " 🔄 TRAILING ACTIVO" if data.get("trailing_active") else ""
+        dyn_lev = data.get("dynamic_leverage", 0)
+        dyn_conf = data.get("confidence", -1.0)
+        leverage_info = ""
+        if dyn_lev > 0 and dyn_conf >= 0:
+            leverage_info = (
+                f"\n⚡ Apalancamiento Ajustado Dinámicamente: "
+                f"{dyn_lev}x (Basado en {dyn_conf:.0f}% de certeza)")
         telegram_text = (
-            f"<b>{status_icon} ORDEN EJECUTADA [{env}]</b>\n"
+            f"<b>⚠️ [BB-450 LIVE OPERATIONS]</b>\n"
+            f"<b>{status_icon} ORDEN EJECUTADA</b>\n"
             f"<b>Dirección:</b> {direction}\n"
-            f"<b>Cantidad:</b> <code>{qty} BTC</code>\n"
-            f"<b>Entrada:</b> <code>${entry:,.0f}</code>\n"
-            f"<b>SL:</b> <code>${sl:,.0f}</code>\n"
-            f"<b>TP:</b> <code>${tp:,.0f}</code>\n"
-            f"<b>IDs:</b> entry=<code>{entry_id}</code> "
-            f"sl=<code>{sl_id}</code> tp=<code>{tp_id}</code>"
-            f"{bracket_info}"
+            f"<b>Cantidad:</b> <code>{qty:.4f} BTC</code>\n"
+            f"<b>Entrada:</b> <code>${entry:,.2f}</code>\n"
+            f"<b>Stop Loss:</b> <code>${sl:,.2f}</code>\n"
+            f"<b>Take Profit:</b> <code>${tp:,.2f}</code>\n"
+            f"<b>ID Entrada:</b> <code>{entry_id or '—'}</code>\n"
+            f"<b>ID SL:</b> <code>{sl_id or '—'}</code>\n"
+            f"<b>ID TP:</b> <code>{tp_id or '—'}</code>"
+            f"{leverage_info}{bracket_info}{trailing_info}"
         )
+        if not success and error_detail:
+            telegram_text = (
+                f"<b>🚨 OPERACIÓN FALLIDA</b>\n"
+                f"{error_detail}")
+
+        # ── Update SignalMonitorTab leverage label in real-time ─────────
+        result_lev = data.get("leverage", 0)
+        if result_lev > 0:
+            st = getattr(self, 'signal_tab', None)
+            if st is not None:
+                st._leverage = result_lev
+                st._update_account_display()
 
         alert = {
             "type": "order_execution",
@@ -6124,6 +8253,39 @@ class MainDashboard(QMainWindow):
         self.status_indicator.setText(status_text)
         self.status_indicator.setStyleSheet(f"color: {status_color}; font-size: 11px; font-weight: bold; background: transparent;")
         
+        # ── Push market context to OrderExecutor (trailing/MA filter) ──
+        executor = getattr(self, 'order_executor', None)
+        if executor is not None:
+            executor.update_market_context(
+                price=self.data.get("price", 0))
+
+        # ── Push signal data to SignalMonitorTab (F2) ──────────────────
+        signal_tab = getattr(self, 'signal_tab', None)
+        if signal_tab is not None:
+            signal_tab.update_signal_data({
+                "direction": self.battle_bar.trend_direction,
+                "confidence": self.battle_bar.confidence,
+                "trend_label": self.battle_bar.trend_label,
+                "price": self.data.get("price", 0),
+                "change_pct": self.data.get("price_change_pct", 0),
+                "rsi": self.data.get("rsi", 50),
+                "macd": self.data.get("macd", 0),
+                "macd_signal": self.data.get("macd_signal", 0),
+                "macd_hist": self.data.get("macd_hist", 0),
+                "bb_upper": self.data.get("bb_upper", 0),
+                "bb_middle": self.data.get("bb_middle", 0),
+                "bb_lower": self.data.get("bb_lower", 0),
+                "atr": self.data.get("atr", 0),
+                "delta": self.data.get("delta", 0),
+                "cvd": self.data.get("cvd", 0),
+                "buy_volume": self.data.get("buy_volume", 0),
+                "sell_volume": self.data.get("sell_volume", 0),
+                "imbalance": self.data.get("liquidity_data", {}).get("imbalance", 0),
+                "technical_levels": self.data.get("technical_levels", {}),
+                "mtf_trend": self.market_state.get("mtf_trend", {}),
+                "signal": self.data.get("signal", "NINGUNA"),
+            })
+
         # Helper to set grid label value + color
         def gv(name, val, color=white):
             if name in self.grid_labels:
@@ -6142,6 +8304,43 @@ class MainDashboard(QMainWindow):
         if 'NARRATIVE' in self.panels:
             mom = self.market_state.get('momentum', {})
             lq = self.market_state.get('liquidity', {})
+
+            # ── HFT Speed (large trades/sec from aggTrade stream) ─────
+            hft_threshold = getattr(self, '_hft_threshold_btc', 0.5)
+            ts_now = time.time()
+            trades = self.market_state.get('trades', [])
+            for t in trades:
+                qty = float(t.get('q', 0))
+                if qty >= hft_threshold:
+                    self._hft_trades.append((ts_now, qty))
+            self._hft_trades = deque(
+                [x for x in self._hft_trades if ts_now - x[0] < 60],
+                maxlen=300
+            )
+            hft_speed = sum(q for _, q in self._hft_trades) / max(ts_now - (self._hft_trades[0][0] if self._hft_trades else ts_now), 1)
+
+            # ── Spoofing Risk (cancel_rate + PINAM + wall persistence) ─
+            cancel_rate_val = mom.get('cancel_rate', 0.0)
+            pinam_val = mom.get('pinam', 0.0)
+            ob = self.data.get('order_book', {})
+            bids_ob = sorted(ob.get('bids', []), key=lambda x: float(x[0]), reverse=True) if ob else []
+            asks_ob = sorted(ob.get('asks', []), key=lambda x: float(x[0])) if ob else []
+            top_bid_vol = float(bids_ob[0][1]) if bids_ob else 0
+            top_ask_vol = float(asks_ob[0][1]) if asks_ob else 0
+            total_bid_vol = sum(float(b[1]) for b in bids_ob[:10]) if bids_ob else 0.001
+            total_ask_vol = sum(float(a[1]) for a in asks_ob[:10]) if asks_ob else 0.001
+            top_bid_ratio = top_bid_vol / total_bid_vol
+            top_ask_ratio = top_ask_vol / total_ask_vol
+            wall_top_heavy = max(top_bid_ratio, top_ask_ratio)
+            spoofing_risk = min(100, (
+                (cancel_rate_val / 100) * 40 +
+                (pinam_val / 100) * 30 +
+                max(0, wall_top_heavy - 0.4) * 150
+            ))
+
+            # ── Liquidation events list for display ───────────────────
+            liq_snapshot = list(getattr(self, '_liquidation_events', deque(maxlen=100)))[-12:]
+
             narrative_state = {
                 **self.data,
                 'kaufman_eff': mom.get('kaufman_efficiency', 0.5),
@@ -6150,6 +8349,9 @@ class MainDashboard(QMainWindow):
                 'cancel_rate': mom.get('cancel_rate', 0.0),
                 'depth_imb_pct': lq.get('depth_imbalance', 0.0),
                 'delta_accel': self.battle_bar.delta_accel if hasattr(self, 'battle_bar') and hasattr(self.battle_bar, 'delta_accel') else 0,
+                'hft_speed': hft_speed,
+                'spoofing_risk': spoofing_risk,
+                'liquidation_events': liq_snapshot,
             }
             self.panels['NARRATIVE'].update_narrative(narrative_state, self.data.get('order_book', {}))
         
@@ -6289,6 +8491,41 @@ class MainDashboard(QMainWindow):
         resistance = short_b[0]['price'] if short_b else self.data['bb_upper']
         gv("SUPPORT", f"${support:,.0f}", up)
         gv("RESISTANCE", f"${resistance:,.0f}", dn)
+
+        # Technical levels from market_state (Fibonacci + S/R)
+        tech = self.data.get("technical_levels", {})
+        if tech and tech.get("fib_retracement"):
+            fb = tech["fib_retracement"]
+            fib_618 = next((f for f in fb if f["ratio"] == 0.618), None)
+            fib_382 = next((f for f in fb if f["ratio"] == 0.382), None)
+            if fib_618:
+                gv("FIB 0.618", f"${fib_618['price']:,.0f}", magenta)
+            if fib_382:
+                gv("FIB 0.382", f"${fib_382['price']:,.0f}", cyan)
+            closest = None
+            for f in fb:
+                d = abs(f["price"] - price)
+                if closest is None or d < closest[0]:
+                    closest = (d, f)
+            if closest:
+                fl = closest[1]
+                pct = (fl["price"] - price) / max(price, 1) * 100
+                clr = up if pct > 0 else dn
+                gv("FIB NEAREST", f"${fl['price']:,.0f} ({pct:+.2f}%)", clr)
+        ns = tech.get("nearest_support") if tech else None
+        nr = tech.get("nearest_resistance") if tech else None
+        if ns:
+            ns_pct = (ns["price"] - price) / max(price, 1) * 100
+            gv("SR NEAR S", f"${ns['price']:,.0f} ({ns_pct:+.2f}%)", up)
+        if nr:
+            nr_pct = (nr["price"] - price) / max(price, 1) * 100
+            gv("SR NEAR R", f"${nr['price']:,.0f} ({nr_pct:+.2f}%)", dn)
+
+        # Confluence zone
+        cz = tech.get("confluence_zones") if tech else []
+        if cz:
+            top_z = cz[0]
+            gv("CONFLUENCE", f"${top_z['price']:,.0f} (score:{top_z['score']})", gold)
         
         # ═══════════════════════════════════════════════════════════════
         # COL 3: MTF TREND (MULTI-TIMEFRAME)
@@ -6646,9 +8883,22 @@ class MainDashboard(QMainWindow):
     def close_application_cleanly(self):
         self.running = False
 
-        # Stop the refresh timer
-        if hasattr(self, 'update_timer') and self.update_timer is not None:
-            self.update_timer.stop()
+        # Stop all timers
+        for name in ('update_timer', '_pos_timer', '_data_timer',
+                      'pulse_timer', 'flash_timer'):
+            obj = getattr(self, name, None)
+            if obj is not None:
+                try:
+                    obj.stop()
+                except Exception:
+                    pass
+
+        # Stop all anim_timer instances (multiple sub-widgets have one)
+        for widget in self.findChildren((QTimer,)):
+            try:
+                widget.stop()
+            except Exception:
+                pass
 
         # Stop async data engine
         if hasattr(self, '_async_engine') and self._async_engine is not None:
@@ -6662,24 +8912,53 @@ class MainDashboard(QMainWindow):
         if hasattr(self, 'order_executor') and self.order_executor is not None:
             self.order_executor.stop()
 
+        # Stop signal data worker
+        if hasattr(self, '_data_worker') and self._data_worker is not None:
+            try:
+                self._data_worker.quit()
+                self._data_worker.wait(2000)
+            except Exception:
+                pass
+
+        # Stop F4 worker
+        if hasattr(self, 'risk_tab'):
+            rt = self.risk_tab
+            if hasattr(rt, '_f4worker') and rt._f4worker is not None:
+                try:
+                    rt._f4worker.quit()
+                    rt._f4worker.wait(2000)
+                except Exception:
+                    pass
+
         # Clean up knowledge parser worker if still running
         if hasattr(self, '_brain_worker') and self._brain_worker is not None:
             self._brain_worker.requestInterruption()
             self._brain_worker.deleteLater()
             self._brain_worker = None
 
-        # Let closeEvent propagate properly
-        self.close()
-
         # Force exit
         QApplication.quit()
+        import os
+        os._exit(0)
 
     def closeEvent(self, event):
+        print("\n👋 BB-450 cerrando sesión... ¡Hasta la próxima!")
         self.running = False
         event.accept()
 
 
 if __name__ == "__main__":
+    import signal
+    def _sigint_handler(signum, frame):
+        app = QApplication.instance()
+        for w in app.topLevelWidgets():
+            if isinstance(w, MainDashboard):
+                w.close_application_cleanly()
+                return
+        print("\n👋 Recibido Ctrl+C — BB-450 cerrando sesión... ¡Hasta la próxima!")
+        QApplication.quit()
+    signal.signal(signal.SIGINT, _sigint_handler)
+
     app = QApplication(sys.argv)
     window = MainDashboard()
     window.show()

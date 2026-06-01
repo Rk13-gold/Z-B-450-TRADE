@@ -72,6 +72,8 @@ class OrderFlowEngine:
             'delta_per_second': self.delta_per_second,
             'buy_volume': self.buy_volume,
             'sell_volume': self.sell_volume,
+            'window_buy_volume': buy_vol,
+            'window_sell_volume': sell_vol,
             'delta_strength': delta_strength,
             'total_trades': len(self.trades_buffer)
         }
