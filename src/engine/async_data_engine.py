@@ -11,8 +11,11 @@ Architecture:
 """
 
 import asyncio
+import logging
 import time
 import math
+
+log = logging.getLogger(__name__)
 import threading
 from collections import deque
 from typing import Dict, Optional, Any
@@ -83,7 +86,7 @@ class AsyncDataEngine:
 
     def __init__(self, market_state: Dict, symbol: str = None):
         self.market_state = market_state
-        self.symbol = symbol or settings.SYMBOL
+        self.symbol = symbol or settings.get_symbol()
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -126,6 +129,29 @@ class AsyncDataEngine:
             self._loop.call_soon_threadsafe(self._loop.stop)
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=5)
+
+    def reset_symbol(self, new_symbol: str):
+        """Hot-swap symbol without restarting the engine.
+
+        Clears internal buffers so stale data for the old symbol
+        is not mixed with the new one.
+        """
+        self.symbol = new_symbol
+        # Clear all circular buffers
+        self._depth_events.clear()
+        self._spread_history.clear()
+        self._order_diffs.clear()
+        self._oi_history.clear()
+        self._tick_speed_history.clear()
+        self._klines_cache.clear()
+        self._ob_volume_history.clear()
+        self._tech_levels_cache.clear()
+        self._last_oi = 0.0
+        self._last_best_bid = 0.0
+        self._last_best_ask = 0.0
+        self._last_spread_ts = 0.0
+        self._last_price = 0.0
+        log.info("AsyncDataEngine reset for symbol %s", new_symbol)
 
     def _run_loop(self):
         self._loop = asyncio.new_event_loop()
@@ -441,6 +467,8 @@ class AsyncDataEngine:
             ("5m", 100, "5M"),
             ("15m", 100, "15M"),
             ("1h", 100, "1H"),
+            ("4h", 100, "4H"),
+            ("1d", 100, "1D"),
         ]
         while self._running:
             for interval, limit, label in timeframes:

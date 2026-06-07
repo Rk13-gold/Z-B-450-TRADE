@@ -454,7 +454,10 @@ def format_levels_for_prompt(tech: dict, price: float) -> str:
 
 
 def format_levels_for_telegram(tech: dict, price: float,
-                                symbol: str = "BTCUSDT") -> str:
+                                symbol: str = None) -> str:
+    if symbol is None:
+        from config.settings import settings
+        symbol = settings.get_symbol()
     """Format levels into a rich Telegram HTML message."""
     if not tech or not tech.get("fib_retracement"):
         return "⚠️ No hay datos de niveles técnicos disponibles."

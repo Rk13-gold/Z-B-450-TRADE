@@ -33,7 +33,8 @@ class AIAnalyst:
         rsi = market_data.get('rsi', 0)
         price = market_data.get('price', 0)
 
-        prompt = f"""Analiza el sentimiento del mercado para BTCUSDT con los siguientes datos:
+        sym = settings.get_symbol()
+        prompt = f"""Analiza el sentimiento del mercado para {sym} con los siguientes datos:
         - Precio actual: {price}
         - Delta: {delta}
         - Fuerza del Delta: {delta_strength}
@@ -44,7 +45,7 @@ class AIAnalyst:
         return prompt
 
     async def _call_gemini(self, prompt: str) -> Dict:
-        url = f"{self.base_url}/gemini-2.0-flash:generateContent?key={self.api_key}"
+        url = f"{self.base_url}/gemini-2.5-flash:generateContent?key={self.api_key}"
 
         payload = {
             "contents": [{

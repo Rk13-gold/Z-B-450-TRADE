@@ -36,67 +36,62 @@ from pydantic import BaseModel, Field
 
 log = logging.getLogger(__name__)
 
+from config.settings import settings
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 1. STRICT PYDANTIC SCHEMA — forces Gemini to return structured JSON
 # ══════════════════════════════════════════════════════════════════════════════
 
 
-class BracketRisk(BaseModel):
-    """Stop-loss / take-profit bracket for a single trade decision."""
-
-    entry: float = Field(..., description="Entry price for the position")
-    stop_loss: float = Field(
-        ..., alias="stop_loss",
-        description="Stop-loss price (below entry for LONG, above for SHORT)",
-    )
-    take_profit_1: float = Field(
-        ..., alias="take_profit_1",
-        description="First take-profit target (1:1 risk/reward minimum)",
-    )
-    take_profit_2: float = Field(
-        ..., alias="take_profit_2",
-        description="Second take-profit target (3:1 risk/reward target)",
-    )
-
-
 class GeminiTradingDecision(BaseModel):
-    """Complete decision output from Gemini — maps directly to UI panels."""
+    """Complete decision output from Gemini Brain v4-Speed — 3-phase micro-engine."""
 
     decision: str = Field(
         ...,
         strict=True,
-        description='Must be exactly "ALZA", "BAJA", or "INCIERTO"',
+        description='Must be exactly "ALZA", "BAJA", or "ESPERAR"',
     )
-    confidence: float = Field(
+    confianza: float = Field(
         ..., ge=0.0, le=100.0,
         description="Confidence level 0–100 %",
     )
-    exhaustion_detected: str = Field(
+    trigger_price: float = Field(
         ...,
-        description='Microstructural exhaustion: "▲ BRAIN BULLISH", '
-        '"▼ BRAIN BEARISH", or "NONE"',
+        description="Suggested entry price for the trade",
     )
-    reasoning: str = Field(
+    stop_loss: float = Field(
         ...,
-        max_length=1000,
-        description="Analytical rationale with order-flow basis",
+        description="Stop-loss price (below trigger for LONG, above for SHORT)",
     )
-    score_order_flow: float = Field(
-        ..., ge=0.0, le=10.0,
-        description="Order-flow score 0–10",
-    )
-    score_momentum: float = Field(
-        ..., ge=0.0, le=10.0,
-        description="Momentum score 0–10",
-    )
-    score_trend: float = Field(
-        ..., ge=0.0, le=10.0,
-        description="Multi-timeframe trend score 0–10",
-    )
-    bracket: BracketRisk = Field(
+    take_profit: float = Field(
         ...,
-        description="Risk bracket with entry, stop, and profit targets",
+        description="Take-profit price (above trigger for LONG, below for SHORT)",
+    )
+    regimen_mercado: str = Field(
+        ...,
+        description='Market regime: "DIRECCIONAL_CON_VOLUMEN_HFT", '
+        '"ABSORCION_INSTITUCIONAL_CONFIRMADA", '
+        '"LIQUIDITY_SWEEP_REVERSAL", '
+        '"BLOQUEO_POR_SPOOFING", '
+        '"EVITANDO_TRAMPA_DEL_BOOK", or "RANGO_INDECISO"',
+    )
+    multiplicador_posicion: float = Field(
+        ..., ge=0.5, le=1.5,
+        description="Position size multiplier 0.5–1.5 based on confluencia and absorption",
+    )
+    analisis_cuant: str = Field(
+        ..., max_length=400,
+        description="Concise technical rationale (max 2 lines) correlating liquidity pools, "
+        "HFT, spoofing risk, and real book liquidity with the decision taken",
+    )
+    funding_rate: float = Field(
+        default=0.0,
+        description="Current funding rate % for the perpetual contract (from exchange data)",
+    )
+    oi_delta_5min: float = Field(
+        default=0.0,
+        description="Open Interest % change in the last 5 minutes",
     )
 
 
@@ -104,65 +99,134 @@ class GeminiTradingDecision(BaseModel):
 # 2. GEMINI BRAIN MANAGER
 # ══════════════════════════════════════════════════════════════════════════════
 
-_ENGINEER_PROMPT = """\
-Eres un Operador de Flujo de Órdenes Institucional y Gestor de Riesgo Frío.
+def _get_engineer_prompt() -> str:
+    from config.settings import settings
+    sym = settings.get_symbol()
+    return f"""\
+Eres "BB-450 Engine v4-Speed", un micro-motor cuantitativo de 3 fases
+optimizado para {sym} Perpetuo. Tu arquitectura elimina toda capa de
+filtros intermedios (Kaufman, ATR%, chop, BB squeeze, MTF gate, bounce gate,
+price discovery, delta efficiency) y opera directamente sobre la mecánica
+del mercado: pools de liquidez, spoofing/trap state y velocidad HFT.
 
-REGLAS ESTRICTAS:
-- Tu única función es analizar microestructura de mercado en BTCUSDT 1m.
-- Eres ultra defensivo: ante la menor duda, desequilibrio contradictorio, o
-  falta de convicción microestructural, debes emitir "INCIERTO" con confianza
-  baja (< 55 %).
-- NUNCA adivines dirección. Si el order flow no muestra agresión clara y
-  sostenida, reporta INCIERTO.
-- El bracket de riesgo debe ser realista respecto al ATR actual. SL no puede
-  estar a menos de 0.5× ATR del entry.
+[INSTRUCCIÓN CRÍTICA DE PROCESAMIENTO]
+Recibirás un diccionario JSON con métricas en tiempo real. NO solicites
+snapshots ni detengas el pipeline. Responde EXCLUSIVAMENTE en JSON
+estructurado según el schema.
 
-MOMENTUM DE RUPTURA (BREAKOUT MOMENTUM — PRIORIDAD MÁXIMA):
-Si detectas un incremento súbito de volumen acompañado de aceleración de ticks
-a favor del CVD, no lo clasifiques como incertidumbre. Clasifícalo como un
-impulso institucional de alta probabilidad. En este escenario, genera el bracket
-dinámico para montarse en la tendencia de inmediato (SL más ajustado, TP más
-amplio). Ignora temporalmente divergencias MTF menores si el microestructura
-confirma agresión institucional.
+[MODO APRENDIZAJE — QUANTUM BRAIN SIN OPINIÓN]
+Si pytorch.learning_mode == True, el Quantum Brain está en entrenamiento
+y sus probabilidades (p_alza, p_baja, p_incierto) no son fiables.
+IGNORA completamente p_alza/p_baja y basa tu decisión ÚNICAMENTE en:
+- snapshot de mercado (precio, delta, CVD, order book, RSI, etc.)
+- reglas de riesgo (spoofing, trampas, HFT)
+- contexto episódico (lecciones pasadas)
+En este modo, actúa como el motor de decisión principal, no como validador.
 
-ANÁLISIS REQUERIDO (en orden):
-1. Order Flow: delta, CVD, B/A ratio, cumulative delta, cancel_rate.
-   ¿Hay divergencia entre precio y flujo de órdenes? ¿El tick_speed es
-   anómalamente alto (> 3× promedio 5min)? Eso es institucional.
-2. Momentum: kaufman_eff, tick_speed, spread_velocity, delta_accel.
-   ¿El movimiento tiene tracción o es absorción?
-3. Estructura MTF: tendencias en 5m/15m/1h/4h. ¿Hay confluencia?
-4. Liquidez: muros bid/ask, depth_imb_pct. ¿Hay trampas / spoofing?
-5. Agotamiento: ¿Precio en extremo de bandas? ¿CVD frenándose? ¿Rango?
+[PIPELINE DE PROCESAMIENTO — 3 FASES]
+Evalúa en este orden. Si una fase bloquea, devuelve "ESPERAR".
 
-NIVELES TÉCNICOS (SOPORTES / RESISTENCIAS / FIBONACCI):
-Cuando recibas el campo "technical_levels", úsalo para afinar tu predicción:
-- Si el precio está cerca de un nivel Fibonacci clave (0.382, 0.5, 0.618)
-  combinado con S/R histórico, considera posible REVERSIÓN desde esa zona.
-- Si el precio rompe un nivel Fibonacci + S/R con confluencia, confirma la
-  tendencia (breakout con objetivo en el siguiente nivel).
-- Las zonas de confluencia (score ≥ 0.7) son áreas de alta probabilidad
-  donde múltiples tipos de nivel se solapan — presta atención especial.
-- La estructura de mercado (UPTREND/DOWNTREND/RANGING) debe ser coherente
-  con tu decisión: no des ALZA si la estructura es bajista cerca de una
-  resistencia clave.
-- Usa el soporte o resistencia más cercana para validar si el bracket de
-  riesgo es razonable (SL no debe estar dentro de una zona de confluencia).
+FASE 1: COMPUERTA DE MITIGACIÓN DE RIESGO (Spoofing & Trap)
+- spoofing_risk_pct > 70% → "BLOQUEO_POR_SPOOFING", ESPERAR.
+- active_trap == "TRAMPA_ALCISTA" → PROHIBIDO ALZA.
+- active_trap == "TRAMPA_BAJISTA" → PROHIBIDO BAJA.
+- NO hay penalización 50-70%. NO hay boost por trap contrario.
 
-CONTEXTO DE MEMORIA EPISÓDICA (Análisis Inter-Cerebral):
-Cuando recibas el campo "episodic_context", úsalo como VALIDADOR ESTRATÉGICO:
-- Las lecciones del pasado con etiqueta "FAILED" deben sesgar tu decisión en
-  contra de repetir ese error. Si el patrón actual es similar a fallos pasados,
-  incrementa tu umbral de confianza requerido.
-- Las lecciones con etiqueta "SUCCESS" pueden servir como confirmación, pero
-  no confíes ciegamente — cada tick es único.
-- Ajusta dinámicamente el bracket de riesgo según el contexto histórico:
-   más tight si hay fallos similares, más amplio si hay aciertos similares.
+FASE 2: MAPA DE LIQUIDEZ MÁXIMA (Liquidity Target)
+- Analiza liquidity_pools (pool_shorts_arriba, pool_longs_abajo) y
+  whale_bid_walls / whale_ask_walls del Order Book.
+- Identifica el imán dominante: el pool/muro más cercano al precio
+  ponderado por tamaño (distancia ÷ volumen).
+- El TP provisional se sitúa 0.02% ANTES del imán.
+- El SL se sitúa 0.05% MÁS ALLÁ del barrido más lejano.
 
-IMPORTANTE — LÍMITE DE RAZONAMIENTO:
-- El campo "reasoning" debe tener MÁXIMO 800 caracteres.
-- Prioriza datos concretos sobre opiniones: menciona valores específicos
-  (delta, CVD, RSI, niveles de precios) en vez de descripciones genéricas.\
+FASE 3: AJUSTE DINÁMICO DE EJECUCIÓN (HFT → Multiplier)
+- hft_speed_score > 5 y depth_imb_pct > 0 a favor: +15 confianza,
+  multiplicador 1.5.
+- hft_speed_score < 0.5: multiplicador 0.5, -25 confianza.
+- Por defecto: confianza >= 80 → 1.5x, >= 60 → 1.0x, < 60 → 0.5x.
+- NO hay bloqueo por HFT. Solo ajusta confianza y tamaño.
+
+[REGLA CRÍTICA DE CONTROL DE RIESGO: SL/TP NUMÉRICO ESTRICTO]
+Queda TERMINANTEMENTE PROHIBIDO usar multiplicadores porcentuales libres
+sobre el precio de BTC para calcular SL o TP. Usa referencias numéricas
+directas del Order Book:
+
+1. CÁLCULO DE STOP LOSS (SL):
+   - Para SHORT (BAJA): localiza el ASK institucional más alto del snapshot.
+     SL = ese precio + $15.00 USD.
+   - Para LONG (ALZA): localiza el BID institucional más bajo del snapshot.
+     SL = ese precio - $15.00 USD.
+   - SL NUNCA podrá distar más de $120.00 USD del trigger_price. Si excede,
+     recórtalo automáticamente a trigger_price ± $120.00 USD.
+
+2. CÁLCULO DE TAKE PROFIT (TP):
+   - Colócalo a $5.00 USD ANTES de la primera gran pared de liquidez
+     contraria para garantizar absorción inmediata en Binance.
+
+3. OUTPUT SCHEMA ENFORCEMENT:
+   - stop_loss y take_profit deben ser float redondeados a 2 decimales.
+   - Deben cumplir simetría de riesgo mínima 2:1 (distancia TP >= 2×
+     distancia SL).
+
+[REGLA MAESTRA INQUEBRANTABLE: FILTRO DE DISCORDANCIA DE DELTA]
+1. RESTRICCIÓN ABSOLUTA DE COMPRA (ALZA):
+   - PROHIBIDO emitir "ALZA" si delta o cvd < -200, a menos que
+     ba_ratio > 2.5 (muros de compra real absorbiendo).
+   - Si delta es fuertemente negativo (∼ -900 o peor) y el precio
+     no rebota con un muro institucional masivo en los Bids, la
+     decisión DEBE ser "BAJA" o "ESPERAR". No asumas absorción solo
+     por volumen alto.
+
+2. RESTRICCIÓN ABSOLUTA DE VENTA (BAJA):
+   - PROHIBIDO emitir "BAJA" si delta o cvd > +200, a menos que
+     ba_ratio < 0.4 (muros de venta bloqueando arriba).
+
+[FILTROS ADICIONALES v4-Speed]
+1. FUNDING RATE (fr):
+   - Si abs(funding_rate) > 0.05%, el mercado está extremadamente
+     sesgado. NO emitir señales en esa dirección del sesgo.
+   - funding_rate > 0.05% → NO ALZA (sobrecomprado).
+   - funding_rate < -0.05% → NO BAJA (sobrevendido).
+
+2. OPEN INTEREST DELTA (oi_delta_5min):
+   - Si abs(oi_delta_5min) > 15%, hay entrada/salida masiva de capital.
+     Solo emitir señal si el OI va en la misma dirección que el trade.
+
+3. PROFUNDIDAD MÍNIMA DEL BOOK (book_depth_bids/asks_volume):
+   - Si un lado del book tiene < 5% del volumen total del book y
+     depth_imb_pct < 5% y ba_ratio está entre 0.95-1.05, no hay
+     convicción real. Forzar ESPERAR.
+
+4. INTEGRIDAD TICK (tick_integrity_score):
+   - Si tick_integrity_score < 3 t/s y los ticks están decayendo,
+     reducir confianza. Mercado sin microestructura activa. Sesgar
+     a ESPERAR.
+
+[REGLA DE PRIORIDAD ANALÍTICA: MICROESTRUCTURA > OSCILADORES]
+- RSI, Bollinger, EMAs son secundarios y retrasados.
+- Si Depth Imbalance < -60% o > +60%, PROHIBIDO usar RSI para
+  justificar un giro o rebote por "sobreventa/sobrecompra".
+- En desbalance crítico, la única prioridad es la continuación del
+  flujo de órdenes dominante hasta que aparezca un muro institucional
+  de absorción (INST BID/ASK) en sentido contrario con volumen > 3.0B.
+
+[REGLAS DE DECISIÓN ADICIONALES]
+1. La dirección (ALZA/BAJA) la determina el motor determinístico.
+   Gemini solo valida, sugiere confianza y ajusta SL/TP.
+2. Si hay sweep confirmado (precio barrió un pool con absorción activa),
+   regimen = "LIQUIDITY_SWEEP_REVERSAL".
+3. Sin sweep, regimen por defecto = "ABSORCION_INSTITUCIONAL_CONFIRMADA"
+   si hay dirección, o "RANGO_INDECO" si NEUTRAL.
+
+CONTEXTO DE MEMORIA EPISÓDICA:
+- Lecciones "FAILED" → sesgan contra repetir ese patrón.
+- Lecciones "SUCCESS" → confirman, pero sin exceso de confianza.
+
+IMPORTANTE:
+- analisis_cuant MAX 400 caracteres.
+- Correlaciona imán de liquidez, HFT, spoofing y order book real.
+- Usa español técnico conciso con valores específicos.\
 """
 
 
@@ -180,7 +244,7 @@ class GeminiBrainManager:
     failures to dynamically re-calibrate probabilities and brackets.
     """
 
-    MODEL: str = "gemini-2.0-flash"
+    MODEL: str = "gemini-2.5-flash"
 
     def __init__(self):
         api_key = os.getenv("GEMINI_API_KEY", "")
@@ -199,11 +263,17 @@ class GeminiBrainManager:
                 log.error(f"[GeminiBrain] Error inicializando cliente: {exc}")
                 self._enabled = False
 
-        # ── System instructions (set once, cached) ─────────────────────
-        self._system_instruction: Optional[str] = _ENGINEER_PROMPT
+        # ── System instructions (dynamic symbol) ──────────────────────
+        self._system_instruction: Optional[str] = _get_engineer_prompt()
 
         # ── Narrative journal (lazy) ───────────────────────────────────
         self._journal = None
+
+    def refresh_system_instruction(self):
+        """Rebuild system instruction with current symbol."""
+        self._system_instruction = _get_engineer_prompt()
+        log.info("[GeminiBrain] System instruction refreshed for %s",
+                 settings.get_symbol())
 
     # ── Public API ─────────────────────────────────────────────────────
 
@@ -266,8 +336,19 @@ class GeminiBrainManager:
             compact["technical_levels"] = format_levels_for_prompt(
                 tech_levels_raw, price)
 
-        # Inject PyTorch metrics
-        if pytorch_metrics:
+        # Inject PyTorch metrics (quantum brain opinion)
+        if pytorch_metrics and pytorch_metrics.get("learning_mode"):
+            # Learning mode: quantum brain has no opinion yet
+            compact['pytorch'] = {
+                'p_alza': 0.33,
+                'p_baja': 0.33,
+                'p_incierto': 0.34,
+                'conf': 0,
+                'dir': 'INCIERTO',
+                'learning_mode': True,
+                'trades_until_active': pytorch_metrics.get('trades_until_active', 200),
+            }
+        elif pytorch_metrics:
             compact['pytorch'] = {
                 'p_alza': pytorch_metrics.get('prob_alza', 0),
                 'p_baja': pytorch_metrics.get('prob_baja', 0),
@@ -293,7 +374,12 @@ class GeminiBrainManager:
                 ),
             )
 
-            raw = response.text
+            try:
+                raw = "".join(
+                    part.text for part in response.candidates[0].content.parts
+                )
+            except Exception:
+                raw = response.text
             if not raw or not raw.strip():
                 log.warning("[GeminiBrain] Respuesta vacía de Gemini")
                 return None
@@ -351,6 +437,7 @@ class GeminiBrainManager:
             "t15": raw.get("trend_15m", "WAIT"),
             "t1h": raw.get("trend_1h", "WAIT"),
             "t4h": raw.get("trend_4h", "WAIT"),
+            "t1d": raw.get("trend_1d", "WAIT"),
             "rsi5": raw.get("rsi_5m", 0),
             "rsi15": raw.get("rsi_15m", 0),
             "conf": raw.get("confluence_score", 0),
@@ -360,8 +447,16 @@ class GeminiBrainManager:
             "w_ask": raw.get("wall_ask", 0),
             "w_ask_sz": raw.get("wall_ask_size", 0),
             "trap": raw.get("trap_status", "SIN TRAMPA"),
+            "sr": raw.get("spoofing_risk", 0),
+            "hft": raw.get("hft_speed", 0),
             "prob": raw.get("directional_probability", 50),
             "bias": raw.get("market_bias", "INCIERTO"),
+            # Mejoras v4-Speed
+            "fr": raw.get("funding_rate", 0.0),
+            "oi_d5": raw.get("oi_delta_5min", 0.0),
+            "tis": raw.get("tick_integrity_score", 1.0),
+            "bd_bv": raw.get("book_depth_bids_volume", 0.0),
+            "bd_av": raw.get("book_depth_asks_volume", 0.0),
         }
 
     # ── Narrative journaling ────────────────────────────────────────────

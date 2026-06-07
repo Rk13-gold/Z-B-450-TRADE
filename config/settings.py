@@ -1,5 +1,6 @@
 import os
 import sys
+import threading
 from dotenv import load_dotenv
 
 dotenv_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '.env'))
@@ -11,11 +12,45 @@ class Settings:
     BINANCE_REAL_API_KEY = os.getenv("BINANCE_REAL_API_KEY", "")
     BINANCE_REAL_SECRET_KEY = os.getenv("BINANCE_REAL_SECRET_KEY", "")
     SYMBOL = os.getenv("SYMBOL", "BTCUSDT")
-    LEVERAGE = int(os.getenv("LEVERAGE", "100"))
 
-    RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.01"))
+    # ── Thread-safe active symbol (hot-swappable via Telegram) ──────────
+    ACTIVE_SYMBOL: str = SYMBOL
+    _symbol_lock = threading.Lock()
+
+    @classmethod
+    def get_symbol(cls) -> str:
+        with cls._symbol_lock:
+            return cls.ACTIVE_SYMBOL
+
+    @classmethod
+    def set_symbol(cls, new_symbol: str) -> str:
+        """Change active symbol. Returns old symbol for rollback."""
+        with cls._symbol_lock:
+            old = cls.ACTIVE_SYMBOL
+            cls.ACTIVE_SYMBOL = new_symbol
+            return old
+    LEVERAGE = int(os.getenv("DEFAULT_LEVERAGE", os.getenv("LEVERAGE", "40")))
+
+    RISK_PER_TRADE = float(os.getenv("RISK_PERCENT", os.getenv("RISK_PER_TRADE", "10.0")))
     MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS", "0.05"))
     MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "1"))
+
+    # Global position sizing (set via dashboard F2 or Telegram numeric message)
+    GLOBAL_TRADE_AMOUNT: float = 1.00   # USD, used when USE_ALL_IN is False
+    USE_ALL_IN: bool = os.getenv("USEALLIN", "False").lower() in ("true", "1", "yes")
+
+    @classmethod
+    def set_global_trade_amount(cls, amount: float) -> None:
+        """Central write-point for GLOBAL_TRADE_AMOUNT.
+
+        Called from:
+          - dashboard F2 → _save_sizing_config()
+          - Telegram bot → numeric message handler
+        Automatically disables USE_ALL_IN when a fixed amount is set.
+        """
+        cls.GLOBAL_TRADE_AMOUNT = round(float(amount), 2)
+        cls.USE_ALL_IN = False
+
 
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 

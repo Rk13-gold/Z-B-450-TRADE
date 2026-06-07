@@ -182,14 +182,21 @@ class NarrativeJournal:
         try:
             from google.genai import types
             resp = await self._gemini_client.aio.models.generate_content(
-                model="gemini-2.0-flash",
+                model="gemini-2.5-flash",
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     temperature=0.4,
                     max_output_tokens=600,
                 ),
             )
-            return resp.text.strip() if resp and resp.text else None
+            try:
+                texto_completo = "".join(
+                    part.text for part in resp.candidates[0].content.parts
+                )
+            except Exception:
+                texto_completo = resp.text if resp else ""
+            texto = texto_completo.strip()
+            return texto if texto else None
         except Exception as e:
             log.warning("[NarrativeJournal] Gemini error: %s", e)
             return None

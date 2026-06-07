@@ -78,7 +78,7 @@ RESPONDE SOLO JSON (sin markdown, sin texto adicional):
 
 # ── Klines fetcher (sync, cached) ──────────────────────────────────────
 
-def fetch_klines(symbol: str = "BTCUSDT", interval: str = "1m",
+def fetch_klines(symbol: str = None, interval: str = "1m",
                  limit: int = 200) -> List:
     """Fetch klines from Binance futures with 15s cache.
 
@@ -86,6 +86,9 @@ def fetch_klines(symbol: str = "BTCUSDT", interval: str = "1m",
     Falls back to cached data on error.
     """
     global _KLINE_CACHE, _KLINE_CACHE_TIME
+    if symbol is None:
+        from config.settings import settings
+        symbol = settings.get_symbol()
 
     now = time.time()
     if _KLINE_CACHE and (now - _KLINE_CACHE_TIME) < _KLINE_CACHE_TTL:
@@ -328,14 +331,20 @@ class AutoLearner:
         try:
             from google.genai import types
             resp = self._client.models.generate_content(
-                model="gemini-2.0-flash",
+                model="gemini-2.5-flash",
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     temperature=0.2,
                     max_output_tokens=500,
                 ),
             )
-            raw = resp.text.strip() if resp and resp.text else ""
+            try:
+                texto_completo = "".join(
+                    part.text for part in resp.candidates[0].content.parts
+                )
+            except Exception:
+                texto_completo = resp.text if resp else ""
+            raw = texto_completo.strip()
             if not raw:
                 return None
 

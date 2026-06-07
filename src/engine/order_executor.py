@@ -23,13 +23,16 @@ Flow
 from __future__ import annotations
 
 import logging
+import math
 import queue
+import sqlite3
 import time
+from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from threading import Lock
 from typing import Optional
 
-from PyQt5.QtCore import QThread, pyqtSignal
+from PyQt5.QtCore import QThread, pyqtSignal, QTimer
 from binance.client import Client
 from binance.exceptions import BinanceAPIException, BinanceRequestException
 
@@ -42,9 +45,13 @@ REAL_BASE_URL = "https://fapi.binance.com"
 REAL_WS_URL = "wss://fstream.binance.com"
 
 # ── ORDER CONFIG ────────────────────────────────────────────────────────────
-SYMBOL = settings.SYMBOL or "BTCUSDT"
 MAX_RETRIES = 3
 RETRY_DELAY_S = 0.5
+
+# ── Mejora 1: Split entry (3 micro-tickets) ─────────────────────────────────
+SPLIT_ENTRY_TICKETS = 3
+SPLIT_ENTRY_PULLBACK_WAIT_SEC = 0.8
+SPLIT_ENTRY_PULLBACK_PCT = 0.0003
 
 
 class OrderExecutor(QThread):
@@ -58,8 +65,9 @@ class OrderExecutor(QThread):
     """
 
     order_result = pyqtSignal(bool, str, dict)
+    position_closed = pyqtSignal(dict)
 
-    def __init__(self, parent: Optional = None, client: Optional[Client] = None):
+    def __init__(self, parent=None, client: Optional[Client] = None):
         super().__init__(parent)
         self._lock = Lock()
         self._queue: queue.Queue[Optional[dict]] = queue.Queue()
@@ -75,13 +83,18 @@ class OrderExecutor(QThread):
         self._close_cooldown_until: float = 0.0
         self._close_cooldown_seconds: float = 900.0  # 15 min
 
+        # ── Adaptive cooldown post-loss (Mejora 7 — v4-Speed) ────────
+        self._consecutive_sl_count: int = 0
+        self._adaptive_cooldown_base: float = 300.0  # 5 min base
+
         # ── Single-position gate ─────────────────────────────────────
         self._has_open_position: bool = False
         self._position_info: dict = {}
 
-        # ── Algo bracket tracking ────────────────────────────────────
-        self._active_algo_ids: list[str] = []
-        self._brackets_verified: bool = False
+        # ── Position-close tracking (PASO 2) ─────────────────────────
+        self._open_position_data: Optional[dict] = None
+        self._close_poll_timer: Optional[QTimer] = None
+        self._close_poll_flag: bool = False
 
         # ── Environment — locked to REAL ───────────────────────────
 
@@ -94,20 +107,12 @@ class OrderExecutor(QThread):
         self._ma_7: float = 0.0
         self._ma_25: float = 0.0
         self._ma_99: float = 0.0
-
-        # ── Trailing stop state ─────────────────────────────────────
-        self._trailing_enabled: bool = True
-        self._trail_breakeven_pnl: float = 6.0     # $ → move SL to entry
-        self._trail_distance_pct: float = 0.2       # % trailing distance
-        self._trail_use_ma7: bool = True             # prefer MA7 over fixed %
-        self._trail_activated: bool = False          # breakeven reached?
-        self._trailing_sl_price: float = 0.0
-        self._trailing_algo_id: str = ""
+        self._atr: float = 0.0
 
     # ── Precision helpers ───────────────────────────────────────────────────
 
     def _load_symbol_filters(self) -> dict:
-        """Fetch and cache LOT_SIZE + PRICE_FILTER + precision for SYMBOL."""
+        """Fetch and cache LOT_SIZE + PRICE_FILTER + precision for current symbol."""
         if self._precision_cached and self._symbol_filters:
             return self._symbol_filters
         if self._client is None:
@@ -115,7 +120,7 @@ class OrderExecutor(QThread):
         try:
             info = self._client.futures_exchange_info()
             for s in info.get("symbols", []):
-                if s.get("symbol") == SYMBOL:
+                if s.get("symbol") == settings.get_symbol():
                     filters = {}
                     filters["price_precision"] = int(s.get("pricePrecision", 2))
                     filters["qty_precision"] = int(s.get("quantityPrecision", 4))
@@ -153,9 +158,11 @@ class OrderExecutor(QThread):
         """Round quantity down to symbol's stepSize and format to qtyPrecision."""
         filters = self._load_symbol_filters()
         decimals = filters.get("qty_precision", 4)
-        step = filters.get("step_size", 0.0001)
+        step = filters.get("step_size", 0.001)
+        if qty <= 0:
+            return f"{0.0:.{decimals}f}"
         if step > 0:
-            truncated = int(qty / step) * step
+            truncated = int(qty / step + 1e-9) * step
         else:
             truncated = qty
         return f"{truncated:.{decimals}f}"
@@ -171,6 +178,12 @@ class OrderExecutor(QThread):
         leverage: int = 10,
         capital: float = 100.0,
         confidence: float = -1.0,
+        atr: float = 0.0,
+        wall_bid: float = 0.0,
+        wall_ask: float = 0.0,
+        delta: float = 0.0,
+        cvd: float = 0.0,
+        entry_filter: str = "",
     ) -> bool:
         """Queue a trade signal for background execution.
 
@@ -191,6 +204,12 @@ class OrderExecutor(QThread):
         confidence : float
             Signal confidence 0-100. When >= 0, ``calculate_dynamic_leverage``
             overrides *leverage* and *capital* automatically.
+        delta : float
+            Order flow delta at entry time.
+        cvd : float
+            Cumulative Volume Delta at entry time.
+        entry_filter : str
+            Name of the filter that confirmed the entry (e.g. 'institutional', 'absorption').
         """
 
         # ── SAFETY LAYER 0: Sincronización con Binance ──────────────
@@ -255,18 +274,26 @@ class OrderExecutor(QThread):
             "capital": capital,
             "confidence": confidence,
             "ts": now,
+            "atr": atr,
+            "wall_bid": wall_bid,
+            "wall_ask": wall_ask,
+            "delta": delta,
+            "cvd": cvd,
+            "entry_filter": entry_filter,
         }
         self._queue.put(task)
         if not self.isRunning():
             self.start()
         log.info(
             f"[OrderExec] Enqueued {direction} @ {entry_price:.0f} | "
-            f"SL={sl_price:.0f} TP={tp_price:.0f}"
+            f"SL={sl_price:.0f} TP={tp_price:.0f} "
+            f"| atr={atr:.2f} wall_bid={wall_bid:.2f} wall_ask={wall_ask:.2f}"
         )
         return True
 
     def update_market_context(self, price: float = 0, ma7: float = 0,
-                               ma25: float = 0, ma99: float = 0) -> None:
+                                ma25: float = 0, ma99: float = 0,
+                                atr: float = 0) -> None:
         """Push current market context from the dashboard (called at ~1Hz)."""
         if price > 0:
             self._current_price = price
@@ -276,12 +303,83 @@ class OrderExecutor(QThread):
             self._ma_25 = ma25
         if ma99 > 0:
             self._ma_99 = ma99
+        if atr > 0:
+            self._atr = atr
 
-    # ── Dynamic Leverage ─────────────────────────────────────────────────────
+    @staticmethod
+    def _get_last_trade_outcome(db_path: str = "bb450_trades.db") -> Optional[str]:
+        """Read the last closed trade outcome from SQLite DB."""
+        try:
+            conn = sqlite3.connect(db_path, timeout=3)
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT outcome FROM trades
+                WHERE outcome IN ('TP','SL')
+                ORDER BY closed_at DESC
+                LIMIT 1
+                """
+            )
+            row = cur.fetchone()
+            conn.close()
+            return row[0] if row else None
+        except Exception:
+            return None
+
+    # ── Dynamic Leverage (reactivo por historial) ────────────────────────────
+
+    @staticmethod
+    def get_reactive_leverage(db_path: str = "bb450_trades.db") -> int:
+        """Calcula el apalancamiento reactivo leyendo los últimos 3 trades cerrados.
+
+        Reglas
+        ------
+        - Base / reset:          20x  (si último trade fue pérdida o sin historial)
+        - 1 TP consecutivo:      35x
+        - 2+ TPs consecutivos:   50x  (aprovechar rachas ganadoras)
+        """
+        LEV_BASE  = 20
+        LEV_MID   = 35
+        LEV_MAX   = 50
+        try:
+            conn = sqlite3.connect(db_path, timeout=3)
+            cur  = conn.cursor()
+            # Intentar leer los últimos 3 trades cerrados ordenados por fecha desc
+            cur.execute(
+                """
+                SELECT outcome FROM trades
+                WHERE outcome IN ('TP','SL')
+                ORDER BY closed_at DESC
+                LIMIT 3
+                """
+            )
+            rows = cur.fetchall()   # [(outcome,), ...] más reciente primero
+            conn.close()
+        except Exception as exc:
+            log.warning(f"[ReactiveLE] No se pudo leer la DB ({exc}) — usando 20x")
+            return LEV_BASE
+
+        if not rows:
+            return LEV_BASE
+
+        # El trade más reciente
+        last = rows[0][0]
+        if last == "SL":
+            log.info("[ReactiveLE] Último trade: PÉRDIDA → apalancamiento reset 20x")
+            return LEV_BASE
+
+        # Verificar racha ganadora
+        wins = sum(1 for r in rows if r[0] == "TP")
+        if wins >= 2:
+            log.info(f"[ReactiveLE] Racha ganadora ({wins} TPs) → apalancamiento MAX 50x")
+            return LEV_MAX
+        else:
+            log.info("[ReactiveLE] 1 TP consecutivo → apalancamiento 35x")
+            return LEV_MID
 
     @staticmethod
     def calculate_dynamic_leverage(confidence: float) -> tuple:
-        """Compute leverage and risk % from signal confidence.
+        """Compute leverage and risk % from signal confidence (legacy path).
 
         Rules
         -----
@@ -294,16 +392,6 @@ class OrderExecutor(QThread):
         if confidence <= 60:
             return (10, 0.025)
         return (25, 0.07)
-
-    def configure_trailing(self, enabled: bool = True,
-                            breakeven_pnl: float = 6.0,
-                            distance_pct: float = 0.2,
-                            use_ma7: bool = True) -> None:
-        """Configure trailing stop parameters."""
-        self._trailing_enabled = enabled
-        self._trail_breakeven_pnl = breakeven_pnl
-        self._trail_distance_pct = distance_pct
-        self._trail_use_ma7 = use_ma7
 
     @property
     def can_open_new_trade(self) -> bool:
@@ -364,7 +452,7 @@ class OrderExecutor(QThread):
             log.error("[OrderExec] close_all_positions — no client")
             return result
         try:
-            positions = self._client.futures_position_information(symbol=SYMBOL)
+            positions = self._client.futures_position_information(symbol=settings.get_symbol())
             closed_any = False
             for pos in positions:
                 amt = float(pos.get("positionAmt", 0))
@@ -373,11 +461,11 @@ class OrderExecutor(QThread):
                 side = "SELL" if amt > 0 else "BUY"
                 qty = abs(amt)
                 log.warning(
-                    f"[EMERGENCY] Closing {side} {qty} {SYMBOL} "
+                    f"[EMERGENCY] Closing {side} {qty} {settings.get_symbol()} "
                     f"@ market (positionAmt={amt})"
                 )
                 resp = self._fapi_create_order(
-                    symbol=SYMBOL,
+                    symbol=settings.get_symbol(),
                     side=side,
                     type="MARKET",
                     quantity=qty,
@@ -416,7 +504,10 @@ class OrderExecutor(QThread):
                     result["unrealized_pnl"] = float(asset.get("unrealizedProfit", 0))
                     break
         except Exception as exc:
-            log.error(f"[OrderExec] get_balance error: {exc}")
+            now = time.time()
+            if now - getattr(self, '_last_balance_err_ts', 0) > 60.0:
+                log.error(f"[OrderExec] get_balance error: {exc}")
+                self._last_balance_err_ts = now
         return result
 
     @property
@@ -440,7 +531,7 @@ class OrderExecutor(QThread):
     # ── Thread main loop ────────────────────────────────────────────────────
 
     def run(self) -> None:
-        """Background loop: dequeue and execute trade signals."""
+        """Background loop: dequeue and execute trade signals + close polling."""
         ENV_TAG = "REAL"
         log.info(f"[OrderExec] Thread started | ENV={ENV_TAG}")
         self._build_client()
@@ -455,16 +546,34 @@ class OrderExecutor(QThread):
                      f"{pos.get('positionAmt', 0)} BTC @ "
                      f"${pos.get('entryPrice', 0):,.0f}")
 
-        self._last_trail_check: float = 0.0
+        self._close_poll_flag = bool(pos and abs(float(pos.get('positionAmt', 0))) > 0)
+        if self._close_poll_flag:
+            amt = float(pos.get('positionAmt', 0))
+            self._open_position_data = {
+                "entry_price": float(pos.get('entryPrice', 0)),
+                "qty_btc": abs(amt),
+                "direction": "BUY" if amt > 0 else "SELL",
+                "capital": 0,
+                "leverage": settings.LEVERAGE,
+                "open_timestamp": datetime.now(timezone.utc).isoformat(),
+                "sl_price": 0,
+                "tp_price": 0,
+                "delta_entrada": 0,
+                "cvd_entrada": 0,
+                "filtro_entrada": "recovered",
+                "max_pnl": 0.0,
+            }
+
+        last_close_check = time.time()
 
         while self._running:
             try:
                 task = self._queue.get(timeout=1.0)
             except queue.Empty:
-                now = time.time()
-                if now - self._last_trail_check >= 3.0:
-                    self._last_trail_check = now
-                    self._check_trailing_stop()
+                # ── Periodic position close check ──────────────────────
+                if self._close_poll_flag and time.time() - last_close_check >= 5.0:
+                    last_close_check = time.time()
+                    self._poll_position_close()
                 continue
             if task is None:
                 break
@@ -485,14 +594,14 @@ class OrderExecutor(QThread):
         return dict(self._position_info)
 
     def check_position_status(self) -> Optional[dict]:
-        """Query Binance for open positions on SYMBOL.
+        """Query Binance for open positions on the current symbol.
         Returns the position dict if open, or None if closed.
         Side effect: updates _has_open_position flag.
         """
         if self._client is None:
             return None
         try:
-            positions = self._client.futures_position_information(symbol=SYMBOL)
+            positions = self._client.futures_position_information(symbol=settings.get_symbol())
             with self._lock:
                 for pos in positions:
                     pos_amt = float(pos.get("positionAmt", 0))
@@ -510,19 +619,45 @@ class OrderExecutor(QThread):
                         return dict(self._position_info)
                 if self._has_open_position:
                     log.info("[OrderExec] Position closed — releasing position gate")
-                    self._close_cooldown_until = time.time() + self._close_cooldown_seconds
+                    # ── MEJORA 7: Adaptive cooldown post-loss ─────────────
+                    last_outcome = self._get_last_trade_outcome()
+                    if last_outcome == "SL":
+                        self._consecutive_sl_count += 1
+                    else:
+                        self._consecutive_sl_count = 0  # reset racha ganadora
+
+                    base_cooldown = self._adaptive_cooldown_base  # 300s
+                    if self._consecutive_sl_count >= 2:
+                        # 2 consecutivos → 900s (15 min)
+                        cooldown = 900.0
+                    elif self._consecutive_sl_count == 1:
+                        # 1 pérdida → 600s (10 min) si volatilidad alta
+                        cooldown = base_cooldown * 2
+                    else:
+                        cooldown = self._close_cooldown_seconds  # default 900s
+
+                    # ATR factor: si el mercado está muy volátil, extiende
+                    if hasattr(self, '_current_price') and self._current_price > 0:
+                        atr_factor = getattr(self, '_atr', 0) / max(self._current_price * 0.005, 1)
+                        if atr_factor > 1.5:
+                            cooldown *= min(atr_factor, 2.0)  # max 2x
+
+                    cooldown = max(cooldown, 300.0)  # mínimo 5 min
+                    self._close_cooldown_until = time.time() + cooldown
                     log.info(
                         f"[OrderExec] Cooldown post-cierre: "
-                        f"{self._close_cooldown_seconds:.0f}s "
-                        f"(hasta {time.strftime('%H:%M:%S', time.localtime(self._close_cooldown_until))})")
+                        f"{cooldown:.0f}s "
+                        f"(hasta {time.strftime('%H:%M:%S', time.localtime(self._close_cooldown_until))})"
+                        f" | consecutive_SL={self._consecutive_sl_count}"
+                    )
                 self._has_open_position = False
                 self._position_info = {}
-                self._trail_activated = False
-                self._trailing_sl_price = 0.0
-                self._trailing_algo_id = ""
                 return None
         except Exception as exc:
-            log.warning(f"[OrderExec] Position check error: {exc}")
+            now = time.time()
+            if now - getattr(self, '_last_pos_err_ts', 0) > 60.0:
+                log.warning(f"[OrderExec] Position check error: {exc}")
+                self._last_pos_err_ts = now
             return None
 
     def release_position_gate(self) -> None:
@@ -530,11 +665,6 @@ class OrderExecutor(QThread):
         with self._lock:
             self._has_open_position = False
             self._position_info = {}
-            self._active_algo_ids = []
-            self._brackets_verified = False
-            self._trail_activated = False
-            self._trailing_sl_price = 0.0
-            self._trailing_algo_id = ""
         log.info("[OrderExec] Position gate manually released")
 
     def get_position_with_pnl(self) -> Optional[dict]:
@@ -565,137 +695,7 @@ class OrderExecutor(QThread):
             "leverage": lev,
         }
 
-    # ── Trailing Stop ────────────────────────────────────────────────────────
 
-    def _check_trailing_stop(self) -> None:
-        """Evaluate and update trailing stop every ~3s when a position is open.
-
-        Flow:
-          1. Skip if trailing not enabled, no open position, or no algo SL.
-          2. Fetch live position PnL and mark price.
-          3. If PnL >= breakeven threshold AND trail not yet activated:
-               → cancel old SL algo order
-               → place new SL at entry price (breakeven)
-               → set _trail_activated = True
-          4. If trail activated AND mark price moved favorably:
-               → compute new trail price (MA7 or fixed % behind)
-               → if new price is better (tighter to market) than current SL:
-                   → cancel old SL, place new SL at trailed price
-        """
-        if not self._trailing_enabled or not self._has_open_position:
-            return
-        if self._client is None:
-            return
-
-        pos = self.get_position_with_pnl()
-        if pos is None:
-            return
-
-        entry = pos["entry_price"]
-        mark = pos["mark_price"]
-        pnl = pos["pnl"]
-        direction = pos["direction"]
-        algo_id = self._trailing_algo_id
-
-        if not algo_id:
-            return
-
-        is_long = direction == "LONG"
-
-        # ── Step 1: Breakeven trigger ──────────────────────────────────
-        if not self._trail_activated:
-            if pnl >= self._trail_breakeven_pnl:
-                be_price = entry
-                be_str = self._round_price(be_price)
-                try:
-                    # Cancel old SL algo
-                    if algo_id:
-                        self._client.futures_cancel_algo_order(
-                            symbol=SYMBOL, algoId=algo_id)
-                        log.info(f"[Trail] SL cancelado (breakeven) — id={algo_id}")
-                    # Place new SL at entry price
-                    opposite = "SELL" if is_long else "BUY"
-                    resp = self._create_algo_order(
-                        symbol=SYMBOL,
-                        side=opposite,
-                        type="STOP_MARKET",
-                        triggerPrice=be_str,
-                        closePosition="true",
-                        workingType="MARK_PRICE",
-                    )
-                    new_id = str(resp.get("clientAlgoId", "") or resp.get("algoId", ""))
-                    with self._lock:
-                        self._trail_activated = True
-                        self._trailing_sl_price = be_price
-                        self._trailing_algo_id = new_id
-                    log.info(
-                        f"[Trail] Breakeven activado → SL en ${be_price:,.0f} "
-                        f"| PnL=${pnl:+.2f} | mark=${mark:,.0f}")
-                except Exception as exc:
-                    log.warning(f"[Trail] Breakeven error: {exc}")
-            return
-
-        # ── Step 2: Trail the stop ─────────────────────────────────────
-        # Compute target trail price
-        if self._trail_use_ma7 and self._ma_7 > 0:
-            trail_target = self._ma_7
-        else:
-            # Fixed % trailing distance
-            if is_long:
-                trail_target = mark * (1 - self._trail_distance_pct / 100.0)
-            else:
-                trail_target = mark * (1 + self._trail_distance_pct / 100.0)
-
-        current_sl = self._trailing_sl_price
-        if current_sl <= 0:
-            return
-
-        # Determine if new price improves the stop
-        improvement = False
-        if is_long:
-            # LONG: SL should rise (trail upward)
-            if trail_target > current_sl and trail_target < mark:
-                improvement = True
-        else:
-            # SHORT: SL should fall (trail downward)
-            if trail_target < current_sl and trail_target > mark:
-                improvement = True
-
-        if not improvement:
-            return
-
-        # Minimum distance check: SL must be at least 0.1% away from mark
-        min_dist = mark * 0.001
-        if is_long and (mark - trail_target) < min_dist:
-            return
-        if not is_long and (trail_target - mark) < min_dist:
-            return
-
-        # Apply the new trailed SL
-        try:
-            new_sl_str = self._round_price(trail_target)
-            # Cancel old SL
-            self._client.futures_cancel_algo_order(
-                symbol=SYMBOL, algoId=algo_id)
-            # Place new SL
-            opposite = "SELL" if is_long else "BUY"
-            resp = self._create_algo_order(
-                symbol=SYMBOL,
-                side=opposite,
-                type="STOP_MARKET",
-                triggerPrice=new_sl_str,
-                closePosition="true",
-                workingType="MARK_PRICE",
-            )
-            new_id = str(resp.get("clientAlgoId", "") or resp.get("algoId", ""))
-            with self._lock:
-                self._trailing_sl_price = trail_target
-                self._trailing_algo_id = new_id
-            log.info(
-                f"[Trail] SL actualizado → ${trail_target:,.0f} "
-                f"(mark=${mark:,.0f}) | mejora ${current_sl:,.0f}→${trail_target:,.0f}")
-        except Exception as exc:
-            log.warning(f"[Trail] Update error: {exc}")
 
     # ── Internals ───────────────────────────────────────────────────────────
 
@@ -727,12 +727,72 @@ class OrderExecutor(QThread):
         side = "BUY" if direction.upper() == "ALZA" else "SELL"
         opposite_side = "SELL" if side == "BUY" else "BUY"
 
-        # ── 0. Dynamic leverage override ─────────────────────────────────
+        # ── 0. HARD GATE: live position check against Binance ────────────────
+        # Must be the FIRST thing after parsing the task, before any
+        # modification (margin type, leverage, bracket) to prevent ping-pong
+        # regardless of call origin (UI or Telegram).
+        live_pos = self.check_position_status()
+        if live_pos is not None:
+            pos_amt = float(live_pos.get("positionAmt", 0))
+            pos_side = "LONG" if pos_amt > 0 else "SHORT"
+            msg = (
+                f"🛡️ [BB-450 SECURITY RISK] Orden rechazada. "
+                f"El Executor detectó una posición activa en Binance: "
+                f"{pos_side} {abs(pos_amt):.4f} BTC. "
+                f"Evitando efecto Ping-Pong."
+            )
+            log.warning(f"[OrderExec] {msg}")
+            self.order_result.emit(
+                False, msg,
+                {"environment": env_tag,
+                 "direction": direction,
+                 "error": msg,
+                 "confidence": confidence,
+                 "dynamic_leverage": 0},
+            )
+            return
+
+        # ── 0. Modo CROSSED ──────────────────────────────────────────────────
+        try:
+            self._client.futures_change_margin_type(
+                symbol=settings.get_symbol(), marginType="CROSSED")
+            log.info("[OrderExec] Margin type → CROSSED")
+        except BinanceAPIException as _me:
+            if getattr(_me, "code", 0) != -4046:
+                log.warning(f"[OrderExec] Margin type warning: {_me}")
+            # -4046 = already in CROSSED, ignorar silenciosamente
+
+        # ── 0b. Apalancamiento fijo desde settings ─────────────────────────
+        leverage = settings.LEVERAGE
+        log.info(f"[OrderExec] Leverage fijo: {leverage}x")
+
+        # ── 0c. Capital / size según USE_ALL_IN ─────────────────────────────
+        use_all_in = getattr(settings, "USE_ALL_IN", False)
+        if use_all_in:
+            bal = self.get_balance()
+            available_bal = bal.get("available", 0.0) if bal.get("success") else 0.0
+            if available_bal <= 0:
+                msg = "[REAL] USE_ALL_IN activo pero balance disponible es 0"
+                log.error(f"[OrderExec] {msg}")
+                self.order_result.emit(False, msg, {"error": msg})
+                return
+            # 90 % del balance disponible (evita usar unrealized PnL)
+            capital = available_bal * 0.90
+            log.info(f"[OrderExec] USE_ALL_IN: capital={capital:.2f} USDT "
+                     f"(90% de {available_bal:.2f} disponibles)")
+        else:
+            # Usar GLOBAL_TRADE_AMOUNT si está definido y es > 0
+            gta = getattr(settings, "GLOBAL_TRADE_AMOUNT", 0.0)
+            if gta > 0:
+                capital = gta
+
+        # ── 1. Dynamic leverage override (confidence path — legacy) ──────────
         used_dynamic = False
         dynamic_confidence = confidence
         if confidence >= 0:
-            bal = self.get_balance()
-            live_balance = bal.get("balance", 0.0) if bal.get("success") else max(capital, 100)
+            bal_info = self.get_balance()
+            live_balance = (bal_info.get("balance", 0.0)
+                            if bal_info.get("success") else max(capital, 100))
             dyn_lev, risk_pct = self.calculate_dynamic_leverage(confidence)
             if dyn_lev == 0:
                 msg = (f"[{env_tag}] Señal rechazada — confianza {confidence:.0f}% "
@@ -745,18 +805,28 @@ class OrderExecutor(QThread):
                      "confidence": confidence, "dynamic_leverage": 0},
                 )
                 return
-            leverage = dyn_lev
+            # El path de confianza sobreescribe capital, pero el apalancamiento
+            # reactivo siempre tiene prioridad sobre el confidence-based.
             capital = live_balance * risk_pct
             used_dynamic = True
-            log.info(f"[OrderExec] Dynamic leverage → {leverage}x "
-                     f"(confianza={confidence:.0f}%, riesgo={risk_pct*100:.1f}%, "
+            log.info(f"[OrderExec] Dynamic (confidence) → {dyn_lev}x "
+                     f"(conf={confidence:.0f}%, riesgo={risk_pct*100:.1f}%, "
                      f"capital=${capital:.2f})")
 
-        # ── 1. Set leverage ──────────────────────────────────────────────
+        log.info(f"[OrderExec] Leverage final: {leverage}x")
+
+
+        min_lev = math.ceil(0.001 * entry_price / max(capital, 0.01))
+        if leverage < min_lev:
+            leverage = min(max(leverage, min_lev), 40)
+            log.info(f"[OrderExec] Leverage boosted to {leverage}x "
+                     f"(capital=${capital:.2f}, price=${entry_price:.0f})")
+
+        # ── 2. Set leverage ──────────────────────────────────────────────
         for attempt in range(MAX_RETRIES):
             try:
                 self._client.futures_change_leverage(
-                    symbol=SYMBOL, leverage=leverage
+                    symbol=settings.get_symbol(), leverage=leverage
                 )
                 log.info(f"[OrderExec] Leverage set to {leverage}x")
                 break
@@ -789,78 +859,100 @@ class OrderExecutor(QThread):
                     return
                 time.sleep(RETRY_DELAY_S)
 
-        # ── 2. Calculate quantity ────────────────────────────────────────
+        # ── 3. Calcular cantidad (size) ──────────────────────────────────────
         raw_qty = (capital * leverage) / entry_price
+        if use_all_in:
+            raw_qty = math.floor(raw_qty * 1000) / 1000
         quantity_str = self._round_quantity(raw_qty)
         quantity_val = float(quantity_str)
-        if quantity_val <= 0:
+        if quantity_val <= 0 or quantity_val < 0.001:
             self.order_result.emit(
                 False,
-                f"[{env_tag}] Quantity too small: {raw_qty:.6f} → {quantity_str}",
-                {"environment": env_tag, "raw_qty": raw_qty, "quantity": quantity_str},
+                f"[{env_tag}] Cantidad inválida: raw={raw_qty:.6f} → "
+                f"formateada={quantity_str} — "
+                f"mínimo requerido es 0.001 BTC. "
+                f"Prueba con más capital o menor precio de entrada.",
+                {"environment": env_tag, "raw_qty": raw_qty,
+                 "quantity": quantity_str, "min_required": 0.001},
             )
             return
 
-        # ── 3. MARKET entry ──────────────────────────────────────────────
-        entry_order_id = None
-        entry_fill_price_val = entry_price
-        for attempt in range(MAX_RETRIES):
-            try:
-                entry_resp = self._fapi_create_order(
-                    symbol=SYMBOL,
-                    side=side,
-                    type="MARKET",
-                    quantity=quantity_str,
+        # ── 3b. Verificar margen disponible antes de enviar ─────────────────
+        bal_info = self.get_balance()
+        available_bal = bal_info.get("available", 0.0) if bal_info.get("success") else 0.0
+        required_margin = (quantity_val * entry_price) / leverage
+        if available_bal > 0 and required_margin > available_bal:
+            max_qty_by_bal = (available_bal * leverage) / entry_price
+            max_qty_by_bal = math.floor(max_qty_by_bal * 1000) / 1000  # truncar a 0.001
+            if max_qty_by_bal < 0.001:
+                self.order_result.emit(
+                    False,
+                    f"[{env_tag}] Margen insuficiente — "
+                    f"se requieren ${required_margin:.2f} pero hay ${available_bal:.2f} disponibles. "
+                    f"Deposita más USDT en tu wallet de Futuros o reduce el apalancamiento.",
+                    {"environment": env_tag, "direction": direction,
+                     "error": f"Margin insufficient: need ${required_margin:.2f}, have ${available_bal:.2f}",
+                     "required_margin": required_margin, "available_balance": available_bal},
                 )
-                entry_order_id = str(entry_resp.get("orderId", ""))
-                avg_price_raw = entry_resp.get("avgPrice", str(entry_price))
-                try:
-                    entry_fill_price_val = float(avg_price_raw)
-                except (ValueError, TypeError):
-                    entry_fill_price_val = entry_price
-                if entry_fill_price_val <= 0:
-                    entry_fill_price_val = entry_price
-                entry_fill_price_str = self._round_price(entry_fill_price_val)
-                log.info(
-                    f"[OrderExec] MARKET {side} {quantity_val:.4f} BTC @ "
-                    f"{entry_fill_price_val:.2f} -> id {entry_order_id}"
-                )
-                with self._lock:
-                    self._last_trade_time = time.time()
-                break
-            except BinanceAPIException as exc:
-                code = getattr(exc, "code", "?")
-                msg = getattr(exc, "message", str(exc))
-                err_str = f"BinanceAPIException [{code}]: {msg}"
-                log.warning(f"[OrderExec] Entry attempt {attempt+1} — {err_str}")
-                if attempt == MAX_RETRIES - 1:
-                    self.order_result.emit(
-                        False,
-                        f"[{env_tag}] Entry error [{code}]: {msg}",
-                        {
-                            "environment": env_tag,
-                            "direction": direction,
-                            "quantity": quantity_str,
-                            "error": err_str,
-                        },
-                    )
-                    return
-                time.sleep(RETRY_DELAY_S)
-            except Exception as exc:
-                log.warning(f"[OrderExec] Entry attempt {attempt + 1} failed: {exc}")
-                if attempt == MAX_RETRIES - 1:
-                    self.order_result.emit(
-                        False,
-                        f"[{env_tag}] Entry error: {exc}",
-                        {
-                            "environment": env_tag,
-                            "direction": direction,
-                            "quantity": quantity_str,
-                            "error": str(exc),
-                        },
-                    )
-                    return
-                time.sleep(RETRY_DELAY_S)
+                return
+            quantity_val = max_qty_by_bal
+            quantity_str = self._round_quantity(quantity_val)
+            log.info(
+                f"[OrderExec] Cantidad reducida por margen: "
+                f"{quantity_val:.4f} BTC (max posible con ${available_bal:.2f})"
+            )
+
+        # ── 3. Split MARKET entry (Mejora 1: 3 micro-tickets) ────────────
+        entry_data = self._execute_split_entry(side, quantity_val, quantity_str, leverage, entry_price)
+        entry_order_id = entry_data.get("order_id", "")
+        entry_fill_price_val = entry_data.get("fill_price", entry_price)
+        entry_all_ids = entry_data.get("all_order_ids", [])
+        quantity_val = entry_data.get("total_qty", quantity_val)  # real fill qty
+        quantity_str = self._round_quantity(quantity_val)
+
+        if not entry_order_id:
+            self.order_result.emit(
+                False,
+                f"[{env_tag}] Split entry failed — all tickets rejected",
+                {"environment": env_tag, "direction": direction,
+                 "quantity": quantity_str, "error": "Split entry failed"},
+            )
+            return
+
+        # ── Recalculate SL/TP based on average fill price ──
+        atr = task.get("atr", 0.0)
+        wall_bid = task.get("wall_bid", 0.0)
+        wall_ask = task.get("wall_ask", 0.0)
+        if atr > 0:
+            atr_colchon = max(atr, entry_fill_price_val * 0.002) * 1.5
+            if side == "BUY":
+                new_sl = entry_fill_price_val - atr_colchon
+                if wall_bid > 0:
+                    new_sl = min(new_sl, wall_bid - 5)
+                sl_price = new_sl
+                tp_price = entry_fill_price_val * 1.02
+            else:
+                new_sl = entry_fill_price_val + atr_colchon
+                if wall_ask > 0:
+                    new_sl = max(new_sl, wall_ask + 5)
+                sl_price = new_sl
+                tp_price = entry_fill_price_val * 0.98
+            log.info(
+                f"[OrderExec] SL/TP recalculated from fill ${entry_fill_price_val:.2f}: "
+                f"SL=${sl_price:.2f} TP=${tp_price:.2f}"
+            )
+
+            vol_buffer = entry_fill_price_val * 0.0005
+            if atr > 0 and atr > entry_fill_price_val * 0.005:
+                vol_buffer = entry_fill_price_val * 0.0008
+            if side == "BUY":
+                sl_price = min(sl_price, sl_price - vol_buffer)
+            else:
+                sl_price = max(sl_price, sl_price + vol_buffer)
+            log.info(
+                f"[OrderExec] SL buffer applied ({vol_buffer:.2f}): "
+                f"SL=${sl_price:.2f}"
+            )
 
         # ── 4. SL + TP bracket (Algo Service) ───────────────────────────
         # Binance migró las órdenes condicionales al endpoint
@@ -882,7 +974,7 @@ class OrderExecutor(QThread):
             for attempt in range(MAX_RETRIES):
                 try:
                     sl_resp = self._create_algo_order(
-                        symbol=SYMBOL,
+                        symbol=settings.get_symbol(),
                         side=opposite_side,
                         type="STOP_MARKET",
                         triggerPrice=rounded_sl_str,
@@ -915,7 +1007,7 @@ class OrderExecutor(QThread):
             for attempt in range(MAX_RETRIES):
                 try:
                     tp_resp = self._create_algo_order(
-                        symbol=SYMBOL,
+                        symbol=settings.get_symbol(),
                         side=opposite_side,
                         type="TAKE_PROFIT_MARKET",
                         triggerPrice=rounded_tp_str,
@@ -943,63 +1035,258 @@ class OrderExecutor(QThread):
         else:
             bracket_errors.append("TP price <= 0 — skipped")
 
-        # ── 5. Trailing stop activation (replace static SL with dynamic) ──
-        use_trailing = self._trailing_enabled and sl_order_id
-        if use_trailing:
-            with self._lock:
-                self._trail_activated = False
-                self._trailing_sl_price = float(rounded_sl_str) if sl_order_id else 0.0
-                self._trailing_algo_id = sl_order_id
-            # Do NOT set a TP — trailing will manage the exit dynamically.
-            # Cancel TP if it was placed
-            if tp_order_id:
-                try:
-                    self._client.futures_cancel_algo_order(
-                        symbol=SYMBOL, algoId=tp_order_id)
-                    log.info(f"[OrderExec] TP cancelado para trailing — id={tp_order_id}")
-                except Exception:
-                    pass
-                tp_order_id = ""
-                rounded_tp_str = "0"
-            msg_trail = " | TRAILING ACTIVADO"
-        else:
-            msg_trail = ""
-
-        # ── 6. Emit result ──────────────────────────────────────────────
+        # ── 5. Emit result ──────────────────────────────────────────────
+        open_ts = datetime.now(timezone.utc).isoformat()
         result_data = {
+            "type": "order_execution",
+            "event": "open",
             "environment": env_tag,
-            "direction": direction,
-            "entry_qty": quantity_val,
+            "direction": side,
             "entry_price": entry_fill_price_val,
+            "qty_btc": quantity_val,
+            "margen_usdt": capital,
+            "apalancamiento": settings.LEVERAGE,
             "sl_price": float(rounded_sl_str),
             "tp_price": float(rounded_tp_str),
             "entry_order_id": entry_order_id,
+            "entry_all_ids": entry_all_ids,
+            "total_qty": quantity_val,
             "sl_order_id": sl_order_id,
             "tp_order_id": tp_order_id,
             "leverage": leverage,
             "capital": capital,
-            "trailing_active": use_trailing,
             "confidence": confidence,
             "dynamic_leverage": leverage if used_dynamic else 0,
+            "reactive_leverage": leverage,
+            "use_all_in": use_all_in,
+            "open_timestamp": open_ts,
+            "delta_entrada": task.get("delta", 0),
+            "cvd_entrada": task.get("cvd", 0),
+            "filtro_entrada": task.get("entry_filter", ""),
         }
         if bracket_errors:
             result_data["bracket_errors"] = "; ".join(bracket_errors)
 
-        success = bool(entry_order_id)
-        msg = (
+        success = bool(entry_order_id) and not bracket_errors
+        msg_parts = [
             f"[{env_tag}] {'✅' if success else '❌'} "
-            f"{direction} {quantity_val:.4f} BTC @ {entry_fill_price_val:.2f} "
-            f"| SL {result_data['sl_price']:.2f} | TP {result_data['tp_price']:.2f} "
+            f"{direction} {quantity_val:.4f} BTC @ {entry_fill_price_val:.2f}",
+            f"| SL {result_data['sl_price']:.2f} | TP {result_data['tp_price']:.2f}",
             f"| IDs: entry={entry_order_id} "
-            f"sl={sl_order_id or 'FAIL'} tp={tp_order_id or 'FAIL'}"
-            f"{msg_trail}"
-        )
+            f"split_tickets={len(entry_all_ids)} "
+            f"sl={sl_order_id or 'FAIL'} tp={tp_order_id or 'FAIL'}",
+        ]
+        if bracket_errors and entry_order_id:
+            msg_parts.append(
+                "⚠️ POSICIÓN ABIERTA SIN PROTECCIÓN: "
+                + "; ".join(bracket_errors)
+            )
+            log.critical(
+                "[OrderExec] POSICIÓN SIN BRACKET — entry=%s OK pero SL/TP "
+                "fallaron. Errores: %s",
+                entry_order_id, "; ".join(bracket_errors))
+        msg = " ".join(msg_parts)
         self.order_result.emit(success, msg, result_data)
+
+        # ── 6. Start position-close polling on successful open ─────────
+        if success and result_data["event"] == "open":
+            self._has_open_position = True
+            self._open_position_data = {
+                "entry_price": entry_fill_price_val,
+                "qty_btc": quantity_val,
+                "direction": side,
+                "sl_price": float(rounded_sl_str),
+                "tp_price": float(rounded_tp_str),
+                "capital": capital,
+                "leverage": settings.LEVERAGE,
+                "open_timestamp": open_ts,
+                "delta_entrada": task.get("delta", 0),
+                "cvd_entrada": task.get("cvd", 0),
+                "filtro_entrada": task.get("entry_filter", ""),
+                "max_pnl": 0.0,
+            }
+            self._start_close_polling()
+
+    # ── Position-close polling ───────────────────────────────────────────
+    def _start_close_polling(self):
+        self._close_poll_flag = True
+
+    def _stop_close_polling(self):
+        self._close_poll_flag = False
+
+    def _poll_position_close(self):
+        """Check if open position closed, emit close snapshot if so."""
+        if not self._open_position_data:
+            self._close_poll_flag = False
+            return
+
+        # Snapshot current position state before check
+        last_pnl = self._position_info.get("unRealizedProfit", 0) if self._position_info else 0
+        last_mark = self._position_info.get("markPrice", 0) if self._position_info else 0
+        last_entry = self._position_info.get("entryPrice", 0) if self._position_info else 0
+        pos_open_before = self._has_open_position
+
+        pos = self.check_position_status()
+        pos_open_after = self._has_open_position
+
+        # Transitioned from open → closed
+        if pos_open_before and not pos_open_after:
+            open_data = self._open_position_data
+            self._open_position_data = None
+            self._close_poll_flag = False
+
+            # Best exit price estimate: use last mark or entry
+            exit_price = last_mark if last_mark > 0 else last_entry
+            pnl_real = float(last_pnl)
+            entry_px = open_data.get("entry_price", 0) or last_entry
+            cap = max(open_data.get("capital", 1), 1)
+            risk_btc = abs(entry_px - open_data.get("sl_price", 0)) if open_data.get("sl_price", 0) > 0 else 0
+            risk_usdt = risk_btc * open_data.get("qty_btc", 0)
+            duracion = 0
+            if "open_timestamp" in open_data:
+                try:
+                    ot = datetime.fromisoformat(open_data["open_timestamp"])
+                    duracion = (datetime.now(timezone.utc) - ot.replace(tzinfo=timezone.utc)).total_seconds()
+                except Exception:
+                    pass
+
+            motivo = "MANUAL"
+            if pnl_real > 0:
+                motivo = "TP"
+            elif pnl_real < 0:
+                motivo = "SL"
+
+            close_data = {
+                "type": "order_execution",
+                "event": "close",
+                "exit_price": exit_price,
+                "pnl_usdt": pnl_real,
+                "roe_pct": (pnl_real / cap) * 100 if cap > 0 else 0,
+                "motivo_cierre": motivo,
+                "duracion_segundos": duracion,
+                "rr_real": abs(pnl_real / risk_usdt) if risk_usdt > 0 else 0,
+                "close_timestamp": datetime.now(timezone.utc).isoformat(),
+                **open_data,
+            }
+            log.info(f"[OrderExec] Position closed — emitting close snapshot: "
+                     f"PnL=${pnl_real:+.2f} exit=${exit_price:.2f} motivo={motivo}")
+            self.order_result.emit(True, f"Posición cerrada — PnL ${pnl_real:+.2f}", close_data)
+            self.position_closed.emit(close_data)
+
+    # ── Mejora 1: Split entry en 3 micro-tickets ─────────────────────────
+    def _execute_split_entry(self, side, total_qty, total_qty_str, leverage, entry_price):
+        base_qty = total_qty / SPLIT_ENTRY_TICKETS
+        base_qty = max(base_qty, 0.001)
+
+        fills = []
+        all_ids = []
+
+        for i in range(SPLIT_ENTRY_TICKETS):
+            if i > 0:
+                time.sleep(SPLIT_ENTRY_PULLBACK_WAIT_SEC)
+
+            # Tramo 3: qty_restante = total_qty - sum(fills)
+            if i == SPLIT_ENTRY_TICKETS - 1:
+                qty_ya_ejecutada = sum(float(f.get('executedQty', 0)) for f in fills)
+                qty_restante = max(total_qty - qty_ya_ejecutada, 0.001)
+                qty_restante = min(qty_restante, total_qty * 0.36)
+                qty_str = self._round_quantity(qty_restante)
+            else:
+                qty_str = self._round_quantity(base_qty)
+            qty_val = float(qty_str)
+
+            resp = self._place_market(side, qty_str, leverage)
+            if resp is None:
+                # Fallback: MARKET inmediato
+                log.warning(f"[OrderExec] Split ticket {i+1} timeout — fallback MARKET")
+                try:
+                    resp = self._fapi_create_order(
+                        symbol=settings.get_symbol(), side=side, type="MARKET", quantity=qty_str,
+                    )
+                except Exception as exc:
+                    log.warning(f"[OrderExec] Fallback MARKET ticket {i+1} failed: {exc}")
+                    continue
+                if not resp or not resp.get("orderId"):
+                    log.warning(f"[OrderExec] Fallback MARKET ticket {i+1} no orderId")
+                    continue
+
+            order_id = str(resp.get("orderId", ""))
+            all_ids.append(order_id)
+
+            avg_price_raw = resp.get("avgPrice", str(entry_price))
+            try:
+                fill_price = float(avg_price_raw)
+            except (ValueError, TypeError):
+                fill_price = entry_price
+            if fill_price <= 0:
+                fill_price = entry_price
+
+            executed_raw = resp.get("executedQty", qty_str)
+            try:
+                fill_qty = float(executed_raw)
+            except (ValueError, TypeError):
+                fill_qty = qty_val
+
+            # Precio teórico del tramo (con pullback esperado)
+            if i == 0:
+                precio_teorico = entry_price
+            elif i < SPLIT_ENTRY_TICKETS - 1:
+                precio_teorico = entry_price * (1 - SPLIT_ENTRY_PULLBACK_PCT) if side.upper() == "BUY" else entry_price * (1 + SPLIT_ENTRY_PULLBACK_PCT)
+            else:
+                precio_teorico = entry_price
+
+            slippage_pct = (fill_price - precio_teorico) / max(precio_teorico, 1) * 100
+            log.info(
+                f"[OrderExec] Split fill {i+1}/{SPLIT_ENTRY_TICKETS}: "
+                f"qty={fill_qty:.4f} @ {fill_price:.2f} "
+                f"slippage={slippage_pct:.3f}% id={order_id}"
+            )
+
+            fills.append({"qty": fill_qty, "price": fill_price, "order_id": order_id, "executedQty": executed_raw})
+
+        with self._lock:
+            self._last_trade_time = time.time()
+
+        if not fills:
+            raise RuntimeError(f"Split entry failed: 0/{SPLIT_ENTRY_TICKETS} tickets filled")
+
+        total_qty_filled = sum(f['qty'] for f in fills)
+        avg_fill = sum(f['price'] for f in fills) / len(fills)
+
+        return {
+            "order_id": all_ids[0],
+            "fill_price": avg_fill,
+            "all_order_ids": all_ids,
+            "total_qty": total_qty_filled,
+        }
+
+    def _place_market(self, side, quantity_str, leverage):
+        for attempt in range(MAX_RETRIES):
+            try:
+                return self._fapi_create_order(
+                    symbol=settings.get_symbol(),
+                    side=side,
+                    type="MARKET",
+                    quantity=quantity_str,
+                )
+            except BinanceAPIException as exc:
+                code = getattr(exc, "code", "?")
+                msg = getattr(exc, "message", str(exc))
+                log.warning(f"[OrderExec] MARKET {side} attempt {attempt+1}: [{code}] {msg}")
+                if attempt == MAX_RETRIES - 1:
+                    return None
+                time.sleep(RETRY_DELAY_S)
+            except Exception as exc:
+                log.warning(f"[OrderExec] MARKET {side} attempt {attempt+1}: {exc}")
+                if attempt == MAX_RETRIES - 1:
+                    return None
+                time.sleep(RETRY_DELAY_S)
+        return None
 
     # ── Direct UI operations (bypass queue, immediate API calls) ───────────
 
     def change_margin_type(self, margin_type: str) -> dict:
-        """Set ISOLATED or CROSSED margin mode for SYMBOL.
+        """Set ISOLATED or CROSSED margin mode for the current symbol.
         Returns dict with success bool. Errors are silent (already-set is not fatal).
         """
         result = {"success": False, "margin_type": margin_type}
@@ -1007,7 +1294,7 @@ class OrderExecutor(QThread):
             return result
         try:
             self._client.futures_change_margin_type(
-                symbol=SYMBOL, marginType=margin_type.upper())
+                symbol=settings.get_symbol(), marginType=margin_type.upper())
             result["success"] = True
             log.info(f"[OrderExec] Margin type → {margin_type.upper()}")
         except BinanceAPIException as exc:
@@ -1021,13 +1308,13 @@ class OrderExecutor(QThread):
         return result
 
     def change_leverage_direct(self, leverage: int) -> dict:
-        """Set leverage for SYMBOL directly (not via queue)."""
+        """Set leverage for the current symbol directly (not via queue)."""
         result = {"success": False, "leverage": leverage}
         if self._client is None:
             return result
         try:
             self._client.futures_change_leverage(
-                symbol=SYMBOL, leverage=leverage)
+                symbol=settings.get_symbol(), leverage=leverage)
             result["success"] = True
             log.info(f"[OrderExec] Leverage → {leverage}x")
         except Exception as exc:
@@ -1056,14 +1343,32 @@ class OrderExecutor(QThread):
         if self._client is None:
             result["message"] = "Client not initialised"
             return result
+        if quantity < 0.001:
+            quantity = 0.001
         qty_str = self._round_quantity(quantity)
         qty_val = float(qty_str)
         if qty_val <= 0:
             result["message"] = f"Quantity too small: {quantity}"
             return result
+
+        # ── HARD GATE: live position check (skip if reduce_only) ──────────────
+        if not reduce_only:
+            live_pos = self.check_position_status()
+            if live_pos is not None:
+                pos_amt = float(live_pos.get("positionAmt", 0))
+                pos_side = "LONG" if pos_amt > 0 else "SHORT"
+                result["message"] = (
+                    f"🛡️ [BB-450 SECURITY RISK] Orden rechazada. "
+                    f"El Executor detectó una posición activa en Binance: "
+                    f"{pos_side} {abs(pos_amt):.4f} BTC. "
+                    f"Evitando efecto Ping-Pong."
+                )
+                log.warning(f"[OrderExec] {result['message']}")
+                return result
+
         try:
             params = {
-                "symbol": SYMBOL,
+                "symbol": settings.get_symbol(),
                 "side": side.upper(),
                 "type": "MARKET",
                 "quantity": qty_str,
@@ -1109,6 +1414,14 @@ class OrderExecutor(QThread):
             code = getattr(exc, "code", "?")
             msg = getattr(exc, "message", str(exc))
             log.error(f"[OrderExec] BinanceAPIException [{code}]: {msg}")
+
+            if code == -2019:
+                bal = self.get_balance()
+                log.error(
+                    f"[OrderExec] ERROR -2019: Margen insuficiente. "
+                    f"Balance disponible: ${bal.get('available', 0):.2f}, "
+                    f"Wallet: ${bal.get('balance', 0):.2f}"
+                )
             raise
         except BinanceRequestException as exc:
             log.error(f"[OrderExec] BinanceRequestException: {exc}")

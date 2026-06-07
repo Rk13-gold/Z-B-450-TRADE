@@ -30,9 +30,24 @@ class SupabaseManager:
                 exit_time TEXT,
                 duration_seconds INTEGER,
                 status TEXT,
+                outcome TEXT,
+                closed_at TEXT,
+                leverage_used INTEGER,
                 created_at TEXT NOT NULL
             )
         ''')
+
+        # ── Migración de columnas para DBs existentes ─────────────────────
+        _new_cols = {
+            "outcome":      "TEXT",
+            "closed_at":    "TEXT",
+            "leverage_used": "INTEGER",
+        }
+        existing = {row[1] for row in cursor.execute("PRAGMA table_info(trades)")}
+        for col, col_type in _new_cols.items():
+            if col not in existing:
+                cursor.execute(f"ALTER TABLE trades ADD COLUMN {col} {col_type}")
+                print(f"[DB] Columna '{col}' agregada a la tabla trades")
 
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS signals (
@@ -68,13 +83,28 @@ class SupabaseManager:
         return True
 
     async def save_trade(self, trade: Dict) -> bool:
+        """Guarda un trade en la DB local con soporte completo de outcome/leverage."""
         try:
             cursor = self.conn.cursor()
+            # Derivar outcome si no viene explícito
+            outcome = trade.get('outcome')  # 'TP', 'SL', o None
+            if outcome is None:
+                pnl = trade.get('pnl', 0)
+                if pnl is not None:
+                    outcome = 'TP' if pnl > 0 else ('SL' if pnl < 0 else None)
+
+            closed_at = (
+                trade.get('closed_at')
+                or trade.get('exit_time')
+                or datetime.now().isoformat()
+            )
+
             cursor.execute('''
                 INSERT INTO trades (
                     symbol, side, entry_price, exit_price, quantity, pnl,
-                    entry_time, exit_time, duration_seconds, status, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    entry_time, exit_time, duration_seconds, status,
+                    outcome, closed_at, leverage_used, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 trade.get('symbol', settings.SYMBOL),
                 trade.get('side'),
@@ -86,13 +116,51 @@ class SupabaseManager:
                 trade.get('exit_time', datetime.now().isoformat()),
                 trade.get('duration', 0),
                 trade.get('status', 'closed'),
-                datetime.now().isoformat()
+                outcome,
+                closed_at,
+                trade.get('leverage_used'),
+                datetime.now().isoformat(),
             ))
             self.conn.commit()
-            print(f"💾 Trade guardado: {trade.get('side')} | PnL: ${trade.get('pnl', 0):.2f}")
+            print(f"💾 Trade guardado: {trade.get('side')} | PnL: ${trade.get('pnl', 0):.2f} | outcome={outcome}")
             return True
         except Exception as e:
             print(f"❌ Error guardando trade: {e}")
+            return False
+
+    def close_trade(self, trade_id: int, outcome: str, exit_price: float,
+                    pnl: float, leverage_used: int = 0) -> bool:
+        """Actualiza un trade abierto con su resultado final (TP/SL).
+
+        Llama a este método cuando el sistema detecta que un trade cerró,
+        ya sea por TP, SL o cierre manual, para que el historial de
+        apalancamiento reactivo quede correcto.
+
+        Parameters
+        ----------
+        trade_id    : ID del trade (columna id de la tabla trades)
+        outcome     : 'TP' o 'SL'
+        exit_price  : precio de cierre
+        pnl         : PnL realizado en USDT
+        leverage_used: apalancamiento con el que se abrió
+        """
+        try:
+            cursor = self.conn.cursor()
+            now = datetime.now().isoformat()
+            cursor.execute(
+                """
+                UPDATE trades
+                SET outcome=?, closed_at=?, exit_price=?, pnl=?,
+                    leverage_used=?, status='closed'
+                WHERE id=?
+                """,
+                (outcome, now, exit_price, pnl, leverage_used or None, trade_id),
+            )
+            self.conn.commit()
+            print(f"🔄 Trade #{trade_id} cerrado: {outcome} | PnL=${pnl:+.2f} | lev={leverage_used}x")
+            return cursor.rowcount > 0
+        except Exception as e:
+            print(f"❌ Error cerrando trade #{trade_id}: {e}")
             return False
 
     async def save_signal(self, signal: Dict) -> bool:

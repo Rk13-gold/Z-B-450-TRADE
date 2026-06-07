@@ -516,6 +516,26 @@ class BrainAgent:
         """
         brain = self._empty_decision(snapshot)
 
+        # ── Learning-mode guard: not enough episodic memories yet ─────────
+        MINIMUM_TRADES_FOR_INFERENCE = 200
+        episodic_count = len(self.episodic_memory.memories) if hasattr(self, 'episodic_memory') else 0
+        if episodic_count < MINIMUM_TRADES_FOR_INFERENCE:
+            brain.update({
+                "direction": "INCIERTO",
+                "confidence_pct": 0.0,
+                "prob_alza": 0.33,
+                "prob_baja": 0.33,
+                "prob_incierto": 0.34,
+                "learning_mode": True,
+                "trades_until_active": MINIMUM_TRADES_FOR_INFERENCE - episodic_count,
+            })
+            log.info(
+                "[BrainAgent] Learning mode — %d/%d trades, %d until active",
+                episodic_count, MINIMUM_TRADES_FOR_INFERENCE,
+                MINIMUM_TRADES_FOR_INFERENCE - episodic_count,
+            )
+            return brain
+
         try:
             # ── Anti-latency: validate snapshot freshness ─────────────────
             snap_time = snapshot.get('_snapshot_time', None)

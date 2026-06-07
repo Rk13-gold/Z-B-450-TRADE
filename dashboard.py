@@ -376,7 +376,7 @@ async def main():
     await loading()
     
     try:
-        client.futures_change_leverage(symbol="BTCUSDT", leverage=100)
+        client.futures_change_leverage(symbol="BTCUSDT", leverage=settings.LEVERAGE)
     except:
         pass
     

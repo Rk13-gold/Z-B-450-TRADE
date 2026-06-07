@@ -18,7 +18,7 @@ class BinanceClient:
             settings.BINANCE_REAL_SECRET_KEY,
             testnet=False
         )
-        self.symbol = settings.SYMBOL
+        self.symbol = settings.get_symbol()
 
         self.kline_callback: Optional[Callable] = None
         self.depth_callback: Optional[Callable] = None
@@ -226,6 +226,32 @@ class BinanceClient:
         except Exception as e:
             print(f"❌ Error al obtener precio: {e}")
             return 0.0
+
+    async def stop_streams(self):
+        """Cancel all active WebSocket tasks and reset reconnect state."""
+        for task in self._ws_tasks:
+            task.cancel()
+        self._ws_tasks.clear()
+        self._ws_reconnect_attempts.clear()
+        log.info("WebSocket streams stopped for %s", self.symbol)
+
+    async def start_streams(self, symbol: str = None):
+        """(Re)start WebSocket streams for the given symbol.
+
+        If symbol is None, keeps the current self.symbol.
+        Callback references remain intact; only the subscription URL changes.
+        """
+        if symbol is not None:
+            self.symbol = symbol
+        await self.stop_streams()
+        if self.kline_callback:
+            await self.start_kline_stream(self.kline_callback)
+        if self.depth_callback:
+            await self.start_depth_stream(self.depth_callback)
+        if self.trade_callback:
+            await self.start_trade_stream(self.trade_callback)
+        # Liquidation stream is global (!forceOrder@arr) — no restart needed
+        log.info("WebSocket streams started for %s", self.symbol)
 
     async def close_connection(self):
         self._running = False
