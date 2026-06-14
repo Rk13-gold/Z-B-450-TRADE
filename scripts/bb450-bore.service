@@ -1,0 +1,20 @@
+[Unit]
+Description=BB-450 Bore Tunnel (WebSocket proxy to bore.pub)
+After=network-online.target bb450-dashboard.service
+Wants=network-online.target
+BindsTo=bb450-dashboard.service
+
+[Service]
+Type=simple
+User=RK13
+Group=RK13
+WorkingDirectory=/home/RK13/RK13/BB-450
+ExecStart=/home/RK13/RK13/BB-450/scripts/bb450-bore.sh
+Restart=always
+RestartSec=5
+Environment="BORE_PORT_FILE=/tmp/bb450/bore_port.txt"
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

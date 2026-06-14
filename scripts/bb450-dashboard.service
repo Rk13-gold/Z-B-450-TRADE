@@ -1,0 +1,19 @@
+[Unit]
+Description=BB-450 Dashboard (WebSocket server + GUI)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=RK13
+Group=RK13
+WorkingDirectory=/home/RK13/RK13/BB-450
+ExecStart=/home/RK13/RK13/BB-450/scripts/bb450-dashboard.sh
+Restart=always
+RestartSec=10
+Environment="PYTHONUNBUFFERED=1"
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
