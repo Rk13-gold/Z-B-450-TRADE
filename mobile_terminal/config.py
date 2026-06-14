@@ -5,14 +5,14 @@ Todas las constantes editables por el usuario están aquí.
 """
 
 # ── WebSocket ────────────────────────────────────────────────────────────
-# Opción A — Tailscale (IP fija, recomendado):
+# Opción A — Tailscale (IP fija si el teléfono también tiene Tailscale):
 WS_HOST: str = "100.97.238.10"
 WS_PORT: int = 8765
 
-# Opción B — ngrok (si Tailscale no funciona):
-#   1. En el PC:  ngrok tcp 8765  →  te da 0.tcp.ngrok.io:12345
-#   2. Descomenta la línea de abajo y pon la URL de ngrok
-# WS_URI: str = "ws://0.tcp.ngrok.io:12345"
+# Opción B — bore (no necesita nada en el teléfono):
+#   1. En el PC:  bore local 8765 --to bore.pub
+#   2. Descomenta la línea de abajo con el puerto que te dé
+WS_URI: str = "ws://bore.pub:8806"
 
 # Si WS_URI no está definido, se construye desde WS_HOST:WS_PORT
 try:
