@@ -5,10 +5,20 @@ Todas las constantes editables por el usuario están aquí.
 """
 
 # ── WebSocket ────────────────────────────────────────────────────────────
-# IP del PC donde corre el dashboard BB-450 (Tailscale — funciona desde cualquier red).
+# Opción A — Tailscale (IP fija, recomendado):
 WS_HOST: str = "100.97.238.10"
 WS_PORT: int = 8765
-WS_URI: str = f"ws://{WS_HOST}:{WS_PORT}"
+
+# Opción B — ngrok (si Tailscale no funciona):
+#   1. En el PC:  ngrok tcp 8765  →  te da 0.tcp.ngrok.io:12345
+#   2. Descomenta la línea de abajo y pon la URL de ngrok
+# WS_URI: str = "ws://0.tcp.ngrok.io:12345"
+
+# Si WS_URI no está definido, se construye desde WS_HOST:WS_PORT
+try:
+    WS_URI
+except NameError:
+    WS_URI = f"ws://{WS_HOST}:{WS_PORT}"
 
 # Re-intento de conexión
 WS_RECONNECT_DELAY: float = 5.0   # segundos entre reintentos

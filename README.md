@@ -73,4 +73,4 @@ No es una señal más. Es el **modo carnicero** para 1 minuto:
 
 Para el trader que ya sabe que los indicadores tradicionales (RSI, MACD, BB) son el reflejo, no la causa. La causa está en el **order book**, en el **delta**, en las **órdenes que se cancellan apenas aparecen**.
 
-BB-450 te trae esa causa a Telegram. Cada minuto. Sin dormir. Sin quejarse.
+BB-450 te trae esa causa a Telegram. Cada minuto. Sin dormir. Sin quejarse...
