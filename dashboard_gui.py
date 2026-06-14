@@ -8381,6 +8381,7 @@ class MainDashboard(QMainWindow):
                 "signal_diagnostics": getattr(self.battle_bar, 'signal_diagnostics', []) if hasattr(self, 'battle_bar') else [],
                 "uptime": self.stats.get('uptime_seconds', 0),
                 "timestamp": self.stats.get('last_update', ''),
+                "bore_port": self._get_bore_port(),
             }
 
         def _ws_on_command(data: dict) -> dict:
@@ -8590,7 +8591,15 @@ class MainDashboard(QMainWindow):
         self._last_pos_pnl: float = 0.0
         self._last_pos_entry_price: float = 0.0
         self._last_pos_exit_price: float = 0.0
-    
+
+    def _get_bore_port(self) -> int:
+        """Read current bore tunnel port from file (set by bb450-bore service)."""
+        try:
+            with open("/tmp/bb450/bore_port.txt") as f:
+                return int(f.read().strip())
+        except (FileNotFoundError, ValueError, OSError):
+            return 0
+
     def init_ui(self):
         self.panels = {}
         self.setWindowTitle("BB-450 REELS MODE")
