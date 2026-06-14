@@ -21,8 +21,8 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
-# Local constant (mirrors quantum_brain.N_FEATURES = 39 num + 11 cat = 50)
-N_FEATURES = 50
+# Local constant (mirrors quantum_brain.N_FEATURES = 44 num + 11 cat = 55)
+N_FEATURES = 55
 
 log = logging.getLogger(__name__)
 
@@ -61,7 +61,7 @@ class KnowledgeIndex:
             for b in blocks:
                 vec = self._embed(b)
                 embed_list.append(vec)
-            self.embeddings = torch.stack(embed_list)  # (N, 50)
+            self.embeddings = torch.stack(embed_list)  # (N, 55)
 
         log.info("[KnowledgeIndex] %d bloques indexados (%.1f KB, "
                  "matriz %s)", len(blocks), self.total_bytes / 1024,
@@ -85,8 +85,8 @@ class KnowledgeIndex:
 
         k = min(top_k, len(self.blocks))
         sims = F.cosine_similarity(
-            self.embeddings,                    # (N, 50)
-            query_vec.unsqueeze(0)               # (1, 50)
+            self.embeddings,                    # (N, 55)
+            query_vec.unsqueeze(0)               # (1, 55)
         )  # (N,)
 
         vals, idx = sims.topk(k)

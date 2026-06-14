@@ -10,7 +10,7 @@ from src.engine.binance_client import binance_client
 from src.engine.order_flow import order_flow_engine
 from src.engine.strategy import trading_strategy
 from src.engine.ai_analyst import ai_analyst
-from src.database.supabase_manager import supabase_manager
+from src.database.supabase_manager import local_trade_db
 
 
 console = Console()
@@ -62,7 +62,7 @@ class TradingBot:
                 self.mock_mode = True
                 await self._init_mock_data()
 
-        supabase_manager.connect()
+        local_trade_db.connect()
         console.print("✅ [green]Sistema inicializado[/green]")
 
     async def _init_mock_data(self):
@@ -216,7 +216,7 @@ class TradingBot:
             'duration': (datetime.now() - self.entry_time).seconds
         }
 
-        await supabase_manager.save_trade(trade_data)
+        await local_trade_db.save_trade(trade_data)
 
         self.daily_pnl += pnl
         console.print(f"💰 [bold]PnL: ${pnl:.2f}[/bold] | Daily: ${self.daily_pnl:.2f}")

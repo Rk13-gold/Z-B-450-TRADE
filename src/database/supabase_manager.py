@@ -6,7 +6,7 @@ from typing import Dict, List, Optional
 from config.settings import settings
 
 
-class SupabaseManager:
+class LocalTradeDBManager:
     def __init__(self):
         self.db_path = "bb450_trades.db"
         self.conn = None
@@ -257,4 +257,4 @@ class SupabaseManager:
         }
 
 
-supabase_manager = SupabaseManager()
+local_trade_db = LocalTradeDBManager()

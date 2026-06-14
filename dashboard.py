@@ -11,7 +11,7 @@ from binance.client import Client
 from config.settings import settings
 from src.engine.order_flow import order_flow_engine
 from src.engine.strategy import trading_strategy
-from src.database.supabase_manager import supabase_manager
+from src.database.supabase_manager import local_trade_db
 
 
 client = Client(settings.BINANCE_REAL_API_KEY, settings.BINANCE_REAL_SECRET_KEY, testnet=False)
@@ -391,7 +391,7 @@ async def main():
     data['klines'] = klines
     calculate_all_indicators(klines)
     
-    supabase_manager.connect()
+    local_trade_db.connect()
     
     print(f"{GRIS}Presiona Ctrl+C para salir{GRIS}")
     

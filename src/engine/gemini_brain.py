@@ -30,6 +30,8 @@ Usage
 import json
 import logging
 import os
+import threading
+import time
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
@@ -269,6 +271,19 @@ class GeminiBrainManager:
         # ── Narrative journal (lazy) ───────────────────────────────────
         self._journal = None
 
+        # ── Background regime monitor (thread-safe cache) ──────────────
+        self._regime_lock = threading.Lock()
+        self.current_regime_state: Dict[str, Any] = {
+            "regime": "RANGO_INDECISO",
+            "risk_gate_ok": True,
+            "suggested_sl_modifier": 1.0,
+            "suggested_tp_modifier": 1.0,
+            "last_update": 0.0,
+            "confidence": 0,
+        }
+        self._regime_monitor_running = False
+        self._regime_monitor_thread: Optional[threading.Thread] = None
+
     def refresh_system_instruction(self):
         """Rebuild system instruction with current symbol."""
         self._system_instruction = _get_engineer_prompt()
@@ -280,6 +295,105 @@ class GeminiBrainManager:
     @property
     def is_enabled(self) -> bool:
         return self._enabled
+
+    # ── Background regime monitor ──────────────────────────────────────
+
+    def get_cached_regime(self) -> Dict[str, Any]:
+        """Devuelve el último régimen conocido (síncrono, <1ms)."""
+        with self._regime_lock:
+            return dict(self.current_regime_state)
+
+    def _get_lite_snapshot(self, full: Dict[str, Any]) -> Dict[str, Any]:
+        """Extrae solo los campos esenciales para inferencia de régimen."""
+        return {
+            "price": full.get("price", 0),
+            "delta": full.get("delta", 0),
+            "cvd": full.get("cvd", 0),
+            "buy_volume": full.get("buy_volume", 0),
+            "sell_volume": full.get("sell_volume", 0),
+            "rsi": full.get("rsi", 50),
+            "tick_speed": full.get("tick_speed", 0),
+            "cancel_rate": full.get("cancel_rate", 0),
+            "spoofing_risk": full.get("spoofing_risk", 0),
+            "trap_status": full.get("trap_status", "SIN TRAMPA"),
+            "depth_imb_pct": full.get("depth_imb_pct", 0),
+            "ba_ratio": full.get("ba_ratio", 1.0),
+            "trend_5m": full.get("trend_5m", "WAIT"),
+            "trend_1h": full.get("trend_1h", "NEUTRAL"),
+            "hft_speed": full.get("hft_speed", 0),
+            "funding_rate": full.get("funding_rate", 0),
+            "oi_delta_5min": full.get("oi_delta_5min", 0),
+            "confluence_score": full.get("confluence_score", 50),
+            "vwap": full.get("vwap", 0),
+            "bb_position": full.get("bb_position", 50),
+        }
+
+    def _background_regime_loop(self, snapshot_provider, interval: float):
+        """Loop asíncrono que corre en un hilo aparte."""
+        import asyncio
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        while self._regime_monitor_running:
+            try:
+                snapshot = snapshot_provider() if callable(snapshot_provider) else snapshot_provider
+                lite = self._get_lite_snapshot(snapshot)
+                decision = loop.run_until_complete(
+                    self.execute_inference(lite)
+                )
+                if decision is not None:
+                    with self._regime_lock:
+                        self.current_regime_state = {
+                            "regime": getattr(decision, "regimen_mercado", "RANGO_INDECISO"),
+                            "risk_gate_ok": getattr(decision, "decision", "ESPERAR") != "ESPERAR",
+                            "suggested_sl_modifier": 1.0,
+                            "suggested_tp_modifier": 1.0,
+                            "last_update": time.time(),
+                            "confidence": getattr(decision, "confianza", 0),
+                            "_raw_decision": decision,
+                        }
+                else:
+                    with self._regime_lock:
+                        self.current_regime_state["last_update"] = time.time()
+            except Exception as exc:
+                log.warning(f"[GeminiBrain] Regime monitor error: {exc}")
+                # Mantener último estado conocido — no se toca current_regime_state
+            time.sleep(interval)
+
+        loop.close()
+
+    def start_background_regime_monitor(self, snapshot_provider, interval: float = 30.0):
+        """Inicia el monitor de régimen en segundo plano.
+
+        Parameters
+        ----------
+        snapshot_provider : callable | dict
+            Función que retorna el snapshot actual, o un dict fijo.
+        interval : float
+            Segundos entre cada llamada a Gemini (default 30).
+        """
+        if not self._enabled or self._client is None:
+            log.warning("[GeminiBrain] Regime monitor no iniciado — Gemini deshabilitado")
+            return
+
+        if self._regime_monitor_running:
+            log.info("[GeminiBrain] Regime monitor ya activo")
+            return
+
+        self._regime_monitor_running = True
+        self._regime_monitor_thread = threading.Thread(
+            target=self._background_regime_loop,
+            args=(snapshot_provider, interval),
+            daemon=True,
+            name="GeminiRegimeMonitor",
+        )
+        self._regime_monitor_thread.start()
+        log.info(f"[GeminiBrain] Regime monitor iniciado (interval={interval}s)")
+
+    def stop_background_regime_monitor(self):
+        """Detiene el monitor de régimen."""
+        self._regime_monitor_running = False
+        log.info("[GeminiBrain] Regime monitor detenido")
 
     def _get_journal(self):
         if self._journal is None and self._client is not None:
@@ -368,7 +482,7 @@ class GeminiBrainManager:
                 config=types.GenerateContentConfig(
                     system_instruction=self._system_instruction,
                     temperature=0.1,
-                    max_output_tokens=512,
+                    max_output_tokens=1024,
                     response_mime_type="application/json",
                     response_schema=GeminiTradingDecision,
                 ),
@@ -384,9 +498,33 @@ class GeminiBrainManager:
                 log.warning("[GeminiBrain] Respuesta vacía de Gemini")
                 return None
 
-            # ── Parse with pydantic validation ─────────────────────────
-            decision = GeminiTradingDecision.model_validate_json(raw)
-            return decision
+            raw = raw.strip()
+
+            # ── Parse con pydantic — fallback si JSON truncado ─────────
+            try:
+                decision = GeminiTradingDecision.model_validate_json(raw)
+                return decision
+            except Exception:
+                pass
+
+            # Fallback: extraer decision vía regex, devolver ESPERAR seguro
+            import re
+            m = re.search(r'"decision"\s*:\s*"([^"]+)"', raw)
+            if m and m.group(1) == "ESPERAR":
+                log.warning("[GeminiBrain] JSON truncado — forzando ESPERAR safe-default")
+                return GeminiTradingDecision(
+                    decision="ESPERAR",
+                    confianza=0.0,
+                    trigger_price=0.0,
+                    stop_loss=0.0,
+                    take_profit=0.0,
+                    regimen_mercado="RANGO_INDECISO",
+                    multiplicador_posicion=1.0,
+                    analisis_cuant="Gemini response truncated — defaulting to ESPERAR",
+                )
+
+            log.error(f"[GeminiBrain] JSON inválido irrecuperable: {raw[:200]}")
+            return None
 
         except Exception as exc:
             log.error(f"[GeminiBrain] Error en inferencia: {exc}")

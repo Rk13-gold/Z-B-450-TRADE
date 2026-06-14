@@ -52,6 +52,7 @@ RETRY_DELAY_S = 0.5
 SPLIT_ENTRY_TICKETS = 3
 SPLIT_ENTRY_PULLBACK_WAIT_SEC = 0.8
 SPLIT_ENTRY_PULLBACK_PCT = 0.0003
+RATE_LIMIT_RETRY_DELAYS = [1.5, 3.0]  # backoff exponencial para -1015/-1006
 
 
 class OrderExecutor(QThread):
@@ -1174,12 +1175,49 @@ class OrderExecutor(QThread):
             self.position_closed.emit(close_data)
 
     # ── Mejora 1: Split entry en 3 micro-tickets ─────────────────────────
+    def _market_order_rl_safe(self, side: str, qty_str: str, ticket_index: int):
+        """Intenta una orden MARKET con backoff exponencial en rate limit.
+
+        Retorna la respuesta de Binance en éxito, None si aborta por rate limit.
+        """
+        for delay in RATE_LIMIT_RETRY_DELAYS:
+            try:
+                return self._fapi_create_order(
+                    symbol=settings.get_symbol(), side=side, type="MARKET", quantity=qty_str,
+                )
+            except BinanceAPIException as exc:
+                code = getattr(exc, "code", 0)
+                if code in (-1015, -1006):
+                    log.critical(
+                        f"[OrderExec] RATE LIMIT [{code}] ticket {ticket_index+1} — "
+                        f"backoff {delay}s"
+                    )
+                    time.sleep(delay)
+                else:
+                    log.warning(
+                        f"[OrderExec] Fallback MARKET ticket {ticket_index+1} "
+                        f"error [{code}]: {exc}"
+                    )
+                    return None
+            except Exception as exc:
+                log.warning(
+                    f"[OrderExec] Fallback MARKET ticket {ticket_index+1} "
+                    f"unexpected: {exc}"
+                )
+                return None
+        log.critical(
+            f"SPLIT ENTRY ABORTADO POR RATE LIMIT. "
+            f"Posición parcial detectada en ticket {ticket_index+1}."
+        )
+        return None
+
     def _execute_split_entry(self, side, total_qty, total_qty_str, leverage, entry_price):
         base_qty = total_qty / SPLIT_ENTRY_TICKETS
         base_qty = max(base_qty, 0.001)
 
         fills = []
         all_ids = []
+        rl_aborted = False
 
         for i in range(SPLIT_ENTRY_TICKETS):
             if i > 0:
@@ -1195,20 +1233,33 @@ class OrderExecutor(QThread):
                 qty_str = self._round_quantity(base_qty)
             qty_val = float(qty_str)
 
+            # ── Rate-limit-aware order placement ──
             resp = self._place_market(side, qty_str, leverage)
             if resp is None:
-                # Fallback: MARKET inmediato
-                log.warning(f"[OrderExec] Split ticket {i+1} timeout — fallback MARKET")
-                try:
-                    resp = self._fapi_create_order(
-                        symbol=settings.get_symbol(), side=side, type="MARKET", quantity=qty_str,
-                    )
-                except Exception as exc:
-                    log.warning(f"[OrderExec] Fallback MARKET ticket {i+1} failed: {exc}")
-                    continue
-                if not resp or not resp.get("orderId"):
-                    log.warning(f"[OrderExec] Fallback MARKET ticket {i+1} no orderId")
-                    continue
+                # Fallback directo con detección de rate limit
+                resp = self._market_order_rl_safe(side, qty_str, i)
+                if resp is None:
+                    # Fallback inmediato (sin RL) como último recurso
+                    try:
+                        resp = self._fapi_create_order(
+                            symbol=settings.get_symbol(), side=side, type="MARKET", quantity=qty_str,
+                        )
+                    except BinanceAPIException as exc:
+                        code = getattr(exc, "code", 0)
+                        if code in (-1015, -1006):
+                            resp = self._market_order_rl_safe(side, qty_str, i)
+                            if resp is None:
+                                rl_aborted = True
+                                break
+                        else:
+                            log.warning(f"[OrderExec] Fallback MARKET ticket {i+1} error [{code}]: {exc}")
+                            continue
+                    except Exception as exc:
+                        log.warning(f"[OrderExec] Fallback MARKET ticket {i+1} failed: {exc}")
+                        continue
+                    if not resp or not resp.get("orderId"):
+                        log.warning(f"[OrderExec] Fallback MARKET ticket {i+1} no orderId")
+                        continue
 
             order_id = str(resp.get("orderId", ""))
             all_ids.append(order_id)
@@ -1246,6 +1297,13 @@ class OrderExecutor(QThread):
 
         with self._lock:
             self._last_trade_time = time.time()
+
+        if rl_aborted:
+            log.critical(
+                f"SPLIT ENTRY ABORTADO POR RATE LIMIT. "
+                f"Posición parcial detectada: {sum(f['qty'] for f in fills):.4f} BTC "
+                f"de {total_qty:.4f} BTC"
+            )
 
         if not fills:
             raise RuntimeError(f"Split entry failed: 0/{SPLIT_ENTRY_TICKETS} tickets filled")
@@ -1391,7 +1449,113 @@ class OrderExecutor(QThread):
             result["message"] = str(exc)
         return result
 
-    def _fapi_create_order(self, **kwargs) -> dict:
+    def close_position(self) -> bool:
+        """Close the open position via market order (emergency close).
+
+        Returns True if a position was actually closed, False otherwise.
+        """
+        result = self.close_all_positions()
+        return bool(result.get("success"))
+
+    def modify_stop_loss(self, price: float) -> dict:
+        """Cancel existing STOP_MARKET algo orders and place a new stop loss.
+
+        Parameters
+        ----------
+        price : float
+            New stop loss trigger price.
+
+        Returns dict with success, message, and optional error.
+        """
+        result = {"success": False, "message": ""}
+        if self._client is None:
+            result["message"] = "Client not available"
+            return result
+        try:
+            sym = settings.get_symbol()
+            # Cancel existing algo stop-loss orders
+            open_algos = self._client.futures_get_open_algo_orders(symbol=sym)
+            for o in open_algos if open_algos else []:
+                if o.get("algoType") == "STOP":
+                    self._client.futures_cancel_algo_order(
+                        symbol=sym, algoOrderId=o.get("algoId", ""),
+                    )
+                    log.info(f"[OrderExec] Cancelled old SL algo: {o.get('algoId')}")
+
+            # Place new STOP_MARKET algo order
+            resp = self._client.futures_create_algo_order(
+                symbol=sym,
+                side="SELL",
+                type="STOP_MARKET",
+                triggerPrice=price,
+                closePosition="true",
+                workingType="MARK_PRICE",
+                timeInForce="GTE_GTC",
+            )
+            result["success"] = True
+            result["order_id"] = str(resp.get("algoId", ""))
+            result["message"] = f"SL moved to ${price:.2f}"
+            log.info(f"[OrderExec] {result['message']}")
+        except Exception as exc:
+            log.warning(f"[OrderExec] modify_stop_loss error: {exc}")
+            result["message"] = str(exc)
+        return result
+
+    def modify_take_profit(self, price: float) -> dict:
+        """Cancel existing TAKE_PROFIT_MARKET algo orders and place a new take profit.
+
+        Parameters
+        ----------
+        price : float
+            New take profit trigger price.
+
+        Returns dict with success, message, and optional error.
+        """
+        result = {"success": False, "message": ""}
+        if self._client is None:
+            result["message"] = "Client not available"
+            return result
+        try:
+            sym = settings.get_symbol()
+            # Cancel existing algo take-profit orders
+            open_algos = self._client.futures_get_open_algo_orders(symbol=sym)
+            for o in open_algos if open_algos else []:
+                if o.get("algoType") == "TAKE_PROFIT":
+                    self._client.futures_cancel_algo_order(
+                        symbol=sym, algoOrderId=o.get("algoId", ""),
+                    )
+                    log.info(f"[OrderExec] Cancelled old TP algo: {o.get('algoId')}")
+
+            # Place new TAKE_PROFIT_MARKET algo order
+            resp = self._client.futures_create_algo_order(
+                symbol=sym,
+                side="SELL",  # TP is always SELL for a LONG position
+                type="TAKE_PROFIT_MARKET",
+                triggerPrice=price,
+                closePosition="true",
+                workingType="MARK_PRICE",
+                timeInForce="GTE_GTC",
+            )
+            result["success"] = True
+            result["order_id"] = str(resp.get("algoId", ""))
+            result["message"] = f"TP moved to ${price:.2f}"
+            log.info(f"[OrderExec] {result['message']}")
+        except Exception as exc:
+            log.warning(f"[OrderExec] modify_take_profit error: {exc}")
+            result["message"] = str(exc)
+        return result
+
+    def set_leverage(self, leverage: int) -> dict:
+        """Set leverage for the current symbol.
+
+        Parameters
+        ----------
+        leverage : int
+            Leverage factor (1-100).
+
+        Returns dict with success and leverage.
+        """
+        return self.change_leverage_direct(leverage)
         """Call futures_create_order with unified error handling.
 
         Usado exclusivamente para la orden de entrada MARKET.

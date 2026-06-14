@@ -101,6 +101,13 @@ NUMERIC_FEATURES = [
     'wall_bid_size', 'wall_ask_size', 'liq_zones',
     # Trap & confidence
     'directional_probability', 'confidence',
+    # ═══ Nuevas features 51-55 ═══
+    # Codificación cíclica de hora (sesiones de mercado)
+    'hour_of_day_sin', 'hour_of_day_cos',
+    # Distancia a niveles técnicos
+    'nearest_support_dist_pct', 'nearest_resistance_dist_pct',
+    # Sesgo de régimen de Gemini (-1, 0, 1)
+    'gemini_regime_bias',
 ]
 
 CATEGORICAL_MAP: Dict[str, Dict[str, float]] = {
@@ -118,7 +125,7 @@ CATEGORICAL_MAP: Dict[str, Dict[str, float]] = {
 }
 
 CATEGORICAL_FEATURES = list(CATEGORICAL_MAP.keys())
-N_FEATURES = len(NUMERIC_FEATURES) + len(CATEGORICAL_FEATURES)  # 39 + 11 = 50
+N_FEATURES = len(NUMERIC_FEATURES) + len(CATEGORICAL_FEATURES)  # 44 + 11 = 55
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -147,7 +154,7 @@ class QuantumBrainNetwork(nn.Module):
 
     Architecture
     ────────────
-      Input (N_FEATURES)
+      Input (N_FEATURES=55)
         → Linear(512) + LayerNorm + ReLU + Dropout
         → 2× ResidualBlock(512)
         → LSTM(512 → 256, 2 layers)   ← temporal processing
@@ -158,6 +165,14 @@ class QuantumBrainNetwork(nn.Module):
     ──────
       log_probs ∈ ℝ³ : [ln P(ALZA), ln P(BAJA), ln P(INCIERTO)]
       hidden_state   : (hn, cn) for next call
+
+    Features (55 total)
+    ───────────────────
+      44 numéricas: price, change_pct, vwap, rsi, macd..., hour_of_day_sin,
+                    hour_of_day_cos, nearest_support_dist_pct,
+                    nearest_resistance_dist_pct, gemini_regime_bias
+      11 categóricas: trend, signal_text, bb_squeeze, force, mtf trends (5),
+                      market_bias, ema_cross_5m, ema_cross_15m
     """
 
     def __init__(self, n_features: int = N_FEATURES,
@@ -301,12 +316,48 @@ class FeaturePipeline:
     def extract_features(self, snapshot: dict) -> np.ndarray:
         """Extract raw (non-normalised) feature vector from snapshot.
 
-        Returns ndarray of shape (N_FEATURES,).
+        Returns ndarray of shape (N_FEATURES,) = (55,).
         """
+        from datetime import datetime
         feats = []
 
         # Numeric features
         for key in NUMERIC_FEATURES:
+            # ── Features 51-52: hora del día (codificación cíclica) ──
+            if key == 'hour_of_day_sin':
+                hour = datetime.now().hour + datetime.now().minute / 60.0
+                feats.append(math.sin(2 * math.pi * hour / 24))
+                continue
+            if key == 'hour_of_day_cos':
+                hour = datetime.now().hour + datetime.now().minute / 60.0
+                feats.append(math.cos(2 * math.pi * hour / 24))
+                continue
+
+            # ── Feature 53: distancia a soporte cercano ──
+            if key == 'nearest_support_dist_pct':
+                price = self._safe_float(snapshot.get('price', 0))
+                sup = self._safe_float(snapshot.get('nearest_support', 0))
+                if price > 0 and sup > 0:
+                    feats.append((price - sup) / price)
+                else:
+                    feats.append(0.0)
+                continue
+
+            # ── Feature 54: distancia a resistencia cercana ──
+            if key == 'nearest_resistance_dist_pct':
+                price = self._safe_float(snapshot.get('price', 0))
+                res = self._safe_float(snapshot.get('nearest_resistance', 0))
+                if price > 0 and res > 0:
+                    feats.append((res - price) / price)
+                else:
+                    feats.append(0.0)
+                continue
+
+            # ── Feature 55: sesgo de régimen de Gemini ──
+            if key == 'gemini_regime_bias':
+                feats.append(self._safe_float(snapshot.get('gemini_regime_bias', 0)))
+                continue
+
             val = self._safe_float(snapshot.get(key, 0))
 
             # Log-transform skewed magnitudes
@@ -394,10 +445,15 @@ class FeaturePipeline:
         'wall_bid_size': ['muro', 'wall bid', 'soporte'],
         'wall_ask_size': ['muro', 'wall ask', 'resistencia'],
         'confidence':   ['confianza', 'confidence', 'convicción'],
+        'hour_of_day_sin': ['hora', 'sesión', 'horario', 'apertura'],
+        'hour_of_day_cos': ['hora', 'sesión', 'horario', 'cierre'],
+        'nearest_support_dist_pct': ['soporte', 'support', 'soporte cercano'],
+        'nearest_resistance_dist_pct': ['resistencia', 'resistance', 'resistencia cercana'],
+        'gemini_regime_bias': ['gemini', 'régimen', 'ia', 'validación', 'alza', 'baja'],
     }
 
     def embed_text_block(self, text: str) -> torch.Tensor:
-        """Lightweight hashing-trick encoder: text → 53-dim semantic vector.
+        """Lightweight hashing-trick encoder: text → 55-dim semantic vector.
 
         Uses double hash + trading keyword boosting so cosine similarity
         against a raw feature vector captures genuine semantic overlap.
@@ -1383,3 +1439,73 @@ def create_brain_agent(telegram_queue: Optional[Queue] = None,
     if load_model:
         agent.load_or_init()
     return agent
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 5. KNOWLEDGE REBUILD FROM CONCMT
+# ══════════════════════════════════════════════════════════════════════════════
+
+def rebuild_knowledge_embeddings_from_md(
+    folder_path: str = "CONCMT"
+) -> Tuple[List[str], Optional[KnowledgeIndex]]:
+    """Scan folder for lesson .md files, extract observations/recommendations,
+    compute embeddings via hashing trick, and build a KnowledgeIndex.
+
+    The returned blocks can be passed directly to
+    ``BrainAgent.set_knowledge_blocks()``.
+
+    Returns
+    -------
+    (block_texts, knowledge_index)
+        Empty list / None if the folder is missing or contains no usable content.
+    """
+    folder = Path(folder_path)
+    if not folder.is_dir():
+        log.warning("[rebuild_knowledge] Folder not found: %s", folder_path)
+        return [], None
+
+    md_files = sorted(folder.glob("*lesson*.md"))
+    if not md_files:
+        log.warning("[rebuild_knowledge] No lesson .md files in %s", folder_path)
+        return [], None
+
+    blocks: list[str] = []
+    for fpath in md_files:
+        text = fpath.read_text(encoding="utf-8", errors="replace")
+
+        obs_match = re.search(
+            r"## Observación de Aprendizaje\s*\n(.*?)(?=\n##|\Z)",
+            text, re.DOTALL,
+        )
+        rec_match = re.search(
+            r"## Recomendación\s*\n(.*?)(?=\n##|\Z)",
+            text, re.DOTALL,
+        )
+
+        parts = []
+        if obs_match:
+            parts.append(obs_match.group(1).strip())
+        if rec_match:
+            parts.append(rec_match.group(1).strip())
+
+        if parts:
+            blocks.append("\n".join(parts))
+
+    if not blocks:
+        log.warning(
+            "[rebuild_knowledge] No usable content found in %d files",
+            len(md_files),
+        )
+        return [], None
+
+    index = KnowledgeIndex()
+    index.load(blocks)
+
+    log.info(
+        "[rebuild_knowledge] %d bloques extraídos de %s → KnowledgeIndex "
+        "con matriz %s",
+        len(blocks),
+        folder_path,
+        list(index.embeddings.shape) if index.embeddings else "N/A",
+    )
+    return blocks, index

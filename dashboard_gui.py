@@ -3,7 +3,8 @@
 # CARGA GLOBAL del .env — ANTES de cualquier import que use settings
 # ═══════════════════════════════════════════════════════════════════════════════
 from dotenv import load_dotenv
-import os
+import logging, os
+log = logging.getLogger("dashboard")
 _env_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '.env'))
 load_dotenv(_env_path)
 print(f"[ENTRY] .env cargado desde: {_env_path}")
@@ -50,31 +51,38 @@ def play_notification_sound():
 # CONSTANTES DE PRECISIÓN — Mejoras v4-Speed
 # ═══════════════════════════════════════════════════════════════════════════════
 # Mejora 4 — Velocidad de precio
-PRICE_VELOCITY_ABORT_THRESHOLD = 0.08      # % cambio en 1s → abortar
-PRICE_VELOCITY_REDUCE_THRESHOLD = 0.04     # % cambio en 1s → reducir tamaño
+# SCALPING 1min/40x: Umbrales ajustados (abort 0.20%, reduce 0.12%)
+PRICE_VELOCITY_ABORT_THRESHOLD = 0.20      # % cambio en 1s → abortar (era 0.08)
+PRICE_VELOCITY_REDUCE_THRESHOLD = 0.12     # % cambio en 1s → reducir tamaño (era 0.04)
 PRICE_VELOCITY_WINDOW_SEC = 1.0            # ventana en segundos
 
 # Mejora 3 — Ventana post-imbalance
-IMBALANCE_WINDOW_SEC = 1.5                 # segundos para esperar tras imbalance
+IMBALANCE_WINDOW_SEC = 8.0                 # segundos para esperar tras imbalance
 IMBALANCE_OB_THRESHOLD = 15                # |ob_pct - 50| > umbral
 
 # Mejora 2 — Absorción de liquidez
-ABSORPTION_MAX_WAIT_SEC = 0.8              # tiempo máximo de espera
-ABSORPTION_ASK_THRESHOLD = 2.0             # reducción mínima BTC en ask walls (LONG)
-ABSORPTION_BID_THRESHOLD = 2.0             # reducción mínima BTC en bid walls (SHORT)
+# SCALPING 1min: Thresholds reducidos para reacción más rápida
+ABSORPTION_MAX_WAIT_SEC = 0.3              # tiempo máximo de espera (era 0.8s)
+ABSORPTION_ASK_THRESHOLD = 0.5             # reducción mínima BTC en ask walls (era 2.0)
+ABSORPTION_BID_THRESHOLD = 0.5             # reducción mínima BTC en bid walls (era 2.0)
 
 # Filtros de entrada — CVD relativo y rango 4h
 CVD_NEUTRALIZE_PRICE_CHANGE = 0.003   # 0.3% de cambio de precio en 1h
 CVD_NEUTRALIZE_THRESHOLD    = 300     # unidades de CVD relativo
 RANGO_4H_PENALTY_CONFIDENCE = 25
-RANGO_4H_SHORT_MAX_POSITION = 0.45    # SHORT penalizado si precio en 45% inferior del rango
-RANGO_4H_LONG_MIN_POSITION  = 0.55    # LONG penalizado si precio en 55% superior del rango
-MOMENTUM_CONTRADICT_THRESHOLD = 0.002
+
+# Excepción institucional — permite velocidad alta si hay volumen y delta
+VELOCITY_INSTITUTIONAL_VOL_RATIO = 3.0
+VELOCITY_INSTITUTIONAL_DELTA_MIN = 300
+RANGO_4H_SHORT_MAX_POSITION = 0.25    # SHORT penalizado si precio en 25% inferior del rango
+RANGO_4H_LONG_MIN_POSITION  = 0.75    # LONG penalizado si precio en 75% superior del rango
+MOMENTUM_CONTRADICT_THRESHOLD = 0.003
 
 # Mejora 5 — Confirmación institucional
-INSTITUTIONAL_FLOW_BTC = 5.0               # flujo mínimo acumulado institucional
+# SCALPING 1min: Thresholds reducidos y espera más corta
+INSTITUTIONAL_FLOW_BTC = 0.5               # flujo mínimo acumulado (era 2.0 BTC)
 INSTITUTIONAL_FLOW_WINDOW_MS = 2000        # ventana de tiempo para acumular flujo
-INSTITUTIONAL_MAX_WAIT_MS = 1200           # tiempo máximo de espera en ms
+INSTITUTIONAL_MAX_WAIT_MS = 500            # tiempo máximo de espera en ms (era 1200)
 
 # Mejora 8 — Re-entry tras aborto
 REENTRY_ZONE_PCT = 0.3                     # ±% para zona de re-intento
@@ -95,6 +103,91 @@ MTF_WEIGHT_HIGH_VOL = {"1h": 10, "4h": 5, "1d": 5, "5m": 15, "15m": 15}
 SPLIT_ENTRY_TICKETS = 3                    # número de micro-tickets
 SPLIT_ENTRY_PULLBACK_WAIT_SEC = 0.8        # espera entre tickets
 
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIGURACIÓN SCALPING 1min / 40x BTC/USDT
+# ══════════════════════════════════════════════════════════════════════════════
+# SCALPING: TTL extendido para señales (90s auto, 120s manual)
+SCALPING_TTL_SEC = 90
+SCALPING_MANUAL_TTL_SEC = 120
+
+# SCALPING: Umbrales de velocidad de precio ajustados para trades rápidos
+SCALPING_VELOCITY_ABORT = 0.20       # % cambio en 1s — abortar (era 0.08)
+SCALPING_VELOCITY_REDUCE = 0.12      # % cambio en 1s — reducir tamaño (era 0.04)
+
+# SCALPING: Control de filtros — desactivar los que no aplican en 1min
+POST_IMBALANCE_ENABLED = False       # SCALPING: entramos justo en el imbalance
+MAGNET_ENABLED = False               # SCALPING: Magnet no relevante para trades < 2 min
+FUNDING_CHECK_ENABLED = False        # SCALPING: Funding rate irrelevante (trades duran segundos)
+OI_DELTA_CHECK_ENABLED = False       # SCALPING: OI Delta de 5min demasiado lento para 1min
+SESSION_FILTER_ENABLED = False       # Binance 24/7: Sin rollover ni cierre diario
+
+# SCALPING: Absorption thresholds reducidos (tamaños menores, reacción más rápida)
+SCALPING_ABSORPTION_THRESHOLD_BTC = 0.5    # era 2.0 BTC
+SCALPING_ABSORPTION_WAIT_SEC = 0.3         # era 0.8s
+SCALPING_INSTITUTIONAL_FLOW_BTC = 0.5      # era 2.0 BTC
+SCALPING_INSTITUTIONAL_WAIT_MS = 500       # era 1200ms
+SCALPING_INSTITUTIONAL_RATIO = 1.2         # era 1.5x
+
+# SCALPING: SL/TP fijos para 40x (riesgo controlado)
+SCALPING_SL_PCT = 0.0020              # 0.20% de stop loss
+SCALPING_TP_PCT = 0.0040              # 0.40% de take profit (ratio 1:2)
+SCALPING_MAX_SL_PCT = 0.0030          # 0.30% SL máximo permitido con 40x
+SCALPING_RISK_PER_TRADE = 0.02        # 2% del balance por trade
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ANTI-TRAP THRESHOLDS PARA BINANCE CRYPTO (más flexibles que CME)
+# ══════════════════════════════════════════════════════════════════════════════
+TRAP_CANCEL_RATE_THRESHOLD = 40.0     # % (CME era 55)
+TRAP_DEPTH_IMB_THRESHOLD = 30.0       # % (CME era 45)
+TRAP_TICK_BRAKE_THRESHOLD = 250       # unidades delta_vel (CME era 500)
+TRAP_TICK_SPEED_MAX = 25              # ticks/s (CME era 15)
+TRAP_SPOOFING_THRESHOLD = 70          # % (sin cambio)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FLASH MOVE & FORCE DETECTION
+# ══════════════════════════════════════════════════════════════════════════════
+FLASH_MOVE_PCT_1S = 0.05             # % en 1s para micro-flash
+FLASH_MOVE_PCT_3S = 0.10             # % en 3s para micro-flash
+FLASH_MIN_VOL_RATIO = 3.0            # Vol ratio mínimo para clasificar como orgánico
+FLASH_MIN_DELTA = 200                 # Delta mínimo para clasificar como ballena
+FLASH_ORGANIC_BYPASS = True          # Saltar velocity abort si es orgánico
+
+# Escala de fuerza del movemento (impact score)
+FORCE_ABSORPTION_WINDOW_MS = 500     # Ventana para medir absorción
+FORCE_ABSORPTION_MIN_SAMPLES = 3     # Muestras mínimas para score
+FORCE_WHALE_IMPACT_BTC = 1.0         # BTC mínimos para impacto ballena
+FORCE_WHALE_IMPACT_HIGH = 200        # Score > 200 = EXTREME
+FORCE_WHALE_IMPACT_MED = 50          # Score > 50 = HIGH
+FORCE_WHALE_IMPACT_LOW = 10          # Score > 10 = MEDIUM
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONTRAPARTE & PROYECCIÓN DE VELA
+# ══════════════════════════════════════════════════════════════════════════════
+COUNTERPARTY_DEPTH_LEVELS = 50       # Niveles a escanear para contraparte
+COUNTERPARTY_MIN_BTC = 0.3           # BTC mínimos para cluster significativo
+COUNTERPARTY_MAX_GAP_PCT = 0.30      # % máximo de distancia relevante
+SL_WALL_MIN_BTC = 0.3                # BTC mínimos para muro de SL
+TP_CLUSTER_MIN_BTC = 0.5             # BTC mínimos para cluster de TP
+TP_CLUSTER_DEPTH = 30                # Niveles a escanear para TP
+CANDLE_PROJECTION_MIN_SAMPLES = 5    # Muestras mínimas para proyección
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TRAP OVERRIDE — saltar trampa si hay confirmación fuerte
+# ══════════════════════════════════════════════════════════════════════════════
+TRAP_OVERRIDE_CONFIRMATION = True    # Saltar trap si hay confirmación
+TRAP_OVERRIDE_MAX_PROB = 70          # Probabilidad máxima de trap para override
+TRAP_OVERRIDE_MIN_DELTA = 300        # Delta mínimo para override
+TRAP_OVERRIDE_MIN_VOL_RATIO = 2.0    # Vol ratio mínimo para override
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FLASH — tiempos reducidos para entrada rápida
+# ══════════════════════════════════════════════════════════════════════════════
+FLASH_ABSORPTION_WAIT_SEC = 0.1      # 100ms para absorción en flash
+FLASH_INSTITUTIONAL_WAIT_MS = 250    # 250ms para confirmación flash
+FLASH_REDUCE_MULTIPLIER = 0.3        # Reducir posición 30% en flash extremo
+
+print(f"[TRAMPAS-CONFIG] Thresholds: cancel>{TRAP_CANCEL_RATE_THRESHOLD}% | depth>{TRAP_DEPTH_IMB_THRESHOLD}% | brake>{TRAP_TICK_BRAKE_THRESHOLD} | speed<{TRAP_TICK_SPEED_MAX}/s")
+
 
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QGridLayout, QTableWidgetItem,
                              QLabel, QFrame, QVBoxLayout, QHBoxLayout,
@@ -105,17 +198,19 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QGridLayout, QT
                              QTableWidget, QHeaderView, QDoubleSpinBox, QSpinBox,
                              QGroupBox, QRadioButton, QMessageBox)
 from PyQt5.QtGui import QDoubleValidator
-from PyQt5.QtCore import Qt, QTimer, QRectF, QPointF, QThread, pyqtSignal, QSettings
+from PyQt5.QtCore import Qt, QTimer, QRectF, QRect, QPointF, QThread, pyqtSignal, QSettings
 from PyQt5.QtGui import QFont, QColor, QPalette, QKeySequence, QPainter, QPainterPath, QPen, QPolygonF, QStaticText, QPixmap, QFontDatabase
 
 from binance.client import Client
 from config.settings import settings
-from src.engine.order_flow import order_flow_engine
+from src.engine.order_flow import order_flow_engine, OrderFlowSRMap
 from src.telegram_bot import TelegramBot
+from src.api.ws_server import BB450WSServer
+from src.api.notify import get_notifier, NotificationCategory, NotificationSeverity
 from src.engine.order_executor import OrderExecutor
 from src.engine.strategy import trading_strategy
 from src.engine.async_data_engine import AsyncDataEngine
-from src.database.supabase_manager import supabase_manager
+from src.database.supabase_manager import local_trade_db
 from src.engine.gemini_brain import GeminiBrainManager, GeminiTradingDecision
 
 
@@ -127,6 +222,35 @@ try:
 except Exception as e:
     print(f"[DASHBOARD] ⚠ No se pudo conectar con Binance REAL: {e}")
     client = None
+
+# ── Tick size / decimal places resolution ─────────────────────────────
+def get_tick_info(price: float) -> tuple:
+    """Return (tick_spacing, decimal_places) based on price bracket.
+
+    - price >= 100.0   → tick_spacing=10.0,  dp=0  (BTC/ETH)
+    - price >= 10.0    → tick_spacing=1.0,   dp=1
+    - price >= 1.0     → tick_spacing=0.1,   dp=2
+    - price >= 0.1     → tick_spacing=0.01,  dp=3
+    - price < 0.1      → tick_spacing=0.001, dp=5  (SHIB, etc.)
+    """
+    if price >= 100.0:
+        return (10.0, 1)
+    elif price >= 10.0:
+        return (1.0, 2)
+    elif price >= 1.0:
+        return (0.1, 3)
+    elif price >= 0.1:
+        return (0.01, 4)
+    else:
+        return (0.001, 6)
+
+
+def format_price(price: float, dp: int = None) -> str:
+    """Format a price with commas and dynamic decimal places."""
+    if dp is None:
+        _, dp = get_tick_info(price)
+    return f"{price:,.{dp}f}"
+
 
 COLORS = {
     'background': '#000000',
@@ -442,6 +566,7 @@ class OrderFlowNumericFeed(QOpenGLWidget):
     def update_data(self, order_book, current_price):
         if not order_book: return
         self.current_price = current_price
+        self.tick_size, _ = get_tick_info(current_price)
         self.raw_order_book = order_book
         
         bids = sorted([(float(p), float(q)) for p, q in order_book.get('bids', []) if float(q) > 0.3], key=lambda x: x[1], reverse=True)[:30]
@@ -570,7 +695,7 @@ class OrderFlowNumericFeed(QOpenGLWidget):
                 painter.setBrush(Qt.NoBrush)
             else:
                 painter.setPen(QColor(180, 180, 180))
-            painter.drawText(int(x1), int(y + row_height * 0.65), f"${price_level:,.0f}")
+            painter.drawText(int(x1), int(y + row_height * 0.65), f"${format_price(price_level)}")
             
             x2 = draw_rect.left() + (draw_rect.width() * col_positions[1][0])
             if bid_vol > 0:
@@ -664,7 +789,9 @@ class OrderFlowNumericFeed(QOpenGLWidget):
         draw_rect = self.rect().adjusted(10, 30, -10, -10)
         h = draw_rect.height()
         
-        num_rows = max(15, min(40, h // 18))
+        price_range_ratio = self.current_price / max(self.tick_size, 0.001) if self.current_price > 0 else 100
+        max_rows = 20 if price_range_ratio < 500 else 40
+        num_rows = max(10, min(max_rows, h // 20))
         
         base_font_size = max(8, min(14, int(10 * self.y_scale_factor)))
         font = painter.font()
@@ -716,7 +843,7 @@ class GalaxyOrderFlowChart(QOpenGLWidget):
         super().__init__(parent)
         self.title = title
         self.klines = []
-        self.max_candles = 30  # 30 candles para mejor visualización
+        self.max_candles = 30
         self.indicators = {}
         self.bounce_zones = []
         self.order_state = None
@@ -742,17 +869,28 @@ class GalaxyOrderFlowChart(QOpenGLWidget):
         self.entry_state = None
         self.visual_pulses = []
         
-        # ── dPOC history (last 20 candles for dynamic coloring + trail) ──
-        self._dpoc_history = deque(maxlen=20)      # (price, timestamp)
-        self._dpoc_5m_ago = None                   # price from 5 candles back
+        # ── dPOC history ──
+        self._dpoc_history = deque(maxlen=20)
+        self._dpoc_5m_ago = None
         
         # ── EMA band pre-compute cache ──
         self._ema9_cache: list[float] = []
         self._ema21_cache: list[float] = []
-        self._ema_cache_hash = None                # invalidate when klines change
+        self._ema_cache_hash = None
         
-        # ── Imbalance circles buffer (pre-computed outside paintEvent) ──
-        self._imbalance_circles: list[dict] = []   # [{x, y, side, alpha}, ...]
+        # ── Imbalance circles buffer ──
+        self._imbalance_circles: list[dict] = []
+        
+        # ── Right panel state ──
+        self._last_trades: deque = deque(maxlen=5)
+        self._imbalance_pct: float = 0.0
+        self.poc_price: float = 0.0
+        self.vah: float = 0.0
+        self.val: float = 0.0
+        self.current_price: float = 0.0
+        
+        # ── Direction badge state ──
+        self._direction_badge = None
         
         self.anim_timer = QTimer(self)
         self.anim_timer.timeout.connect(self.update)
@@ -776,6 +914,13 @@ class GalaxyOrderFlowChart(QOpenGLWidget):
         self.title_label = QLabel(self.title)
         self.title_label.setStyleSheet(f"color: {COLORS['accent_cyan']}; font-weight: bold; font-size: 14px; border: none; background: transparent;")
         header_layout.addWidget(self.title_label)
+        
+        self._direction_badge = QLabel("◆ WAIT")
+        self._direction_badge.setStyleSheet(
+            "color: #c9d1d9; background: rgba(150,150,150,0.1); "
+            "font-size: 10px; font-weight: bold; padding: 3px 8px; "
+            "border-radius: 3px; border: none;")
+        header_layout.addWidget(self._direction_badge)
         
         header_layout.addStretch()
         
@@ -916,6 +1061,53 @@ class GalaxyOrderFlowChart(QOpenGLWidget):
             'sell_volume': data.get('sell_volume', 0), 'atr': data.get('atr', 0),
             'vwap': data.get('vwap', 0)
         }
+        
+        self._update_direction_style()
+
+    def _update_direction_style(self):
+        trend = self.indicators.get('trend', 'NEUTRAL')
+        is_bull = 'ALCISTA' in trend or 'UPTREND' in trend
+        is_bear = 'BAJISTA' in trend or 'DOWNTREND' in trend
+
+        if is_bull:
+            panel_bg = "rgba(57, 211, 83, 0.06)"
+            border_left = "3px solid rgba(57, 211, 83, 0.8)"
+            badge_text = "▲ LONG"
+            badge_color = "#39d353"
+            badge_bg = "rgba(57,211,83,0.15)"
+            conf = self.indicators.get('delta', 0)
+            badge_text = f"▲ LONG {abs(conf):.0f}%" if abs(conf) > 0 else "▲ LONG"
+        elif is_bear:
+            panel_bg = "rgba(248, 81, 73, 0.06)"
+            border_left = "3px solid rgba(248, 81, 73, 0.8)"
+            badge_text = "▼ SHORT"
+            badge_color = "#f85149"
+            badge_bg = "rgba(248,81,73,0.15)"
+            conf = self.indicators.get('delta', 0)
+            badge_text = f"▼ SHORT {abs(conf):.0f}%" if abs(conf) > 0 else "▼ SHORT"
+        else:
+            panel_bg = "rgba(0, 0, 0, 0.0)"
+            border_left = "3px solid rgba(150, 150, 150, 0.3)"
+            badge_text = "◆ WAIT"
+            badge_color = "#c9d1d9"
+            badge_bg = "rgba(150,150,150,0.1)"
+
+        self.setStyleSheet(
+            f"background-color: {panel_bg}; "
+            f"border-left: {border_left}; "
+            f"border-top: 1px solid #1a1a1a; "
+            f"border-right: 1px solid #1a1a1a; "
+            f"border-bottom: 1px solid #1a1a1a; "
+            f"border-radius: 6px;"
+        )
+
+        if self._direction_badge is not None:
+            self._direction_badge.setText(badge_text)
+            self._direction_badge.setStyleSheet(
+                f"color: {badge_color}; background: {badge_bg}; "
+                f"font-size: 10px; font-weight: bold; padding: 3px 8px; "
+                f"border-radius: 3px; border: none;"
+            )
 
     def trigger_entry(self, side, price):
         if not price: return
@@ -944,6 +1136,8 @@ class GalaxyOrderFlowChart(QOpenGLWidget):
         self.raw_trades.extend(trades)
         if len(self.raw_trades) > 2000:
             self.raw_trades = self.raw_trades[-2000:]
+        for t in trades:
+            self._last_trades.append(t)
 
     def _build_footprint(self):
         self.trade_grid = {}
@@ -1039,9 +1233,15 @@ class GalaxyOrderFlowChart(QOpenGLWidget):
 
     def update_data(self, order_book, current_price):
         if not order_book: return
+        self.tick_size, _ = get_tick_info(current_price)
         bids = sorted([(float(p), float(q)) for p, q in order_book.get('bids', []) if float(q) > 0.3], key=lambda x: x[1], reverse=True)[:30]
         asks = sorted([(float(p), float(q)) for p, q in order_book.get('asks', []) if float(q) > 0.3], key=lambda x: x[1], reverse=True)[:30]
         self.order_state = {'bids': bids, 'asks': asks, 'price': current_price}
+        self.current_price = current_price
+        total_bid = sum(q for _, q in bids)
+        total_ask = sum(q for _, q in asks)
+        total = total_bid + total_ask
+        self._imbalance_pct = ((total_bid - total_ask) / total * 100) if total > 0 else 0.0
         self._calculate_bounce_zones(current_price, bids, asks)
         self._predict_future_candles()
         self.update()
@@ -1218,7 +1418,7 @@ class GalaxyOrderFlowChart(QOpenGLWidget):
             painter.drawLine(draw_rect.left(), int(ty), draw_rect.right() + vp_w, int(ty))
             
             painter.setPen(QColor(COLORS['text_secondary']))
-            painter.drawText(self.rect().left() + 2, int(ty) + 3, f"${tp:,.0f}")
+            painter.drawText(self.rect().left() + 2, int(ty) + 3, f"${format_price(tp)}")
             
         # Vertical Grid (Time/Candle steps)
         painter.setPen(grid_pen)
@@ -1227,17 +1427,19 @@ class GalaxyOrderFlowChart(QOpenGLWidget):
             if draw_rect.left() <= x <= draw_rect.right():
                 painter.drawLine(int(x), draw_rect.top(), int(x), draw_rect.bottom())
 
-        # 2. CAPA 2: LINEAS DE LIQUIDEZ TRANSLUCIDAS (Whale Order Book Layer)
+        # 2. CAPA 2: LINEAS DE LIQUIDEZ TRANSLUCIDAS (max 20 each side)
         if hasattr(self, 'order_state') and self.order_state:
-            all_bids = self.order_state.get('bids', [])
-            all_asks = self.order_state.get('asks', [])
-            max_vol = max((q for p, q in all_bids + all_asks), default=1)
+            all_bids = sorted(self.order_state.get('bids', []), key=lambda x: x[1], reverse=True)[:20]
+            all_asks = sorted(self.order_state.get('asks', []), key=lambda x: x[1], reverse=True)[:20]
+            max_vol = max((q for _, q in all_bids + all_asks), default=1)
+            min_alpha = max(5, int((max_vol * 0.02 / max_vol) * 255)) if max_vol else 5
             
             for p, q in all_bids:
                 if min_p <= p <= max_p:
                     y = py(p)
                     if y > vp_max_y + 10 or y < vp_min_y - 10: continue
                     alpha = min(255, max(5, int((q / max_vol) * 255)))
+                    if alpha < min_alpha: continue
                     painter.setPen(QPen(QColor(0, 255, 102, alpha), 1, Qt.SolidLine))
                     painter.drawLine(draw_rect.left(), int(y), draw_rect.right() + vp_w, int(y))
                     
@@ -1246,6 +1448,7 @@ class GalaxyOrderFlowChart(QOpenGLWidget):
                     y = py(p)
                     if y > vp_max_y + 10 or y < vp_min_y - 10: continue
                     alpha = min(255, max(5, int((q / max_vol) * 255)))
+                    if alpha < min_alpha: continue
                     painter.setPen(QPen(QColor(187, 0, 255, alpha), 1, Qt.SolidLine))
                     painter.drawLine(draw_rect.left(), int(y), draw_rect.right() + vp_w, int(y))
 
@@ -1435,6 +1638,13 @@ class GalaxyOrderFlowChart(QOpenGLWidget):
             else:
                 painter.setBrush(QColor(187, 0, 255, 140))
                 painter.drawRect(int(xc - bw / 2), int(dy), int(bw), int(dbh))
+
+        # ── Direction-based subtle tint overlay ──
+        trend = self.indicators.get('trend', 'NEUTRAL') if hasattr(self, 'indicators') else 'NEUTRAL'
+        if 'ALCISTA' in trend or 'UPTREND' in trend:
+            painter.fillRect(self.rect(), QColor(57, 211, 83, 15))
+        elif 'BAJISTA' in trend or 'DOWNTREND' in trend:
+            painter.fillRect(self.rect(), QColor(248, 81, 73, 15))
 
         painter.end()
         return pm
@@ -1631,9 +1841,8 @@ class GalaxyOrderFlowChart(QOpenGLWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         
-        vp_w = 40
-        draw_rect = self.rect().adjusted(50, 30, -(vp_w + 5), -10)
-        vp_x = draw_rect.right() + 3
+        vp_w = 0
+        draw_rect = self.rect().adjusted(50, 30, -10, -10)
         
         vp_min_x = draw_rect.left()
         vp_max_x = draw_rect.right()
@@ -1885,23 +2094,8 @@ class GalaxyOrderFlowChart(QOpenGLWidget):
                     painter.restore()
                     painter.drawRect(int(xc - bw / 2), int(dy), int(bw), int(dbh))
 
-        # VOLUME PROFILE SIDEBAR (Dynamic)
-        if self.order_state:
-            ob_max = max((q for _, q in self.order_state['bids'] + self.order_state['asks']), default=1)
-            for p, q in self.order_state['bids']:
-                if min_p <= p <= max_p:
-                    y = py(p)
-                    if y > vp_max_y + 10 or y < vp_min_y - 10: continue
-                    bww = (q / ob_max) * vp_w
-                    painter.setPen(Qt.NoPen); painter.setBrush(QColor(0, 255, 102, 100))
-                    painter.drawRect(int(vp_x), int(y) - 1, int(bww), 3)
-            for p, q in self.order_state['asks']:
-                if min_p <= p <= max_p:
-                    y = py(p)
-                    if y > vp_max_y + 10 or y < vp_min_y - 10: continue
-                    bww = (q / ob_max) * vp_w
-                    painter.setPen(Qt.NoPen); painter.setBrush(QColor(187, 0, 255, 100))
-                    painter.drawRect(int(vp_x), int(y) - 1, int(bww), 3)
+        # VOLUME PROFILE SIDEBAR — disabled, rendered in _render_right_panel
+        pass
 
         # VOLATILITY CONE (replaces ghost candles)
         if self.predicted_candles and len(self.klines) > 1:
@@ -2034,6 +2228,7 @@ class GalaxyOrderFlowChart(QOpenGLWidget):
                     p_font = QFont(font); p_font.setPointSize(8); p_font.setBold(True); painter.setFont(p_font)
                     painter.setPen(color)
                     painter.drawText(box_x + 5, box_y + 14, f"{icon} ENTRY: ${ep:,.1f}")
+
 
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -2414,6 +2609,15 @@ class OrderFlowBattleBar(QFrame):
         self.decision = "ESPERAR"                # ALZA | BAJA | ESPERAR
         self.sweep_status = "NONE"               # NONE | SWEEP_DETECTED | ABSORPTION_CONFIRMED_REVERSAL
 
+        # ── Pullback Entry System (TREND + PULLBACK states) ──────────
+        self._expected_direction = None           # 'LONG', 'SHORT', None
+        self._pullback_active = False
+        self._pullback_entry_price = 0.0
+        self.debug_expected_direction = None
+        self.debug_pullback_detected = False
+        self.debug_pullback_modifier = 1.0
+        self.debug_fomo_penalty = False
+
         # ── Mejoras v4-Speed ─────────────────────────────────────────
         self._tick_history_3s = deque(maxlen=30)
         self._tick_integrity_score = 1.0
@@ -2437,6 +2641,10 @@ class OrderFlowBattleBar(QFrame):
         # ── FILTRO 2: historial precio para rango 4h ───────────────
         self._price_history_4h = deque(maxlen=14400)  # 4h a 1 tick/segundo
         self.posicion_rango_4h = 50.0
+
+        # ── CVD-Price divergence: buffer de swings (~12.5 min a 5s res) ──
+        self._cvd_px_swing_buffer = deque(maxlen=150)
+        self._cvd_px_swing_counter = 0
 
     def animate_step(self):
         diff = self.target_buy_pct - self.current_buy_pct
@@ -2463,7 +2671,8 @@ class OrderFlowBattleBar(QFrame):
                         ba_ratio=1.0, depth_imb_pct=0.0, relative_volume=0.0,
                         liquidity_pools=None, whale_bid_walls=None, whale_ask_walls=None,
                         book_depth_bids_volume=0.0, book_depth_asks_volume=0.0,
-                        funding_rate=0.0, oi_delta_5min=0.0):
+                        funding_rate=0.0, oi_delta_5min=0.0,
+                        flow_supports=None, flow_resistances=None):
         """Full synchronization with all market data.
 
         V5 — Dynamic Order Flow Balance:
@@ -2589,6 +2798,11 @@ class OrderFlowBattleBar(QFrame):
         # ═══════════════════════════════════════════════════════════════
         self._cvd_history.append({"ts": time.time(), "cvd": cvd})
 
+        # ── CVD-Price divergence: buffer de swings (cada ~5s) ────
+        self._cvd_px_swing_counter += 1
+        if self._cvd_px_swing_counter % 5 == 0:
+            self._cvd_px_swing_buffer.append((time.time(), price, cvd))
+
         # ═══════════════════════════════════════════════════════════════
         # MEJORA 7: Ajustar TP dinámico por velocidad de precio
         # ═══════════════════════════════════════════════════════════════
@@ -2618,6 +2832,8 @@ class OrderFlowBattleBar(QFrame):
             ba_ratio=ba_ratio,
             depth_imb_pct=depth_imb_pct,
             relative_volume=relative_volume,
+            flow_supports=flow_supports,
+            flow_resistances=flow_resistances,
             override=False,
         )
 
@@ -2650,6 +2866,87 @@ class OrderFlowBattleBar(QFrame):
             return 0
         return self._cvd_history[-1]["cvd"] - pasados[0]["cvd"]
 
+    # ── Liquidity Sentiment: Funding Rate + Open Interest ────────────────
+    @staticmethod
+    def _calculate_liquidity_sentiment(funding_rate: float, oi_delta: float,
+                                       price_velocity: float) -> int:
+        """Score (-100..+100) del sentimiento de flujo institucional.
+
+        Positivo  → flujo alcista sano (longs baratos, OI real entrando).
+        Negativo  → flujo bajista o engañoso (longs caros, squeeze falso).
+        """
+        score = 0
+
+        # 1. Funding rate extremo → riesgo de liquidación masiva
+        if funding_rate > 0.05:
+            score -= 40          # Locura Long — shorts pagando caro, riesgo de crash
+        elif funding_rate < -0.05:
+            score += 40          # Locura Short — longs cobrando, riesgo de squeeze
+
+        # 2. Calidad del flujo: OI delta + velocidad de precio
+        rising = price_velocity > 0.05  # subida significativa en ventana ~10s
+        if oi_delta > 0 and rising:
+            score += 20          # Flujo real alcista: dinero nuevo entrando
+        elif oi_delta < 0 and rising:
+            score -= 30          # Short squeeze engañoso: precio sube sin OI nuevo
+
+        return max(-100, min(100, score))
+
+    # ── CVD-Price Divergence Detection ─────────────────────────────────
+    def _detect_cvd_divergence(self) -> int:
+        """Detect divergencia CVD-Precio en los últimos ~5-10 min.
+
+        Returns
+        -------
+        +50  Bullish divergence  (price lower low, CVD higher low)
+        -50  Bearish divergence  (price higher high, CVD lower high)
+          0  No divergence
+        """
+        buf = list(self._cvd_px_swing_buffer)
+        if len(buf) < 20:
+            return 0
+
+        prices = [p for _, p, _ in buf]
+        cvds   = [c for _, _, c in buf]
+
+        # ── Find valley / peak indices in price series ───────────────
+        # A valley: price[i] < price[i-1] and price[i] < price[i+1]
+        # A peak:   price[i] > price[i-1] and price[i] > price[i+1]
+        # Use a 2-step window to filter micro-noise
+        price_valleys: list[int] = []
+        price_peaks:   list[int] = []
+        for i in range(2, len(prices) - 2):
+            if (prices[i] < prices[i-1] and prices[i] < prices[i+1]
+                    and prices[i] < prices[i-2] and prices[i] < prices[i+2]):
+                price_valleys.append(i)
+            if (prices[i] > prices[i-1] and prices[i] > prices[i+1]
+                    and prices[i] > prices[i-2] and prices[i] > prices[i+2]):
+                price_peaks.append(i)
+
+        # ── Bullish divergence: price lower low, CVD higher low ─────
+        bullish = False
+        if len(price_valleys) >= 2:
+            i_v1, i_v2 = price_valleys[-2], price_valleys[-1]
+            price_ll = prices[i_v2] < prices[i_v1]
+            cvd_hl  = cvds[i_v2] > cvds[i_v1]
+            if price_ll and cvd_hl:
+                bullish = True
+
+        # ── Bearish divergence: price higher high, CVD lower high ───
+        bearish = False
+        if len(price_peaks) >= 2:
+            i_p1, i_p2 = price_peaks[-2], price_peaks[-1]
+            price_hh = prices[i_p2] > prices[i_p1]
+            cvd_lh  = cvds[i_p2] < cvds[i_p1]
+            if price_hh and cvd_lh:
+                bearish = True
+
+        if bullish and not bearish:
+            return 50
+        if bearish and not bullish:
+            return -50
+        return 0
+
     def _compute_signal(self, buy_volume, sell_volume, imbalance,
                         trend, rsi, cvd,
                         confluence_score, trend_1h, trend_4h, trend_1d='NEUTRAL',
@@ -2663,6 +2960,7 @@ class OrderFlowBattleBar(QFrame):
                         critical_support=0.0, consecutive_red_bars=0,
                         spoofing_risk=0.0, hft_speed=0.0, active_trap="",
                         ba_ratio=1.0, depth_imb_pct=0.0, relative_volume=0.0,
+                        flow_supports=None, flow_resistances=None,
                         override=False):
         """Weighted composite signal computation.
 
@@ -2671,6 +2969,9 @@ class OrderFlowBattleBar(QFrame):
         """
         spread_penalty = 0.8 if spread_velocity > 50 and not override else 1.0
         tick_penalty = 1.0
+
+        # ── Signal Diagnostics: reasons why signal is NEUTRAL/blocked ──
+        self.signal_diagnostics = []
 
         # ══════════════════════════════════════════════════════════════
         # FASE 0a: MINIMUM BOOK DEPTH FILTER (Mejora 1 — v4-Speed)
@@ -2687,6 +2988,9 @@ class OrderFlowBattleBar(QFrame):
                 self.regimen_mercado = "NO_PROFUNDIDAD"
                 self.analisis_cuant = f"Book sin profundidad: bids {bid_pct:.0f}% asks {ask_pct:.0f}%"
                 self.trend_label = "◆ BOOK SIN PROFUNDIDAD — FILTRO ACTIVADO"
+                self.signal_diagnostics.append(
+                    f"Blocked by Book Depth Filter: bids {bid_pct:.0f}% asks {ask_pct:.0f}%"
+                )
                 return
 
         # ══════════════════════════════════════════════════════════════
@@ -2754,6 +3058,22 @@ class OrderFlowBattleBar(QFrame):
         elif delta_vel < -5:     delta_pct = 35
         else:                    delta_pct = 50
 
+        # 1e. Delta acceleration (2da deriv.) + CVD velocity + CVD acceleration
+        if not hasattr(self, '_prev_delta_vel'):
+            self._prev_delta_vel = delta_vel
+        delta_accel = delta_vel - self._prev_delta_vel
+        self._prev_delta_vel = delta_vel
+
+        if not hasattr(self, '_prev_cvd'):
+            self._prev_cvd = cvd
+        cvd_vel = cvd - self._prev_cvd
+        self._prev_cvd = cvd
+
+        if not hasattr(self, '_prev_cvd_vel'):
+            self._prev_cvd_vel = cvd_vel
+        cvd_accel = cvd_vel - self._prev_cvd_vel
+        self._prev_cvd_vel = cvd_vel
+
         # 2. MICROSTRUCTURE ACCELERATION
         if not hasattr(self, '_prev_tick'):
             self._prev_tick = tick_speed
@@ -2808,13 +3128,187 @@ class OrderFlowBattleBar(QFrame):
         elif atr < 15:       vol_regime = 35
         else:                vol_regime = 50
 
-        # ── COMPOSITE ─────────────────────────────────────────────────
-        raw_composite = (
-            vol_pct * 0.15 + ob_pct * 0.10 + cvd_pct * 0.10 +
-            delta_pct * 0.15 + micro_pct * 0.15 +
-            rsi_pct * 0.10 + mtf_pct * 0.15 + vol_regime * 0.10
+        # 6. CVD-PRICE DIVERGENCE  (9no componente temporal)
+        divergence_score = self._detect_cvd_divergence()
+        if divergence_score == 50:
+            divergence_pct = 75
+        elif divergence_score == -50:
+            divergence_pct = 25
+        else:
+            divergence_pct = 50
+        self.debug_divergence = divergence_score
+
+        # ══════════════════════════════════════════════════════════════
+        # FASE 0c(i): LIQUIDITY SENTIMENT (pre-compute para contexto)
+        # ══════════════════════════════════════════════════════════════
+        price_velocity = 0.0
+        if len(self.price_buffer_1s) >= 3:
+            t0, p0 = self.price_buffer_1s[0]
+            tn, pn = self.price_buffer_1s[-1]
+            window_s = tn - t0
+            if window_s > 0:
+                price_velocity = ((pn - p0) / p0) * 100
+        liq_sent = self._calculate_liquidity_sentiment(
+            self._funding_rate, self._oi_delta_5min, price_velocity
         )
-        composite = 50 + (raw_composite - 50) * spread_penalty * tick_penalty
+        self.debug_liq_sentiment = liq_sent
+
+        # ══════════════════════════════════════════════════════════════
+        # FASE 0c(ii): CONTEXTO + DISPARADOR (modelo no-lineal)
+        # ══════════════════════════════════════════════════════════════
+        # Evalúa 2 dimensiones independientes:
+        #   1. CONTEXTO  = sesgo direccional desde MTF + macro liquidez
+        #   2. DISPARADOR = gatillo micro-estructural (delta, divergencia, absorción)
+        #
+        # La combinación determina el multiplicador no-lineal:
+        #   Caso Fuerte       (contexto + disparador alineados)  → ×1.3
+        #   Caso Contracorriente (contexto ≠ disparador)        → ×0.5
+        #   Sin disparador    → NEUTRAL (no importa el contexto)
+        # ──────────────────────────────────────────────────────────────
+
+        # ── Contexto: MTF trends ─────────────────────────────────────
+        mtf_bullish = (
+            (trend_5m == 'ALCISTA' or trend_15m == 'ALCISTA')
+            and trend_1h in ('ALCISTA', 'NEUTRAL')
+        )
+        mtf_bearish = (
+            (trend_5m == 'BAJISTA' or trend_15m == 'BAJISTA')
+            and trend_1h in ('BAJISTA', 'NEUTRAL')
+        )
+
+        # ── Contexto: integración final ─────────────────────────────
+        # (spoofing y traps se evalúan directamente para evitar
+        #  depender de self.regimen_mercado que se asigna después)
+        trap_upper = (active_trap or '').upper()
+        trap_alcista = 'TRAMPA_ALCISTA' in trap_upper or 'TRAMPA ALCISTA' in trap_upper
+        trap_bajista = 'TRAMPA_BAJISTA' in trap_upper or 'TRAMPA BAJISTA' in trap_upper
+
+        context_bullish = (
+            mtf_bullish
+            and liq_sent > 0
+            and spoofing_risk <= 70
+            and not trap_alcista
+        )
+        context_bearish = (
+            mtf_bearish
+            and liq_sent < 0
+            and spoofing_risk <= 70
+            and not trap_bajista
+        )
+
+        # ── Disparador: microestructura ─────────────────────────────
+        delta_vel = self.delta_accel if hasattr(self, 'delta_accel') else 0
+        ask_absorption = buy_volume > sell_volume * 1.3 and delta > 50
+        bid_absorption = sell_volume > buy_volume * 1.3 and delta < -50
+
+        trigger_bull = delta_vel > 15 or divergence_score == 50 or ask_absorption
+        trigger_bear = delta_vel < -15 or divergence_score == -50 or bid_absorption
+
+        # Debug
+        self.debug_context_bullish = context_bullish
+        self.debug_context_bearish = context_bearish
+        self.debug_trigger_bull = trigger_bull
+        self.debug_trigger_bear = trigger_bear
+
+        # ── Multiplicador no-lineal ─────────────────────────────────
+        context_trigger_multiplier = 1.0
+        if context_bullish and trigger_bull:
+            context_trigger_multiplier = 1.3   # CASO FUERTE LONG
+        elif context_bearish and trigger_bear:
+            context_trigger_multiplier = 1.3   # CASO FUERTE SHORT
+        elif (context_bearish and trigger_bull) or (context_bullish and trigger_bear):
+            context_trigger_multiplier = 0.5   # CASO CONTRACORRIENTE
+
+        self.debug_ct_multiplier = context_trigger_multiplier
+
+        # ── COMPOSITE ─────────────────────────────────────────────────
+        # SCALPING 1min: Mayor peso a Delta Accel + Micro + OB Imbalance
+        #   Delta: 0.20 (+0.05), Micro: 0.20 (+0.05), OB: 0.15 (+0.05)
+        #   RSI: 0.05 (-0.05), MTF: 0.10 (-0.05), Vol: 0.05 (-0.05)
+        #   Divergencia: 0.05 (9no componente)
+        raw_composite = (
+            vol_pct * 0.15 + ob_pct * 0.15 + cvd_pct * 0.10 +
+            delta_pct * 0.20 + micro_pct * 0.20 +
+            rsi_pct * 0.05 + mtf_pct * 0.10 + vol_regime * 0.05 +
+            divergence_pct * 0.05
+        )
+        composite = 50 + (raw_composite - 50) * spread_penalty * tick_penalty * context_trigger_multiplier
+
+        # ══════════════════════════════════════════════════════════════
+        # FASE 0d: TREND + PULLBACK (Pullback Entry System)
+        # ══════════════════════════════════════════════════════════════
+        # Dos estados:
+        #   TREND    → detecta dirección dominante (CVD + MTF alineados)
+        #   PULLBACK → espera retroceso a un flow S/R con micro-confirmación
+        #
+        # Modificador de confianza:
+        #   Pullback confirmado → +20% (multiplicador 1.20)
+        #   Señal en trend pero SIN pullback (FOMO) → -20% (multiplicador 0.80)
+        # ────────────────────────────────────────────────────────────────
+        if flow_supports is None:
+            flow_supports = []
+        if flow_resistances is None:
+            flow_resistances = []
+
+        # 0d(i) — TREND: expected direction from CVD + MTF alignment
+        expected_direction = None
+        cvd_bullish = cvd_pct > 55
+        cvd_bearish = cvd_pct < 45
+        mtf_bullish = mtf_pct > 55
+        mtf_bearish = mtf_pct < 45
+
+        if cvd_bullish and mtf_bullish:
+            expected_direction = "LONG"
+        elif cvd_bearish and mtf_bearish:
+            expected_direction = "SHORT"
+
+        self._expected_direction = expected_direction
+        self.debug_expected_direction = expected_direction
+
+        # 0d(ii) — PULLBACK: check proximity to flow S/R + micro-confirmation
+        pullback_detected = False
+        fomo_penalty = False
+        touch_pct = 0.05  # misma tolerancia que OrderFlowSRMap
+
+        if expected_direction is not None:
+            if expected_direction == "LONG" and flow_supports:
+                for lv in flow_supports:
+                    sp = lv.get('price', 0)
+                    if sp <= 0:
+                        continue
+                    if abs(price - sp) / max(sp, 0.001) * 100 <= touch_pct:
+                        delta_buying = delta_vel > 0
+                        ob_bullish = imbalance > 0
+                        if delta_buying or ob_bullish:
+                            pullback_detected = True
+                        break
+
+            elif expected_direction == "SHORT" and flow_resistances:
+                for lv in flow_resistances:
+                    rp = lv.get('price', 0)
+                    if rp <= 0:
+                        continue
+                    if abs(price - rp) / max(rp, 0.001) * 100 <= touch_pct:
+                        delta_selling = delta_vel < 0
+                        ob_bearish = imbalance < 0
+                        if delta_selling or ob_bearish:
+                            pullback_detected = True
+                        break
+
+            # Aplicar modificador al composite
+            if pullback_detected:
+                composite = 50 + (composite - 50) * 1.20
+            elif (expected_direction == "LONG" and composite > 50) or \
+                 (expected_direction == "SHORT" and composite < 50):
+                composite = 50 + (composite - 50) * 0.80
+                fomo_penalty = True
+
+        self.debug_pullback_detected = pullback_detected
+        self.debug_pullback_modifier = round(
+            (composite - 50) / max(raw_composite - 50, 0.001) *
+            spread_penalty * tick_penalty * context_trigger_multiplier, 4
+        ) if abs(raw_composite - 50) > 0.001 else 1.0
+        self.debug_fomo_penalty = fomo_penalty
 
         # ── DEBUG FIELDS (injected into snapshot) ─────────────────────
         self.debug_vol_pct = round(vol_pct, 1)
@@ -2837,18 +3331,42 @@ class OrderFlowBattleBar(QFrame):
             self.regimen_mercado = "BLOQUEO_POR_SPOOFING"
             self.analisis_cuant = f"Spoofing {spoofing_risk:.0f}% > 70% — manipulación activa"
             self.trend_label = "◆ SPOOFING > 70% — BLOQUEO POR MANIPULACIÓN"
+            self.signal_diagnostics.append(
+                f"Blocked by Spoofing Gate: score {spoofing_risk:.0f}% > 70%"
+            )
             return
 
         # ── DYNAMIC THRESHOLDS ───────────────────────────────────────
+        # SCALPING 1min: Threshold ligeramente más estricto ya que eliminamos filtros
         if override:
-            threshold = 55  # looser threshold during explosion
+            threshold = 58  # SCALPING: era 55
         elif atr > 70:
-            threshold = 65
+            threshold = 62  # SCALPING: era 65
         elif atr < 20:
-            threshold = 58
+            threshold = 60  # SCALPING: era 58
         else:
-            threshold = 62
+            threshold = 60  # SCALPING: era 58
         self.debug_threshold = threshold
+
+        # ══════════════════════════════════════════════════════════════
+        # FASE 0c(iii): CASO SIN DISPARO → NEUTRAL
+        # ══════════════════════════════════════════════════════════════
+        # Si no hay ningún disparador micro-estructural, no hay base
+        # para entrar aunque el contexto sea favorable.
+        if not trigger_bull and not trigger_bear:
+            self.trend_direction = "NEUTRAL"
+            self.confidence = 0
+            self.decision = "ESPERAR"
+            self.regimen_mercado = "RANGO_INDECISO"
+            self.analisis_cuant = (
+                "ESPERAR — Sin disparador micro-estructural "
+                f"(delta_vel={delta_vel:+.0f} div={divergence_score})"
+            )
+            self.trend_label = "◆ SIN DISPARADOR — ESPERANDO MICROESTRUCTURA"
+            self.signal_diagnostics.append(
+                f"No microstructural trigger: delta_vel={delta_vel:+.0f} divergence={divergence_score}"
+            )
+            return
 
         # ── PROVISIONAL SIGNAL ───────────────────────────────────────
         self.confidence = abs(composite - 50) * 2
@@ -2861,7 +3379,168 @@ class OrderFlowBattleBar(QFrame):
         else:
             self.trend_direction = "NEUTRAL"
             self.trend_label = f"◆ WAIT — NO CLEAR EDGE"
+            self.signal_diagnostics.append(
+                f"Composite {composite:.1f} in neutral range [{100-threshold:.1f}-{threshold:.1f}]. "
+                f"Confidence {abs(composite-50)*2:.0f}% < {threshold}% threshold"
+            )
             return  # no further checks needed
+
+        # ══════════════════════════════════════════════════════════════
+        # FASE 0e: DELTA EXHAUSTION — Velocidad Divergence Penalty/Bonus
+        # ══════════════════════════════════════════════════════════════
+        # Detecta cuando el precio se mueve rápido pero delta/CVD
+        # velocity se está desacelerando → el movimiento pierde combustible.
+        #
+        # Reglas:
+        #   Exhaustion a favor de la señal → PENALTY -15%
+        #   Exhaustion en contra del trend principal → BONUS +15%
+        # ────────────────────────────────────────────────────────────────
+        upside_exhaust = False
+        downside_exhaust = False
+
+        if abs(price_velocity) > 0.03:
+            if price_velocity > 0 and delta_accel < -5 and cvd_vel < 2:
+                upside_exhaust = True
+            elif price_velocity < 0 and delta_accel > 5 and cvd_vel > -2:
+                downside_exhaust = True
+
+        exhaustion_label = ""
+        if self.trend_direction == "LONG" and upside_exhaust:
+            self.confidence = max(0, self.confidence - 15)
+            exhaustion_label = " EXH-"
+        elif self.trend_direction == "SHORT" and downside_exhaust:
+            self.confidence = max(0, self.confidence - 15)
+            exhaustion_label = " EXH-"
+
+        exhaustion_bonus = False
+        if expected_direction == "LONG" and downside_exhaust:
+            self.confidence = min(100, self.confidence + 15)
+            exhaustion_bonus = True
+            exhaustion_label = " EXH+"
+        elif expected_direction == "SHORT" and upside_exhaust:
+            self.confidence = min(100, self.confidence + 15)
+            exhaustion_bonus = True
+            exhaustion_label = " EXH+"
+
+        if exhaustion_label:
+            self.trend_label += exhaustion_label
+            if self.confidence == 0:
+                self.trend_direction = "NEUTRAL"
+                self.decision = "ESPERAR"
+                self.regimen_mercado = "DELTA_EXHAUSTION"
+                self.analisis_cuant = (
+                    f"Delta Exhaustion: price_vel={price_velocity:+.4f}% "
+                    f"d_accel={delta_accel:+.0f} cvd_vel={cvd_vel:+.0f}"
+                )
+                self.trend_label = "◆ BLOQUEADO POR DELTA EXHAUSTION"
+                self.signal_diagnostics.append(
+                    f"Blocked by Delta Exhaustion: "
+                    f"price_vel={price_velocity:+.4f}% delta_accel={delta_accel:+.0f} cvd_vel={cvd_vel:+.0f}"
+                )
+                return
+
+        # ── Delta Exhaustion diagnostic (informational even when not blocking) ──
+        if upside_exhaust:
+            self.signal_diagnostics.append(
+                f"Delta Upside Exhaustion detected (-15% penalty applied)"
+            )
+        if downside_exhaust:
+            self.signal_diagnostics.append(
+                f"Delta Downside Exhaustion detected (-15% penalty applied)"
+            )
+        if exhaustion_bonus:
+            self.signal_diagnostics.append(
+                f"Delta Exhaustion bonus (+15% confidence): exhaustion against trend"
+            )
+
+        self.debug_upside_exhaust = upside_exhaust
+        self.debug_downside_exhaust = downside_exhaust
+        self.debug_delta_accel_2 = round(delta_accel, 1)
+        self.debug_cvd_vel = round(cvd_vel, 1)
+        self.debug_cvd_accel = round(cvd_accel, 1)
+        self.debug_exhaustion_bonus = exhaustion_bonus
+
+        # ══════════════════════════════════════════════════════════════
+        # FASE 0c(i): CVD-PRICE DIVERGENCE — bonus / penalty
+        # ══════════════════════════════════════════════════════════════
+        # Divergencia a favor → +15 extra; en contra → -30% raw_composite
+        divergence_contradicts = (
+            (divergence_score == -50 and self.trend_direction == "LONG") or
+            (divergence_score == 50 and self.trend_direction == "SHORT")
+        )
+        divergence_aligns = (
+            (divergence_score == 50 and self.trend_direction == "LONG") or
+            (divergence_score == -50 and self.trend_direction == "SHORT")
+        )
+
+        if divergence_contradicts:
+            raw_composite *= 0.70
+            composite = 50 + (raw_composite - 50) * spread_penalty * tick_penalty
+            self.confidence = abs(composite - 50) * 2
+            self.debug_composite = round(composite, 2)
+            if not (composite > threshold or composite < 100 - threshold):
+                self.trend_direction = "NEUTRAL"
+                self.confidence = 0
+                self.decision = "ESPERAR"
+                self.regimen_mercado = "RANGO_INDECISO"
+                self.analisis_cuant = (
+                    "ESPERAR — Divergencia CVD-Price en contra de la señal "
+                    f"(score={divergence_score})"
+                )
+                self.trend_label = "◆ BLOQUEADO POR DIVERGENCIA CVD-PRECIO"
+                self.signal_diagnostics.append(
+                    f"Blocked by CVD-Price Divergence: divergence_score={divergence_score} "
+                    f"contradicts {self.trend_direction} direction"
+                )
+                return
+        elif divergence_aligns:
+            composite += 15
+            self.confidence = min(100, abs(composite - 50) * 2)
+            self.debug_composite = round(composite, 2)
+            self.trend_label += f" + DIV"
+
+        # ══════════════════════════════════════════════════════════════
+        # FASE 0c(iv): THRESHOLD ADJUSTMENT — Liquidity Sentiment
+        # ══════════════════════════════════════════════════════════════
+        # liq_sent ya fue calculado en FASE 0c(i) antes del composite.
+        # Ajusta el umbral dinámico: sentimiento a favor → -3 (facilita),
+        # en contra → +5 (dificulta, requiere más confianza).
+        threshold_adj = 0
+        if liq_sent > 0 and self.trend_direction == "LONG":
+            threshold_adj = -3
+        elif liq_sent < 0 and self.trend_direction == "SHORT":
+            threshold_adj = -3
+        elif liq_sent > 0 and self.trend_direction == "SHORT":
+            threshold_adj = +5
+        elif liq_sent < 0 and self.trend_direction == "LONG":
+            threshold_adj = +5
+
+        if threshold_adj:
+            threshold += threshold_adj
+            self.debug_threshold = threshold
+            if threshold_adj > 0:
+                re_check = (
+                    composite > threshold
+                    if self.trend_direction == "LONG"
+                    else composite < 100 - threshold
+                )
+                if not re_check:
+                    self.trend_direction = "NEUTRAL"
+                    self.confidence = 0
+                    self.decision = "ESPERAR"
+                    self.regimen_mercado = "RANGO_INDECISO"
+                    self.analisis_cuant = (
+                        "ESPERAR — Sentimiento de liquidez adverso "
+                        f"(funding={self._funding_rate:+.4f}% "
+                        f"oi={self._oi_delta_5min:+.1f}%)"
+                    )
+                    self.trend_label = "◆ BLOQUEADO POR SENTIMIENTO DE LIQUIDEZ"
+                    self.signal_diagnostics.append(
+                        f"Blocked by Liquidity Sentiment: liq_sent={liq_sent:+d} against "
+                        f"{self.trend_direction} (funding={self._funding_rate:+.4f}% "
+                        f"oi={self._oi_delta_5min:+.1f}%)"
+                    )
+                    return
 
         # ══════════════════════════════════════════════════════════════
         # FASE 1: COMPUERTA DE MITIGACIÓN DE RIESGO (v4-Speed)
@@ -2874,6 +3553,9 @@ class OrderFlowBattleBar(QFrame):
             self.regimen_mercado = "BLOQUEO_POR_SPOOFING"
             self.analisis_cuant = f"Spoofing {spoofing_risk:.0f}% > 70% — manipulación activa"
             self.trend_label = "◆ SPOOFING > 70% — BLOQUEO POR MANIPULACIÓN"
+            self.signal_diagnostics.append(
+                f"Blocked by Spoofing Gate (late check): score {spoofing_risk:.0f}% > 70%"
+            )
             return
 
         # b) Active trap cancela si coincide con la dirección provisional
@@ -2887,6 +3569,9 @@ class OrderFlowBattleBar(QFrame):
                     self.regimen_mercado = "EVITANDO_TRAMPA_DEL_BOOK"
                     self.analisis_cuant = "Trampa alcista bloquea LONG"
                     self.trend_label = "◆ TRAMPA ALCISTA — BLOQUEO LONG"
+                    self.signal_diagnostics.append(
+                        f"Blocked by Trap Detector: TRAMPA_ALCISTA blocks LONG"
+                    )
                     return
             elif ("TRAMPA_BAJISTA" in trap_upper or "TRAMPA BAJISTA" in trap_upper):
                 if self.trend_direction == "SHORT":
@@ -2896,6 +3581,9 @@ class OrderFlowBattleBar(QFrame):
                     self.regimen_mercado = "EVITANDO_TRAMPA_DEL_BOOK"
                     self.analisis_cuant = "Trampa bajista bloquea SHORT"
                     self.trend_label = "◆ TRAMPA BAJISTA — BLOQUEO SHORT"
+                    self.signal_diagnostics.append(
+                        f"Blocked by Trap Detector: TRAMPA_BAJISTA blocks SHORT"
+                    )
                     return
 
         # ══════════════════════════════════════════════════════════════
@@ -2912,11 +3600,19 @@ class OrderFlowBattleBar(QFrame):
                 if self.trend_direction == "SHORT" and posicion_rango < RANGO_4H_SHORT_MAX_POSITION:
                     old_conf = self.confidence
                     self.confidence = max(0, self.confidence - RANGO_4H_PENALTY_CONFIDENCE)
+                    self.signal_diagnostics.append(
+                        f"4H Range penalty: SHORT at {posicion_rango*100:.1f}% of 4H range "
+                        f"(confidence {old_conf:.0f}% → {self.confidence:.0f}%)"
+                    )
                     print(f"[RANGO] SHORT penalizado: precio en {posicion_rango*100:.1f}% del rango 4h "
                           f"confianza {old_conf:.0f}% → {self.confidence:.0f}%")
                 elif self.trend_direction == "LONG" and posicion_rango > RANGO_4H_LONG_MIN_POSITION:
                     old_conf = self.confidence
                     self.confidence = max(0, self.confidence - RANGO_4H_PENALTY_CONFIDENCE)
+                    self.signal_diagnostics.append(
+                        f"4H Range penalty: LONG at {posicion_rango*100:.1f}% of 4H range "
+                        f"(confidence {old_conf:.0f}% → {self.confidence:.0f}%)"
+                    )
                     print(f"[RANGO] LONG penalizado: precio en {posicion_rango*100:.1f}% del rango 4h "
                           f"confianza {old_conf:.0f}% → {self.confidence:.0f}%")
 
@@ -2931,11 +3627,19 @@ class OrderFlowBattleBar(QFrame):
                 self.momentum_1min_pct = round(momentum_1min * 100, 3)
                 if self.trend_direction == "SHORT" and momentum_1min > MOMENTUM_CONTRADICT_THRESHOLD:
                     self.confidence = max(0, self.confidence - 30)
+                    self.signal_diagnostics.append(
+                        f"Momentum contradiction penalty: SHORT penalized by bullish momentum "
+                        f"{momentum_1min*100:.3f}% in 60s (confidence → {self.confidence:.0f}%)"
+                    )
                     print(f"[MOMENTUM] SHORT penalizado por momentum alcista: "
                           f"{momentum_1min*100:.3f}% en 60s "
                           f"confianza → {self.confidence:.0f}%")
                 elif self.trend_direction == "LONG" and momentum_1min < -MOMENTUM_CONTRADICT_THRESHOLD:
                     self.confidence = max(0, self.confidence - 30)
+                    self.signal_diagnostics.append(
+                        f"Momentum contradiction penalty: LONG penalized by bearish momentum "
+                        f"{momentum_1min*100:.3f}% in 60s (confidence → {self.confidence:.0f}%)"
+                    )
                     print(f"[MOMENTUM] LONG penalizado por momentum bajista: "
                           f"{momentum_1min*100:.3f}% en 60s "
                           f"confianza → {self.confidence:.0f}%")
@@ -2950,6 +3654,10 @@ class OrderFlowBattleBar(QFrame):
                 f"ALZA conf={self.confidence:.0f}% magnet={self.liquidity_magnet} "
                 f"tp={self.provisional_tp:.0f} hft={hft_speed:.1f}"
             )
+            if self.confidence < 10:
+                self.signal_diagnostics.append(
+                    f"LONG signal but confidence {self.confidence:.0f}% critically low"
+                )
         elif self.trend_direction == "SHORT":
             self.decision = "BAJA"
             self.regimen_mercado = self.regimen_mercado or "ABSORCION_INSTITUCIONAL_CONFIRMADA"
@@ -2957,10 +3665,18 @@ class OrderFlowBattleBar(QFrame):
                 f"BAJA conf={self.confidence:.0f}% magnet={self.liquidity_magnet} "
                 f"tp={self.provisional_tp:.0f} hft={hft_speed:.1f}"
             )
+            if self.confidence < 10:
+                self.signal_diagnostics.append(
+                    f"SHORT signal but confidence {self.confidence:.0f}% critically low"
+                )
         else:
             self.decision = "ESPERAR"
             self.regimen_mercado = "RANGO_INDECISO"
             self.analisis_cuant = "ESPERAR — sin confluencia suficiente"
+            if not self.signal_diagnostics:
+                self.signal_diagnostics.append(
+                    f"No clear edge: composite {composite:.1f} in neutral range"
+                )
 
     # ── Mejora 7: Ajustar TP dinámico por velocidad de precio ─────────────
     def _adjust_tp_by_velocity(self, provisional_tp, price, magnet_label):
@@ -3557,7 +4273,7 @@ class ConfluenceMatrixWidget(QFrame):
         if score >= 60:
             t, col, bg = f"{score:.0f}% BULLISH", COLORS['accent_cyan'], "rgba(0,245,255,0.12)"
         elif score <= 40:
-            t, col, bg = f"{100-score:.0f}% BEARISH", COLORS['accent_magenta'], "rgba(255,0,255,0.12)"
+            t, col, bg = f"{100-score:.0f}% BEARISH", COLORS['accent_magenta'], "rgba(248,81,73,0.15)"
         else:
             t, col, bg = f"{score:.0f}% NEUTRAL", COLORS['accent_gold'], "rgba(255,204,0,0.12)"
         self.score_lbl.setText(t)
@@ -4103,7 +4819,7 @@ class MarketNarrativePanel(QFrame):
         self.lbl_imb_bar_bg.setStyleSheet("background: #111620; border-radius: 4px; border: none;")
         self.lbl_imb_bar_fill = QFrame(self.lbl_imb_bar_bg)
         self.lbl_imb_bar_fill.setFixedHeight(8)
-        self.lbl_imb_bar_fill.setStyleSheet("background: #00ff66; border-radius: 4px; border: none;")
+        self.lbl_imb_bar_fill.setStyleSheet("background: #39d353; border-radius: 4px; border: none;")
         root.addWidget(self.lbl_imb_bar_bg)
         self.lbl_imb_text = html_label()
         root.addWidget(self.lbl_imb_text)
@@ -4146,7 +4862,7 @@ class MarketNarrativePanel(QFrame):
     @staticmethod
     def _row(label, value, color):
         return (f"<tr>"
-                f"<td style='color:#556677; padding:1px 4px;'>{label}</td>"
+                f"<td style='color:#c9d1d9; padding:1px 4px;'>{label}</td>"
                 f"<td align='right' style='color:{color}; font-weight:bold; padding:1px 4px;'>{value}</td>"
                 f"</tr>")
 
@@ -4201,21 +4917,21 @@ class MarketNarrativePanel(QFrame):
         hft_color = "#FF6644" if hft_speed > 5 else "#ffcc00" if hft_speed > 2 else "#445566"
         if abs(delta_pct) > 35 and total_vol > 3:
             direction = "🔵 BALLENA COMPRADORA" if delta > 0 else "🔴 BALLENA VENDEDORA"
-            w_color   = "#00ff66" if delta > 0 else "#bb00ff"
+            w_color   = "#39d353" if delta > 0 else "#f85149"
             whale_html = (f"<div style='background:#0a1520; padding:5px; border-left:3px solid {w_color}; border-radius:3px;'>"
                           f"<b style='color:{w_color};'>{direction}</b><br>"
-                          f"<span style='color:#aaa; font-family:monospace;'>Δ {delta:+.2f} ₿ ({delta_pct:+.1f}%)</span><br>"
-                          f"<span style='color:#aaa; font-family:monospace;'>Vel: {ts:.1f} ticks/s</span>"
+                          f"<span style='color:#c9d1d9; font-family:monospace;'>Δ {delta:+.2f} ₿ ({delta_pct:+.1f}%)</span><br>"
+                          f"<span style='color:#c9d1d9; font-family:monospace;'>Vel: {ts:.1f} ticks/s</span>"
                           f"</div>")
         elif abs(delta_pct) > 15 and total_vol > 3:
             direction = "🟢 AGRESIÓN COMPRADORA" if delta > 0 else "🟣 AGRESIÓN VENDEDORA"
-            w_color   = "#00ff66" if delta > 0 else "#bb00ff"
+            w_color   = "#39d353" if delta > 0 else "#f85149"
             whale_html = (f"<div style='background:#0a1520; padding:5px; border-left:3px solid {w_color}; border-radius:3px;'>"
                           f"<b style='color:{w_color};'>{direction}</b><br>"
-                          f"<span style='color:#aaa; font-family:monospace;'>Δ {delta:+.2f} ₿ ({delta_pct:+.1f}%)</span>"
+                          f"<span style='color:#c9d1d9; font-family:monospace;'>Δ {delta:+.2f} ₿ ({delta_pct:+.1f}%)</span>"
                           f"</div>")
         else:
-            whale_html = (f"<span style='color:#445566; font-family:monospace;'>⚪ Sin anomalías &nbsp; Δ {delta:+.2f} ₿ ({delta_pct:+.1f}%)</span>")
+            whale_html = (f"<span style='color:#c9d1d9; font-family:monospace;'>⚪ Sin anomalías &nbsp; Δ {delta:+.2f} ₿ ({delta_pct:+.1f}%)</span>")
 
         whale_html += (f"<div style='margin-top:4px; font-family:monospace; font-size:10px;'>"
                        f"<span style='color:{hft_color};'>HFT Speed: {hft_speed:.1f} inst/s</span>"
@@ -4224,6 +4940,9 @@ class MarketNarrativePanel(QFrame):
 
         # ── 2. INSTITUTIONAL POSITIONS ─────────────────────────────────────
         inst_html = ""
+        # Dynamic decimal places based on current price
+        current_price_narr = float(state.get('price', 0) or 0)
+        _, dp_inst = get_tick_info(current_price_narr)
         # Use z-score filtered walls from analyze_whale_walls() when available
         ld_pre = state.get('liquidity_data', {})
         if ld_pre and (ld_pre.get('buy_walls') or ld_pre.get('sell_walls')):
@@ -4234,23 +4953,23 @@ class MarketNarrativePanel(QFrame):
             whale_asks_display = whale_asks
 
         for p, q in whale_bids_display[:2]:
-            inst_html += (f"<div style='background:#002233; padding:3px 5px; margin:2px; border-left:3px solid #00ff66; border-radius:2px;'>"
-                          f"<b style='color:#00ff66;'>🐋 BID {q:.1f}₿</b> "
-                          f"<span style='color:#aaa;'>@ ${p:,.0f}</span></div>")
+            inst_html += (f"<div style='background:#002233; padding:3px 5px; margin:2px; border-left:3px solid #39d353; border-radius:2px;'>"
+                          f"<b style='color:#39d353;'>🐋 BID {q:.1f}₿</b> "
+                          f"<span style='color:#c9d1d9;'>@ ${format_price(p, dp_inst)}</span></div>")
         for p, q in whale_asks_display[:2]:
-            inst_html += (f"<div style='background:#1a0033; padding:3px 5px; margin:2px; border-left:3px solid #bb00ff; border-radius:2px;'>"
-                          f"<b style='color:#bb00ff;'>🐋 ASK {q:.1f}₿</b> "
-                          f"<span style='color:#aaa;'>@ ${p:,.0f}</span></div>")
+            inst_html += (f"<div style='background:#1a0033; padding:3px 5px; margin:2px; border-left:3px solid #f85149; border-radius:2px;'>"
+                          f"<b style='color:#f85149;'>🐋 ASK {q:.1f}₿</b> "
+                          f"<span style='color:#c9d1d9;'>@ ${format_price(p, dp_inst)}</span></div>")
         for p, q in inst_bids[:1]:
-            inst_html += (f"<div style='background:#001a11; padding:3px 5px; margin:2px; border-left:3px solid #00ff66; border-radius:2px;'>"
-                          f"<span style='color:#00ff66;'>🏦 INST BID {q:.1f}₿</span> "
-                          f"<span style='color:#888;'>@ ${p:,.0f}</span></div>")
+            inst_html += (f"<div style='background:#001a11; padding:3px 5px; margin:2px; border-left:3px solid #39d353; border-radius:2px;'>"
+                          f"<span style='color:#39d353;'>🏦 INST BID {q:.1f}₿</span> "
+                          f"<span style='color:#c9d1d9;'>@ ${format_price(p, dp_inst)}</span></div>")
         for p, q in inst_asks[:1]:
-            inst_html += (f"<div style='background:#1a0011; padding:3px 5px; margin:2px; border-left:3px solid #bb00ff; border-radius:2px;'>"
-                          f"<span style='color:#bb00ff;'>🏦 INST ASK {q:.1f}₿</span> "
-                          f"<span style='color:#888;'>@ ${p:,.0f}</span></div>")
+            inst_html += (f"<div style='background:#1a0011; padding:3px 5px; margin:2px; border-left:3px solid #f85149; border-radius:2px;'>"
+                          f"<span style='color:#f85149;'>🏦 INST ASK {q:.1f}₿</span> "
+                          f"<span style='color:#c9d1d9;'>@ ${format_price(p, dp_inst)}</span></div>")
         if not inst_html:
-            inst_html = "<span style='color:#334455; font-family:monospace;'>Sin posiciones institucionales visibles</span>"
+            inst_html = "<span style='color:#c9d1d9; font-family:monospace;'>Sin posiciones institucionales visibles</span>"
         self.lbl_inst.setText(inst_html)
 
         # ── 3. LIQUIDITY TRAPS ─────────────────────────────────────────────
@@ -4270,9 +4989,9 @@ class MarketNarrativePanel(QFrame):
         # Trap OFF conditions
         if bid_wall_near or ask_wall_near:
             has_wall_narr = True
-            cancel_ok = cancel_rate_narr > 55.0
-            depth_ok = abs(depth_imb_narr) > 45.0
-            tick_brake = abs(delta_vel_narr) * 10 > 500 and tick_speed_narr < 15
+            cancel_ok = cancel_rate_narr > TRAP_CANCEL_RATE_THRESHOLD
+            depth_ok = abs(depth_imb_narr) > TRAP_DEPTH_IMB_THRESHOLD
+            tick_brake = abs(delta_vel_narr) * 10 > TRAP_TICK_BRAKE_THRESHOLD and tick_speed_narr < TRAP_TICK_SPEED_MAX
 
             if not cancel_ok or not depth_ok:
                 # Legitimate S/R — mark as operational
@@ -4282,25 +5001,25 @@ class MarketNarrativePanel(QFrame):
                 if bid_wall_near and cvd < -2 and delta < 0:
                     trap_html += (f"<div style='background:#1a0808; padding:4px 5px; margin:2px; border-left:3px solid #FF2244; border-radius:2px;'>"
                                   f"<b style='color:#FF2244;'>🔴 TRAMPA ALCISTA</b><br>"
-                                  f"<span style='color:#aaa; font-size:10px;'>Muro BID {bid_wall_near[1]:.1f}₿ @ ${bid_wall_near[0]:,.0f} con CVD bajista — stop hunt en curso</span>"
+                                  f"<span style='color:#c9d1d9; font-size:10px;'>Muro BID {bid_wall_near[1]:.1f}₿ @ ${format_price(bid_wall_near[0])} con CVD bajista — stop hunt en curso</span>"
                                   f"</div>")
 
                 # Ask trap: big ask wall but CVD rising (buying into resistance)
                 if ask_wall_near and cvd > 2 and delta > 0:
                     trap_html += (f"<div style='background:#0a1a08; padding:4px 5px; margin:2px; border-left:3px solid #FF2244; border-radius:2px;'>"
                                   f"<b style='color:#FF2244;'>🔴 TRAMPA BAJISTA</b><br>"
-                                  f"<span style='color:#aaa; font-size:10px;'>Muro ASK {ask_wall_near[1]:.1f}₿ @ ${ask_wall_near[0]:,.0f} con CVD alcista — fakeout en curso</span>"
+                                  f"<span style='color:#c9d1d9; font-size:10px;'>Muro ASK {ask_wall_near[1]:.1f}₿ @ ${format_price(ask_wall_near[0])} con CVD alcista — fakeout en curso</span>"
                                   f"</div>")
 
         # Absorption: high vol + price not moving = absorption
         if ba_ratio > 0.7 and ba_ratio < 1.3 and total_vol > 5:
             trap_html += (f"<div style='background:#111a22; padding:4px 5px; margin:2px; border-left:3px solid #ffcc00; border-radius:2px;'>"
                           f"<b style='color:#ffcc00;'>⚡ ABSORCIÓN ACTIVA</b><br>"
-                          f"<span style='color:#aaa; font-size:10px;'>B/A {ba_ratio:.2f}x — Institucional acumulando ambos lados</span>"
+                          f"<span style='color:#c9d1d9; font-size:10px;'>B/A {ba_ratio:.2f}x — Institucional acumulando ambos lados</span>"
                           f"</div>")
 
         if not trap_html:
-            trap_html = "<span style='color:#334455; font-family:monospace;'>Sin trampas detectadas</span>"
+            trap_html = "<span style='color:#c9d1d9; font-family:monospace;'>Sin trampas detectadas</span>"
 
         # ── Liquidation Tracker mini-feed ────────────────────────────────
         liq_list = state.get('liquidation_events', [])
@@ -4308,13 +5027,13 @@ class MarketNarrativePanel(QFrame):
             liq_html = "<div style='margin-top:4px; border-top:1px solid #1a1f2e; padding-top:4px;'>"
             for liq in liq_list[-6:]:  # last 6
                 is_long_liq = liq.get('side') == 'SELL'
-                lcolor = "#00ff66" if is_long_liq else "#FF2244"
+                lcolor = "#39d353" if is_long_liq else "#FF2244"
                 badge = "LONG⬆" if is_long_liq else "SHORT⬇"
                 lsize = liq.get('total_value', 0)
                 liq_html += (f"<div style='display:inline-block; background:#0d1117; margin:1px; padding:1px 4px; "
                              f"border-left:2px solid {lcolor}; border-radius:2px; font-size:9px; font-family:monospace;'>"
                              f"<span style='color:{lcolor};'>{badge}</span> "
-                             f"<span style='color:#aaa;'>${lsize:,.0f}</span>"
+                              f"<span style='color:#c9d1d9;'>${lsize:,.0f}</span>"
                              f"</div>")
             liq_html += "</div>"
             trap_html += liq_html
@@ -4326,25 +5045,25 @@ class MarketNarrativePanel(QFrame):
         bar_w    = int((self.width() - 20) * fill_pct)
         if bar_w > 0:
             self.lbl_imb_bar_fill.setFixedWidth(bar_w)
-        imb_color = "#00ff66" if imb > 0.2 else "#bb00ff" if imb < -0.2 else "#ffcc00"
+        imb_color = "#39d353" if imb > 0.2 else "#f85149" if imb < -0.2 else "#ffcc00"
         self.lbl_imb_bar_fill.setStyleSheet(f"background: {imb_color}; border-radius: 4px; border: none;")
 
         imb_label  = "BIDS DOMINAN" if depth_imb_pct > 10 else "ASKS DOMINAN" if depth_imb_pct < -10 else "EQUILIBRADO"
-        imb_tcolor = "#00ff66" if depth_imb_pct > 10 else "#bb00ff" if depth_imb_pct < -10 else "#ffcc00"
+        imb_tcolor = "#39d353" if depth_imb_pct > 10 else "#f85149" if depth_imb_pct < -10 else "#ffcc00"
         imb_html   = (f"<table width='100%' style='font-family:monospace; font-size:11px;'>"
                       f"{self._row('Depth Imb.', f'{depth_imb_pct:+.1f}%', imb_tcolor)}"
-                      f"{self._row('Total Bids', f'{total_bid_depth:.1f}₿', '#00ff66')}"
-                      f"{self._row('Total Asks', f'{total_ask_depth:.1f}₿', '#bb00ff')}"
+                      f"{self._row('Total Bids', f'{total_bid_depth:.1f}₿', '#39d353')}"
+                      f"{self._row('Total Asks', f'{total_ask_depth:.1f}₿', '#f85149')}"
                       f"</table>")
         self.lbl_imb_text.setText(imb_html)
 
         # ── 5. MICROSTRUCTURE ──────────────────────────────────────────────
         cvd_label   = "BULLISH ↑" if cvd > 2  else "BEARISH ↓" if cvd < -2 else "PLANO →"
-        cvd_color   = "#00ff66"   if cvd > 2  else "#bb00ff"   if cvd < -2 else "#888"
+        cvd_color   = "#39d353"   if cvd > 2  else "#f85149"   if cvd < -2 else "#c9d1d9"
         kauf_label  = "TENDENCIA" if kaufman > 0.6 else "RANGO"
-        kauf_color  = "#00ff66"   if kaufman > 0.6 else "#ffcc00"
-        ba_color    = "#00ff66"   if ba_ratio > 1.2 else "#bb00ff" if ba_ratio < 0.8 else "#888"
-        sv_color    = "#bb00ff"   if spread_vel > 10 else "#888"
+        kauf_color  = "#39d353"   if kaufman > 0.6 else "#ffcc00"
+        ba_color    = "#39d353"   if ba_ratio > 1.2 else "#f85149" if ba_ratio < 0.8 else "#c9d1d9"
+        sv_color    = "#f85149"   if spread_vel > 10 else "#c9d1d9"
 
         cancel_rate_narr = state.get('cancel_rate', 0.0)
         spoofing_risk = state.get('spoofing_risk', 0.0)
@@ -4368,10 +5087,10 @@ class MarketNarrativePanel(QFrame):
             dec_color = "#FF2244"
         elif trend == 'ALCISTA' and depth_imb_pct > 10 and cvd > 2 and not whale_asks:
             decision  = "🟢 LONG CONFIRMADO\nAbsorción + Flujo comprador + Sin muros encima"
-            dec_color = "#00ff66"
+            dec_color = "#39d353"
         elif trend == 'BAJISTA' and depth_imb_pct < -10 and cvd < -2 and not whale_bids:
             decision  = "🔴 SHORT CONFIRMADO\nRechazo + Flujo vendedor + Sin muros abajo"
-            dec_color = "#bb00ff"
+            dec_color = "#f85149"
         elif abs(depth_imb_pct) > 20 and abs(delta_pct) > 20:
             decision  = "⚡ SEÑAL PARCIAL\nEsperando confluencia adicional"
             dec_color = "#ffcc00"
@@ -4382,8 +5101,8 @@ class MarketNarrativePanel(QFrame):
         self.lbl_decision.setText(decision)
         self.lbl_decision.setStyleSheet(
             f"color: {dec_color}; font-size: 12px; font-weight: 900; "
-            f"background: #0d1117; padding: 10px; border-radius: 6px; "
-            f"border: 2px solid {dec_color};"
+            f"background: #000000; padding: 10px; border-radius: 6px; "
+            f"border: 1px solid {dec_color};"
         )
 
         # ── Emergency dimming: SEÑAL PARCIAL / SIN VENTAJA ──────────────
@@ -4519,12 +5238,11 @@ class BrainInferenceWorker(QThread):
 class GeminiInferenceWorker(QThread):
     """Background QThread for Gemini 2.0 Flash inference.
 
-    Runs ``execute_inference()`` in its own temporary asyncio event-loop
-    so the UI thread is never blocked.  Emits a ``GeminiTradingDecision``
-    or ``None`` via ``gemini_finished``.
+    Lee el régimen cachead del monitor de fondo (``get_cached_regime()``,
+    <1ms) en vez de llamar a Gemini en tiempo real.  Para análisis profundos
+    (con contexto episódico/métricas) usa ``execute_inference()`` directo.
 
-    Supports inter-brain dialogue by receiving episodic_context and
-    pytorch_metrics from the quantum brain.
+    Emite un ``GeminiTradingDecision`` o ``None`` via ``gemini_finished``.
     """
 
     gemini_finished = pyqtSignal(object)
@@ -4540,19 +5258,32 @@ class GeminiInferenceWorker(QThread):
         self.pytorch_metrics = pytorch_metrics
 
     def run(self):
-        import asyncio
-        try:
-            result = asyncio.run(
-                self.gemini_brain.execute_inference(
-                    self.snapshot,
-                    episodic_context=self.episodic_context,
-                    pytorch_metrics=self.pytorch_metrics,
+        # Si el worker pide análisis profundo (con contexto episódico o
+        # métricas PyTorch), ejecuta inferencia real.  En caso contrario
+        # lee la caché del monitor de fondo (ultra-rápido).
+        if self.episodic_context or self.pytorch_metrics:
+            import asyncio
+            try:
+                result = asyncio.run(
+                    self.gemini_brain.execute_inference(
+                        self.snapshot,
+                        episodic_context=self.episodic_context,
+                        pytorch_metrics=self.pytorch_metrics,
+                    )
                 )
-            )
-            self.gemini_finished.emit(result)
-        except Exception as e:
-            print(f"[⚠️ GEMINI WORKER] Error en inferencia: {e}")
-            self.gemini_finished.emit(None)
+                self.gemini_finished.emit(result)
+            except Exception as e:
+                print(f"[⚠️ GEMINI WORKER] Error en inferencia profunda: {e}")
+                self.gemini_finished.emit(None)
+        else:
+            # Fast path: leer caché del monitor de régimen (<1ms)
+            try:
+                cached = self.gemini_brain.get_cached_regime()
+                decision = cached.get("_raw_decision")
+                self.gemini_finished.emit(decision)
+            except Exception as e:
+                print(f"[⚠️ GEMINI WORKER] Error leyendo caché de régimen: {e}")
+                self.gemini_finished.emit(None)
 
 
 class F4Worker(QThread):
@@ -4772,6 +5503,7 @@ class SignalMonitorTab(QFrame):
 
         # Execution state
         self._order_busy = False
+        self._signal_from_manual = False     # SCALPING: distingue auto vs manual para TTL
         self._risk_pct = 2.5
         self._capital_preset = 100
 
@@ -4839,7 +5571,46 @@ class SignalMonitorTab(QFrame):
         # ── Entry stats (para ajuste de thresholds) ───────────────────
         self.entry_stats = {
             "reentry_rechazado_senal_vieja": 0,
+            "momentum_institucional_detectado": 0,
         }
+
+        # ── Deep book snapshot (for counterparty scanning) ──
+        self._deep_book = None
+
+        # ── FLASH MOVE DETECTION ──
+        self._flash_detected = False
+        self._flash_classification = "NONE"       # NONE, ORGANICO, BALLENA, FLASH
+        self._flash_price_change = 0.0
+        self._flash_velocity_pct = 0.0
+        self._flash_timestamp = 0.0
+        self.price_buffer_100ms = deque(maxlen=30)  # (ts, price) para micro flash
+
+        # ── WHALE IMPACT SCORE ──
+        self._whale_impact_score = 0.0
+        self._whale_impact_label = "LOW"           # LOW, MEDIUM, HIGH, EXTREME
+        self._force_absorption_btc_s = 0.0         # BTC/s de absorción
+        self._force_score = 0.0                    # 0-100 métrica de fuerza real
+        self._absorption_history = deque(maxlen=10) # historial de absorciones
+
+        # ── CONTRAPARTE SCANNER ──
+        self._counterparty_clusters = []            # [{price, btc, distance_pct, side}...]
+        self._next_cluster_price = 0.0
+        self._next_cluster_btc = 0.0
+        self._next_cluster_distance = 0.0
+        self._projected_move_ticks = 0
+        self._projected_move_pct = 0.0
+
+        # ── DYNAMIC SL/TP ──
+        self._dynamic_sl_price = 0.0
+        self._dynamic_tp_price = 0.0
+        self._book_sl_found = False                 # True si se encontró muro para SL
+        self._book_tp_found = False                 # True si se encontró cluster para TP
+
+        # ── TRAP OVERRIDE STATE ──
+        self._trap_overridden = False
+
+        # ── SIGNAL DIAGNOSTICS (acumula bloqueos de SignalMonitorTab) ──
+        self._signal_diagnostics = []
 
         self._on_ai_result_signal.connect(self._on_ai_result)
         self._init_ui()
@@ -4876,12 +5647,15 @@ class SignalMonitorTab(QFrame):
         self._price = data.get("price", self._price)
         self._change_pct = data.get("change_pct", self._change_pct)
         self._current_price = self._price
+        self._vol_ratio = data.get("vol_ratio", 1.0)
+        self._delta = data.get("delta", 0)
 
         # ═══════════════════════════════════════════════════════════════
         # MEJORA 4: alimentar buffer de precio 1s
         # ═══════════════════════════════════════════════════════════════
         if self._price > 0:
             self.price_buffer_1s.append((time.time(), self._price))
+            self.price_buffer_100ms.append((time.time(), self._price))
 
         # ═══════════════════════════════════════════════════════════════
         # MEJORA 8: verificar si el precio volvió a la zona de re-entry
@@ -4896,7 +5670,7 @@ class SignalMonitorTab(QFrame):
                     direction = re["direction"]
                     if direction in ("LONG", "SHORT"):
                         # ── FIX 2: señal demasiado vieja ────────────────
-                        signal_age = (datetime.utcnow() - data.get("signal_ts", datetime.min)).total_seconds()
+                        signal_age = (datetime.now(timezone.utc) - data.get("signal_ts", datetime.min.replace(tzinfo=timezone.utc))).total_seconds()
                         if signal_age > 8.0:
                             print(f"[SIGNAL MONITOR] Re-entry rechazado: señal tiene {signal_age:.1f}s de antigüedad")
                             self.entry_stats["reentry_rechazado_senal_vieja"] = self.entry_stats.get("reentry_rechazado_senal_vieja", 0) + 1
@@ -4944,6 +5718,9 @@ class SignalMonitorTab(QFrame):
                             reason_str = " | ".join(reasons)
                             msg = f"🚫 RE-ENTRY RECHAZADO — {reason_str}"
                             print(f"[SIGNAL MONITOR] {msg}")
+                            self._signal_diagnostics = [
+                                f"Re-entry rejected: price returned to zone but {reason_str}"
+                            ]
                             if self._executor and hasattr(self._executor, 'order_result'):
                                 self._executor.order_result.emit(False, msg, {"error": msg, "reason": "reentry_rechazado"})
                     self.pending_reentry = None
@@ -4960,6 +5737,9 @@ class SignalMonitorTab(QFrame):
             self._signal_direction = "NEUTRAL"
             self._signal_confidence = 0
             self._trend_label = "◆ POSICIÓN ACTIVA — SIN SEÑAL"
+            self._signal_diagnostics = [
+                f"Blocked by Position Mutex: {incoming_dir} ignored - position {pos_side} already open"
+            ]
         else:
             self._signal_direction = incoming_dir
             self._signal_confidence = data.get("confidence", self._signal_confidence)
@@ -5012,6 +5792,20 @@ class SignalMonitorTab(QFrame):
         # ── Mejora 2: whale walls para absorción ───────────────────
         self._whale_bid_walls = data.get("whale_bid_walls", self._whale_bid_walls)
         self._whale_ask_walls = data.get("whale_ask_walls", self._whale_ask_walls)
+
+        # ═══════════════════════════════════════════════════════════════
+        # NUEVO: detección de flash, fuerza, proyección (después de walls)
+        # ═══════════════════════════════════════════════════════════════
+        self._detect_flash_move()
+        self._compute_whale_impact_score()
+        if self._whale_bid_walls or self._whale_ask_walls:
+            total_wall = sum(
+                abs(float(w.get('quantity', w.get('size', 0))) if isinstance(w, dict) else float(w[1]))
+                for w in (self._whale_bid_walls + self._whale_ask_walls)
+            )
+            self._absorption_history.append((time.time(), total_wall))
+            if self._signal_direction in ("LONG", "SHORT"):
+                self._project_candle_move(self._signal_direction)
 
         self._refresh_ui()
 
@@ -5198,6 +5992,12 @@ class SignalMonitorTab(QFrame):
         # Reason label
         self._sig_reason = self._sl("◆ Analizando mercado...", "#aaa", 10)
         cl.addWidget(self._sig_reason)
+
+        # Diagnostics label (hidden when empty)
+        self._sig_diag = self._sl("", "#ff8844", 8, False)
+        self._sig_diag.setWordWrap(True)
+        self._sig_diag.setVisible(False)
+        cl.addWidget(self._sig_diag)
 
         layout.addWidget(card)
 
@@ -5514,7 +6314,7 @@ class SignalMonitorTab(QFrame):
             "QPushButton:hover { background: #2a2a0f; }"
             "QPushButton:pressed { background: #3a3a1a; }"
             "QPushButton:disabled { color: #333; border-color: #222; background: #0a0a0a; }")
-        self._ex_autorizar.clicked.connect(self._execute_signal)
+        self._ex_autorizar.clicked.connect(lambda: self._execute_signal(from_manual=True))
         row.addWidget(self._ex_autorizar)
 
         row.addStretch()
@@ -5723,6 +6523,7 @@ class SignalMonitorTab(QFrame):
 
     def _build_snapshot(self):
         return {
+            "_snapshot_time": int(time.time() * 1000),  # 🕐 inicio del snapshot en ms
             "price": self._price,
             "change_pct": self._change_pct,
             "rsi": self._rsi,
@@ -5768,7 +6569,6 @@ class SignalMonitorTab(QFrame):
             "book_depth_asks_volume": self._book_depth_asks_volume,
             "magnet_timestamp": self._magnet_timestamp,
             "magnet_price_at_set": self._magnet_price_at_set,
-            "_snapshot_time": time.time(),
         }
 
     # ── Execution ──────────────────────────────────────────────────────
@@ -5803,19 +6603,22 @@ class SignalMonitorTab(QFrame):
         self._ex_status.setText(f"⟳ Enviando {side} {qty:.4f} BTC ({lev}x)…")
         self._ex_status.setStyleSheet("color: #ffcc00; font-size: 10px; background: transparent; border: none;")
 
-    def _execute_signal(self):
+    def _execute_signal(self, from_manual=False):
         if self._order_busy or self._executor is None or self._signal_direction == "NEUTRAL":
             return
+        self._signal_from_manual = from_manual  # SCALPING: TTL diferencial auto/manual
 
-        # ── TTL: expire signals older than 45 seconds ────────────────
+        # ── TTL: expire signals older than threshold ─────────────────
+        # SCALPING 1min: 90s auto, 120s manual
+        ttl_seconds = SCALPING_MANUAL_TTL_SEC if self._signal_from_manual else SCALPING_TTL_SEC
         elapsed = time.time() - self._signal_timestamp
-        if self._signal_timestamp <= 0 or elapsed > 45:
+        if self._signal_timestamp <= 0 or elapsed > ttl_seconds:
             reason = (
                 "⏰ SEÑAL EXPIRADA"
                 if self._signal_timestamp > 0
                 else "⚠️ SEÑAL NO INICIALIZADA"
             )
-            msg = f"{reason} — Tiempo máximo de espera superado ({elapsed:.0f}s > 45s)"
+            msg = f"{reason} — Tiempo máximo de espera superado ({elapsed:.0f}s > {ttl_seconds}s)"
             print(f"[SIGNAL MONITOR] {msg}")
             self._ex_status.setText(f"🚫 {msg}")
             self._ex_status.setStyleSheet("color: #ff4444; font-size: 10px; background: transparent; border: none;")
@@ -5845,7 +6648,10 @@ class SignalMonitorTab(QFrame):
         # ════════════════════════════════════════════════════════════════
         # MEJORA 4: PRICE VELOCITY — abortar si movimiento violento
         # ════════════════════════════════════════════════════════════════
-        velo_result = self._check_price_velocity()
+        velo_result = self._check_price_velocity(
+            vol_ratio=getattr(self, '_vol_ratio', 1.0),
+            delta=getattr(self, '_delta', 0),
+        )
         if velo_result == "ABORTAR":
             reason = "PRICE_VELOCITY_ABORT"
             self.entry_stats[reason] = self.entry_stats.get(reason, 0) + 1
@@ -5862,19 +6668,36 @@ class SignalMonitorTab(QFrame):
             print(f"[SIGNAL MONITOR] Velocidad elevada — multiplicador reducido 50%")
 
         # ════════════════════════════════════════════════════════════════
+        # TRAP OVERRIDE — ignorar trampa si hay confirmación fuerte
+        # ════════════════════════════════════════════════════════════════
+        self._trap_overridden = False
+        if TRAP_OVERRIDE_CONFIRMATION and self._active_trap and self._active_trap != "SIN TRAMPA":
+            trap_prob = getattr(self, '_trap_probability', 0)
+            delta_val = abs(getattr(self, '_delta', 0))
+            vol_ratio_val = getattr(self, '_vol_ratio', 1.0)
+            if (trap_prob < TRAP_OVERRIDE_MAX_PROB
+                    and delta_val >= TRAP_OVERRIDE_MIN_DELTA
+                    and vol_ratio_val >= TRAP_OVERRIDE_MIN_VOL_RATIO):
+                self._trap_overridden = True
+                log.info("Trap override: trampa %s ignorada (prob=%d%% delta=%d vol=%.1fx)",
+                         self._active_trap, trap_prob, delta_val, vol_ratio_val)
+
+        # ════════════════════════════════════════════════════════════════
         # MEJORA 3: VENTANA POST-IMBALANCE — abortar si pasó ventana
         # ════════════════════════════════════════════════════════════════
-        if self.imbalance_detected_at > 0:
-            imbalance_elapsed = time.time() - self.imbalance_detected_at
-            if imbalance_elapsed > IMBALANCE_WINDOW_SEC:
-                reason = "IMBALANCE_WINDOW_EXPIRED"
-                self.entry_stats[reason] = self.entry_stats.get(reason, 0) + 1
-                msg = f"⏰ VENTANA POST-IMBALANCE EXPIRADA ({imbalance_elapsed:.1f}s > {IMBALANCE_WINDOW_SEC}s) — señal abortada"
-                print(f"[SIGNAL MONITOR] {msg}")
-                self._ex_status.setText(f"🚫 {msg}")
-                self._ex_status.setStyleSheet("color: #ff4444; font-size: 10px; background: transparent; border: none;")
-                self._order_busy = False
-                return
+        # SCALPING 1min: Desactivado — entramos justo en el imbalance, no después
+        if POST_IMBALANCE_ENABLED:
+            if self.imbalance_detected_at > 0:
+                imbalance_elapsed = time.time() - self.imbalance_detected_at
+                if imbalance_elapsed > IMBALANCE_WINDOW_SEC:
+                    reason = "IMBALANCE_WINDOW_EXPIRED"
+                    self.entry_stats[reason] = self.entry_stats.get(reason, 0) + 1
+                    msg = f"⏰ VENTANA POST-IMBALANCE EXPIRADA ({imbalance_elapsed:.1f}s > {IMBALANCE_WINDOW_SEC}s) — señal abortada"
+                    print(f"[SIGNAL MONITOR] {msg}")
+                    self._ex_status.setText(f"🚫 {msg}")
+                    self._ex_status.setStyleSheet("color: #ff4444; font-size: 10px; background: transparent; border: none;")
+                    self._order_busy = False
+                    return
 
         # ════════════════════════════════════════════════════════════════
         # MEJORA 2: ABSORCIÓN DE LIQUIDEZ — esperar hasta 800ms
@@ -5907,84 +6730,85 @@ class SignalMonitorTab(QFrame):
         # ══════════════════════════════════════════════════════════════
         # MEJORA 3: AGE CHECK + VALIDACIÓN DEL LIQUIDITY MAGNET
         # ══════════════════════════════════════════════════════════════
-        if self._magnet_timestamp > 0 and self._magnet_price_at_set > 0:
-            magnet_age = time.time() - self._magnet_timestamp
-            if magnet_age > 120:  # magnet older than 2 minutes
-                msg = "⏰ IMÁN DE LIQUIDEZ EXPIRADO (>120s) — señal abortada"
-                print(f"[SIGNAL MONITOR] {msg}")
-                self._ex_status.setText(f"🚫 {msg}")
-                self._ex_status.setStyleSheet("color: #ff4444; font-size: 10px; background: transparent; border: none;")
-                self._order_busy = False
-                return
-            price_drift = abs(self._price - self._magnet_price_at_set) / max(self._magnet_price_at_set, 1) * 100
-            if price_drift > 0.5:
-                msg = f"⏰ PRECIO SE DESVIÓ {price_drift:.2f}% DEL IMÁN — señal abortada"
-                print(f"[SIGNAL MONITOR] {msg}")
-                self._ex_status.setText(f"🚫 {msg}")
-                self._ex_status.setStyleSheet("color: #ff4444; font-size: 10px; background: transparent; border: none;")
-                # ══════════════════════════════════════════════════════
-                # MEJORA 8: setear re-entry pendiente si aborta por drift
-                # ══════════════════════════════════════════════════════
-                self.pending_reentry = {
-                    "direction": self._signal_direction,
-                    "price": self._magnet_price_at_set,
-                    "timestamp": time.time(),
-                }
-                self._order_busy = False
-                return
+        # SCALPING 1min: Magnet no relevante para trades < 2 minutos
+        if MAGNET_ENABLED:
+            if self._magnet_timestamp > 0 and self._magnet_price_at_set > 0:
+                magnet_age = time.time() - self._magnet_timestamp
+                if magnet_age > 120:  # magnet older than 2 minutes
+                    msg = "⏰ IMÁN DE LIQUIDEZ EXPIRADO (>120s) — señal abortada"
+                    print(f"[SIGNAL MONITOR] {msg}")
+                    self._ex_status.setText(f"🚫 {msg}")
+                    self._ex_status.setStyleSheet("color: #ff4444; font-size: 10px; background: transparent; border: none;")
+                    self._order_busy = False
+                    return
+                price_drift = abs(self._price - self._magnet_price_at_set) / max(self._magnet_price_at_set, 1) * 100
+                if price_drift > 0.5:
+                    msg = f"⏰ PRECIO SE DESVIÓ {price_drift:.2f}% DEL IMÁN — señal abortada"
+                    print(f"[SIGNAL MONITOR] {msg}")
+                    self._ex_status.setText(f"🚫 {msg}")
+                    self._ex_status.setStyleSheet("color: #ff4444; font-size: 10px; background: transparent; border: none;")
+                    # ══════════════════════════════════════════════════════
+                    # MEJORA 8: setear re-entry pendiente si aborta por drift
+                    # ══════════════════════════════════════════════════════
+                    self.pending_reentry = {
+                        "direction": self._signal_direction,
+                        "price": self._magnet_price_at_set,
+                        "timestamp": time.time(),
+                    }
+                    self._order_busy = False
+                    return
 
         # ══════════════════════════════════════════════════════════════
         # MEJORA 4: FILTRO DE SESIÓN UTC
         # ══════════════════════════════════════════════════════════════
-        now_utc = time.gmtime()
-        utc_hour = now_utc.tm_hour
-        utc_min = now_utc.tm_min
-        # Session transitions (block entirely)
-        if (utc_hour == 23 and utc_min >= 55) or (utc_hour == 0 and utc_min <= 5):
-            msg = "⏰ TRANSICIÓN DE SESIÓN (23:55-00:05 UTC) — señal bloqueada"
-            print(f"[SIGNAL MONITOR] {msg}")
-            self._ex_status.setText(f"🚫 {msg}")
-            self._ex_status.setStyleSheet("color: #ff4444; font-size: 10px; background: transparent; border: none;")
-            self._order_busy = False
-            return
-        if (utc_hour == 7 and utc_min >= 55) or (utc_hour == 8 and utc_min <= 5):
-            msg = "⏰ TRANSICIÓN DE SESIÓN (07:55-08:05 UTC) — señal bloqueada"
-            print(f"[SIGNAL MONITOR] {msg}")
-            self._ex_status.setText(f"🚫 {msg}")
-            self._ex_status.setStyleSheet("color: #ff4444; font-size: 10px; background: transparent; border: none;")
-            self._order_busy = False
-            return
-        if (utc_hour == 15 and utc_min >= 55) or (utc_hour == 16 and utc_min <= 5):
-            msg = "⏰ TRANSICIÓN DE SESIÓN (15:55-16:05 UTC) — señal bloqueada"
-            print(f"[SIGNAL MONITOR] {msg}")
-            self._ex_status.setText(f"🚫 {msg}")
-            self._ex_status.setStyleSheet("color: #ff4444; font-size: 10px; background: transparent; border: none;")
-            self._order_busy = False
-            return
-        # Low-liquidity windows: reduce position size
-        low_liq = (utc_hour == 0 and utc_min >= 5) or utc_hour == 1 or (utc_hour == 2 and utc_min <= 30)
-        low_liq = low_liq or (utc_hour == 12 or (utc_hour == 13 and utc_min <= 30))
-        if low_liq:
-            self._multiplicador_posicion *= 0.5
-            print(f"[SIGNAL MONITOR] Ventana de baja liquidez — multiplicador reducido 50%")
-
+        # Binance 24/7: Perpetual futures no tienen rollover ni cierre diario
+        if SESSION_FILTER_ENABLED:
+            now_utc = time.gmtime()
+            utc_hour = now_utc.tm_hour
+            utc_min = now_utc.tm_min
+            # Session transitions (block entirely)
+            if (utc_hour == 23 and utc_min >= 55) or (utc_hour == 0 and utc_min <= 5):
+                msg = "⏰ TRANSICIÓN DE SESIÓN (23:55-00:05 UTC) — señal bloqueada"
+                print(f"[SIGNAL MONITOR] {msg}")
+                self._ex_status.setText(f"🚫 {msg}")
+                self._ex_status.setStyleSheet("color: #ff4444; font-size: 10px; background: transparent; border: none;")
+                self._order_busy = False
+                return
+            if (utc_hour == 7 and utc_min >= 55) or (utc_hour == 8 and utc_min <= 5):
+                msg = "⏰ TRANSICIÓN DE SESIÓN (07:55-08:05 UTC) — señal bloqueada"
+                print(f"[SIGNAL MONITOR] {msg}")
+                self._ex_status.setText(f"🚫 {msg}")
+                self._ex_status.setStyleSheet("color: #ff4444; font-size: 10px; background: transparent; border: none;")
+                self._order_busy = False
+                return
+            if (utc_hour == 15 and utc_min >= 55) or (utc_hour == 16 and utc_min <= 5):
+                msg = "⏰ TRANSICIÓN DE SESIÓN (15:55-16:05 UTC) — señal bloqueada"
+                print(f"[SIGNAL MONITOR] {msg}")
+                self._ex_status.setText(f"🚫 {msg}")
+                self._ex_status.setStyleSheet("color: #ff4444; font-size: 10px; background: transparent; border: none;")
+                self._order_busy = False
+                return
         # ══════════════════════════════════════════════════════════════
         # MEJORA 5: FUNDING RATE Y OPEN INTEREST DELTA
         # ══════════════════════════════════════════════════════════════
-        if abs(self._funding_rate) > 0.05:
-            msg = f"⏰ FUNDING RATE ({self._funding_rate:+.4f}%) > 0.05% — señal bloqueada"
-            print(f"[SIGNAL MONITOR] {msg}")
-            self._ex_status.setText(f"🚫 {msg}")
-            self._ex_status.setStyleSheet("color: #ff4444; font-size: 10px; background: transparent; border: none;")
-            self._order_busy = False
-            return
-        if abs(self._oi_delta_5min) > 15:
-            msg = f"⏰ OI DELTA 5m ({self._oi_delta_5min:+.1f}%) > 15% — señal bloqueada"
-            print(f"[SIGNAL MONITOR] {msg}")
-            self._ex_status.setText(f"🚫 {msg}")
-            self._ex_status.setStyleSheet("color: #ff4444; font-size: 10px; background: transparent; border: none;")
-            self._order_busy = False
-            return
+        # SCALPING 1min: Funding rate irrelevante (trades duran segundos, no 8h)
+        if FUNDING_CHECK_ENABLED:
+            if abs(self._funding_rate) > 0.05:
+                msg = f"⏰ FUNDING RATE ({self._funding_rate:+.4f}%) > 0.05% — señal bloqueada"
+                print(f"[SIGNAL MONITOR] {msg}")
+                self._ex_status.setText(f"🚫 {msg}")
+                self._ex_status.setStyleSheet("color: #ff4444; font-size: 10px; background: transparent; border: none;")
+                self._order_busy = False
+                return
+        # SCALPING 1min: OI Delta de 5min demasiado lento para 1min
+        if OI_DELTA_CHECK_ENABLED:
+            if abs(self._oi_delta_5min) > 15:
+                msg = f"⏰ OI DELTA 5m ({self._oi_delta_5min:+.1f}%) > 15% — señal bloqueada"
+                print(f"[SIGNAL MONITOR] {msg}")
+                self._ex_status.setText(f"🚫 {msg}")
+                self._ex_status.setStyleSheet("color: #ff4444; font-size: 10px; background: transparent; border: none;")
+                self._order_busy = False
+                return
 
         self._order_busy = True
         self._ex_long.setEnabled(False)
@@ -6012,31 +6836,65 @@ class SignalMonitorTab(QFrame):
 
         if not sl or not tp1:
             # ══════════════════════════════════════════════════════════
-            # MEJORA 6: SL DINÁMICO BASADO EN ESTRUCTURA DEL BOOK
+            # NUEVO: SL/TP DINÁMICO BASADO EN ORDER BOOK
             # ══════════════════════════════════════════════════════════
-            colchon_estructural = self._atr if self._atr > 0 else entry * 0.002
+            self._book_sl_found = False
+            self._book_tp_found = False
+
+            # Escanear contraparte para TP
+            if hasattr(self, '_deep_book') and self._deep_book:
+                self._scan_counterparty_clusters(self._signal_direction, self._deep_book)
+
+            # Calcular SL basado en muros reales
             if self._signal_direction == "LONG":
-                wall_sl = self._wall_bid - 5 if self._wall_bid > 0 else 0
-                if wall_sl > 0:
-                    book_dist = abs(entry - wall_sl)
-                    if book_dist > entry * 0.0015:
-                        sl = wall_sl + 2
-                    else:
-                        sl = wall_sl
-                else:
-                    sl = entry - colchon_estructural
-                tp1 = entry * 1.02
+                # SL: buscar primer muro BID significativo debajo del entry
+                bids = self._deep_book.get('bids', []) if hasattr(self, '_deep_book') and self._deep_book else []
             else:
-                wall_sl = self._wall_ask + 5 if self._wall_ask > 0 else 0
-                if wall_sl > 0:
-                    book_dist = abs(wall_sl - entry)
-                    if book_dist > entry * 0.0015:
-                        sl = wall_sl - 2
+                # SL: buscar primer muro ASK significativo encima del entry
+                bids = self._deep_book.get('asks', []) if hasattr(self, '_deep_book') and self._deep_book else []
+
+            # Encontrar el primer muro significativo en la dirección opuesta
+            if bids:
+                wall_found = None
+                for p, q in bids:
+                    pq = float(p)
+                    qq = abs(float(q))
+                    if qq >= SL_WALL_MIN_BTC:
+                        dist = abs(pq - entry) / entry * 100
+                        if dist <= SCALPING_MAX_SL_PCT * 100:
+                            wall_found = pq
+                            break
+                if wall_found:
+                    # SL justo detrás del muro
+                    tick_sz = getattr(self, 'tick_size', 0.1)
+                    if self._signal_direction == "LONG":
+                        sl = wall_found - tick_sz * 2
                     else:
-                        sl = wall_sl
-                else:
-                    sl = entry + colchon_estructural
-                tp1 = entry * 0.98
+                        sl = wall_found + tick_sz * 2
+                    self._book_sl_found = True
+
+            if not self._book_sl_found:
+                # Fallback: SL fijo
+                sl_pct = SCALPING_SL_PCT
+                sl = entry * (1 - sl_pct) if self._signal_direction == "LONG" else entry * (1 + sl_pct)
+                sl_percent = abs(entry - sl) / entry * 100
+                if sl_percent > SCALPING_MAX_SL_PCT * 100:
+                    max_sl_dist = entry * SCALPING_MAX_SL_PCT
+                    sl = entry - max_sl_dist if self._signal_direction == "LONG" else entry + max_sl_dist
+
+            # TP basado en el siguiente cluster de contraparte
+            if self._counterparty_clusters:
+                nearest = min(self._counterparty_clusters, key=lambda c: c['distance_pct'])
+                tp_dist_pct = nearest['distance_pct']
+                if 0.05 <= tp_dist_pct <= 0.50:
+                    tp1 = entry * (1 + tp_dist_pct / 100) if self._signal_direction == "LONG" else entry * (1 - tp_dist_pct / 100)
+                    self._book_tp_found = True
+                    self._dynamic_tp_price = tp1
+
+            if not self._book_tp_found:
+                # Fallback: TP fijo
+                tp_pct = SCALPING_TP_PCT
+                tp1 = entry * (1 + tp_pct) if self._signal_direction == "LONG" else entry * (1 - tp_pct)
 
         # Macro bounce SL override: use precise wick-low SL if available
         if self._bounce_sl > 0:
@@ -6050,8 +6908,14 @@ class SignalMonitorTab(QFrame):
                 tp1 = min(sl, max(tp1, self._provisional_tp))
 
         # ══════════════════════════════════════════════════════════════
-        # FASE 4: INYECCIÓN DE LIQUIDEZ DINÁMICA — Ajuste SL/TP
+        # NUEVO: Ajuste SL/TP por flash y fuerza del mercado
         # ══════════════════════════════════════════════════════════════
+        if self._flash_classification == "FLASH":
+            # Flash sin respaldo: reducir tamaño drásticamente
+            self._multiplicador_posicion *= FLASH_REDUCE_MULTIPLIER
+            log.info("Flash extremo detectado — multiplicador reducido a %.2f",
+                     self._multiplicador_posicion)
+
         if self._cancel_rate > 60:
             extra_sl_buffer = entry * 0.0005
             if self._signal_direction == "LONG":
@@ -6065,12 +6929,15 @@ class SignalMonitorTab(QFrame):
             elif self._signal_direction == "SHORT":
                 tp1 = min(sl, tp1 + entry * 0.001)
 
+        # SCALPING 40x: Riesgo limitado a 2% del balance por trade
+        scalping_cap = max(self._available, self._balance, 100) * SCALPING_RISK_PER_TRADE
         if settings.USE_ALL_IN:
             cap = max(self._available, self._balance, 100) * self._capital_preset / 100.0
         else:
             cap = settings.GLOBAL_TRADE_AMOUNT
-        cap *= self._multiplicador_posicion
-        lev = max(self._leverage, 10) if self._leverage > 0 else 10
+        # SCALPING: Usar el menor entre el capital calculado y el límite de riesgo
+        cap = min(cap, scalping_cap) * self._multiplicador_posicion
+        lev = max(self._leverage, 40) if self._leverage > 0 else 40  # SCALPING: mínimo 40x
         success = self._executor.execute_trade_signal(
             bdir, entry, sl, tp1, lev, cap,
             confidence=self._signal_confidence,
@@ -6093,7 +6960,7 @@ class SignalMonitorTab(QFrame):
         self._execute_signal()
 
     # ── Mejora 4: verificar velocidad de precio en ventana 1s ─────────────
-    def _check_price_velocity(self):
+    def _check_price_velocity(self, vol_ratio: float = 1.0, delta: float = 0) -> str:
         if len(self.price_buffer_1s) < 5:
             return "OK"
         t0, p0 = self.price_buffer_1s[0]
@@ -6103,15 +6970,299 @@ class SignalMonitorTab(QFrame):
             return "OK"
         velocity_pct = abs((pn - p0) / p0) * 100
         if velocity_pct > PRICE_VELOCITY_ABORT_THRESHOLD:
+            # FLASH BYPASS: si el flash es orgánico, no abortar
+            flash_cls = self._detect_flash_move()
+            if FLASH_ORGANIC_BYPASS and flash_cls == "ORGANICO":
+                log.info(
+                    "Flash ORGÁNICO detectado (vel=%.2f%%/s vol=%.1fx delta=%.0f) → "
+                    "REDUCIR (bypass abort)", velocity_pct, vol_ratio, delta)
+                return "REDUCIR"
+            es_institucional = (
+                vol_ratio >= VELOCITY_INSTITUTIONAL_VOL_RATIO
+                and abs(delta) >= VELOCITY_INSTITUTIONAL_DELTA_MIN
+            )
+            if es_institucional:
+                log.info(
+                    "Velocidad alta pero momentum institucional detectado: "
+                    "vol_ratio=%.1fx delta=%.0f → REDUCIR (no abortar)",
+                    vol_ratio, delta)
+                self.entry_stats["momentum_institucional_detectado"] = \
+                    self.entry_stats.get("momentum_institucional_detectado", 0) + 1
+                return "REDUCIR"
+            # FLASH: abortar solo si es clasificación FLASH (manipulación)
+            if flash_cls != "FLASH":
+                log.info(
+                    "Flash %s detectado → REDUCIR en vez de abortar",
+                    flash_cls)
+                return "REDUCIR"
             return "ABORTAR"
         if velocity_pct > PRICE_VELOCITY_REDUCE_THRESHOLD:
             return "REDUCIR"
         return "OK"
 
+    # ═══════════════════════════════════════════════════════════════════════
+    # NUEVO: Escáner de Contraparte — busca clusters en el lado opuesto
+    # ═══════════════════════════════════════════════════════════════════════
+    def _scan_counterparty_clusters(self, direction: str, deep_book: dict = None):
+        """Escanea el order book buscando clusters significativos en el lado opuesto.
+        
+        Para LONG: escanea asks en busca del siguiente muro de resistencia.
+        Para SHORT: escanea bids en busca del siguiente muro de soporte.
+        
+        Usa walls conocidas si no hay deep_book completo.
+        Almacena en self._counterparty_clusters los top-3 clusters.
+        """
+        self._counterparty_clusters = []
+        price_now = self._price
+
+        # Si no hay deep_book, usar las walls conocidas
+        if not deep_book:
+            if direction == "LONG":
+                walls = self._whale_ask_walls
+            else:
+                walls = self._whale_bid_walls
+            if walls:
+                parsed = [
+                    (float(w.get('price', 0)), abs(float(w.get('quantity', w.get('size', 0)))))
+                    for w in walls if w.get('price', 0) > 0
+                ]
+                parsed.sort(key=lambda x: x[0])
+                # Calcular distancia y almacenar
+                for p, q in parsed:
+                    dist_pct = abs(p - price_now) / price_now * 100
+                    if dist_pct <= COUNTERPARTY_MAX_GAP_PCT and q >= COUNTERPARTY_MIN_BTC:
+                        self._counterparty_clusters.append({
+                            'price': p, 'btc': q, 'count': 1, 'distance_pct': dist_pct
+                        })
+                if self._counterparty_clusters:
+                    nearest = min(self._counterparty_clusters, key=lambda c: c['distance_pct'])
+                    self._next_cluster_price = nearest['price']
+                    self._next_cluster_btc = nearest['btc']
+                    self._next_cluster_distance = nearest['distance_pct']
+                else:
+                    self._next_cluster_price = 0.0
+                    self._next_cluster_btc = 0.0
+                    self._next_cluster_distance = 0.0
+            return
+
+        levels = deep_book.get('asks' if direction == 'LONG' else 'bids', [])
+        if not levels:
+            return
+
+        # Normalizar: (precio, cantidad_btc)
+        parsed = [(float(p), abs(float(q))) for p, q in levels]
+
+        # Acumular por clusters cercanos (agrupar dentro de 0.02%)
+        clusters = []
+        current_cluster = None
+        for p, q in parsed:
+            dist_pct = abs(p - price_now) / price_now * 100
+            if dist_pct > COUNTERPARTY_MAX_GAP_PCT:
+                break  # más allá del gap máximo, dejar de escanear
+            if q < COUNTERPARTY_MIN_BTC:
+                continue
+            if current_cluster is None:
+                current_cluster = {'price': p, 'btc': q, 'count': 1, 'distance_pct': dist_pct}
+            elif abs(p - current_cluster['price']) / current_cluster['price'] < 0.0002:
+                # Mismo cluster (dentro de 0.02%)
+                current_cluster['btc'] += q
+                current_cluster['count'] += 1
+                current_cluster['price'] = (current_cluster['price'] + p) / 2
+            else:
+                clusters.append(current_cluster)
+                current_cluster = {'price': p, 'btc': q, 'count': 1, 'distance_pct': dist_pct}
+        if current_cluster and current_cluster['btc'] >= COUNTERPARTY_MIN_BTC:
+            clusters.append(current_cluster)
+
+        clusters.sort(key=lambda c: c['btc'], reverse=True)
+        self._counterparty_clusters = clusters[:3]
+
+        if clusters:
+            nearest = min(clusters, key=lambda c: c['distance_pct'])
+            self._next_cluster_price = nearest['price']
+            self._next_cluster_btc = nearest['btc']
+            self._next_cluster_distance = nearest['distance_pct']
+        else:
+            self._next_cluster_price = 0.0
+            self._next_cluster_btc = 0.0
+            self._next_cluster_distance = 0.0
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # NUEVO: Whale Impact Score — mide fuerza real de absorción
+    # ═══════════════════════════════════════════════════════════════════════
+    def _compute_whale_impact_score(self):
+        """Calcula el impacto real de las ballenas en el order flow.
+        
+        Impact Score = (BTC absorbidos / ventana) × delta_vel_normalized × vol_ratio_normalized
+        
+        Clasificación:
+          < 10  → LOW (ruido minorista)
+          10-50 → MEDIUM (movimiento normal)
+          50-200 → HIGH (ballena activa)
+          > 200 → EXTREME (flash institucional)
+        """
+        if not self._whale_bid_walls and not self._whale_ask_walls:
+            self._whale_impact_score = 0.0
+            self._whale_impact_label = "LOW"
+            self._force_score = 0.0
+            return
+
+        total_wall_btc = sum(
+            abs(float(w.get('quantity', w.get('size', 0))) if isinstance(w, dict) else float(w[1]))
+            for w in (self._whale_bid_walls + self._whale_ask_walls)
+        )
+
+        # Velocidad de absorción (BTC/s) desde el historial
+        if len(self._absorption_history) >= 2:
+            t0, v0 = self._absorption_history[0]
+            tn, vn = self._absorption_history[-1]
+            dt = max(tn - t0, 0.1)
+            absorption_btc_s = abs(vn - v0) / dt
+        else:
+            absorption_btc_s = total_wall_btc / max(FORCE_ABSORPTION_WINDOW_MS / 1000, 0.1)
+
+        self._force_absorption_btc_s = absorption_btc_s
+
+        # Delta vel normalizado (0-100)
+        delta_vel = abs(getattr(self, '_delta', 0))
+        delta_norm = min(100, delta_vel / 10)
+
+        # Vol ratio normalizado (0-100)
+        buy_v = getattr(self, '_buy_vol', 0)
+        sell_v = getattr(self, '_sell_vol', 0)
+        total_v = max(buy_v + sell_v, 0.01)
+        vol_ratio = max(buy_v, sell_v) / (total_v / 2)
+        vol_norm = min(100, max(0, (vol_ratio - 1) * 50))
+
+        # Impact Score compuesto
+        impact = (absorption_btc_s * 20) + (delta_norm * 0.5) + (vol_norm * 0.3)
+        self._whale_impact_score = impact
+
+        if impact > FORCE_WHALE_IMPACT_HIGH:
+            self._whale_impact_label = "EXTREME"
+        elif impact > FORCE_WHALE_IMPACT_MED:
+            self._whale_impact_label = "HIGH"
+        elif impact > FORCE_WHALE_IMPACT_LOW:
+            self._whale_impact_label = "MEDIUM"
+        else:
+            self._whale_impact_label = "LOW"
+
+        # Force score (0-100) versión normalizada del impacto
+        self._force_score = min(100, impact / 2)
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # NUEVO: Proyección de movimiento de vela
+    # ═══════════════════════════════════════════════════════════════════════
+    def _project_candle_move(self, direction: str):
+        """Estima cuánto se moverá el precio basado en BTC absorbidos.
+        
+        projected_ticks = (btc_absorbido / btc_promedio_por_tick) × factor_vel
+        
+        donde btc_promedio_por_tick se calcula de los últimos trades.
+        """
+        if not self._absorption_history or len(self._absorption_history) < 2:
+            self._projected_move_ticks = 0
+            self._projected_move_pct = 0.0
+            return
+
+        # BTC absorbidos en la última ventana
+        btc_abs = abs(self._absorption_history[-1][1] - self._absorption_history[0][1])
+
+        # BTC promedio por tick (de los trades recientes)
+        avg_btc_per_tick = 0.01  # default conservador
+        if hasattr(self, 'trade_tape') and len(self.trade_tape) > 0:
+            recent = list(self.trade_tape)[-20:]
+            if recent:
+                avg_btc_per_tick = sum(abs(t.get('qty', 0)) for t in recent) / max(len(recent), 1)
+
+        if avg_btc_per_tick <= 0:
+            self._projected_move_ticks = 0
+            self._projected_move_pct = 0.0
+            return
+
+        # Factor de velocidad: absorción rápida = más impacto
+        t0, v0 = self._absorption_history[0]
+        tn, vn = self._absorption_history[-1]
+        dt = max(tn - t0, 0.1)
+        speed_factor = min(3.0, max(0.5, 1.0 / dt))
+
+        projected_ticks = int((btc_abs / avg_btc_per_tick) * speed_factor)
+        self._projected_move_ticks = projected_ticks
+
+        # Convertir a % aproximado
+        tick_size_pct = getattr(self, '_tick_size_pct', 0.001)  # ~0.01% por tick en BTC
+        self._projected_move_pct = projected_ticks * tick_size_pct
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # NUEVO: Micro-Flash Detector
+    # ═══════════════════════════════════════════════════════════════════════
+    def _detect_flash_move(self) -> str:
+        """Detecta movimientos flash súbitos en ventanas de 1s y 3s.
+        
+        Returns:
+          "NONE" → sin flash
+          "ORGANICO" → flash con respaldo de volumen + delta (confiable)
+          "BALLENA" → flash con alto delta accel pero volumen moderado
+          "FLASH" → flash sin respaldo (posible manipulación, abortar)
+        """
+        buf = list(self.price_buffer_100ms)
+        if len(buf) < 5:
+            self._flash_detected = False
+            self._flash_classification = "NONE"
+            return "NONE"
+
+        now = time.time()
+
+        # Ventana 1s
+        recent_1s = [(t, p) for t, p in buf if now - t <= 1.0]
+        # Ventana 3s
+        recent_3s = [(t, p) for t, p in buf if now - t <= 3.0]
+
+        flash_pct = 0.0
+        if len(recent_1s) >= 2:
+            p0 = recent_1s[0][1]
+            pn = recent_1s[-1][1]
+            flash_pct = abs((pn - p0) / max(p0, 1)) * 100
+            self._flash_velocity_pct = flash_pct
+        elif len(recent_3s) >= 2:
+            p0 = recent_3s[0][1]
+            pn = recent_3s[-1][1]
+            flash_pct = abs((pn - p0) / max(p0, 1)) * 100
+            self._flash_velocity_pct = flash_pct
+
+        if flash_pct < FLASH_MOVE_PCT_1S and flash_pct < FLASH_MOVE_PCT_3S:
+            self._flash_detected = False
+            self._flash_classification = "NONE"
+            return "NONE"
+
+        self._flash_detected = True
+        self._flash_price_change = flash_pct
+        self._flash_timestamp = now
+
+        # Clasificar
+        vol_ratio_val = 1.0
+        if hasattr(self, '_vol_ratio'):
+            vol_ratio_val = getattr(self, '_vol_ratio', 1.0)
+
+        delta_val = abs(getattr(self, '_delta', 0))
+        delta_accel_val = abs(getattr(self, '_delta_accel', 0))
+
+        if vol_ratio_val >= FLASH_MIN_VOL_RATIO and delta_val >= FLASH_MIN_DELTA:
+            cls = "ORGANICO"
+        elif delta_accel_val >= FLASH_MIN_DELTA and vol_ratio_val >= 1.5:
+            cls = "BALLENA"
+        else:
+            cls = "FLASH"
+
+        self._flash_classification = cls
+        return cls
+
     # ── Mejora 5: confirmación institucional por flujo acumulado en ventana ─
     def _wait_for_institutional_confirm(self):
+        # FLASH FAST PATH: reducir tiempo de espera
+        max_wait_ms = FLASH_INSTITUTIONAL_WAIT_MS if self._flash_classification in ("ORGANICO", "BALLENA") else INSTITUTIONAL_MAX_WAIT_MS
         start = time.time()
-        while (time.time() - start) * 1000 < INSTITUTIONAL_MAX_WAIT_MS:
+        while (time.time() - start) * 1000 < max_wait_ms:
             now = time.time()
             window_trades = [
                 t for t in self.trade_tape
@@ -6124,12 +7275,14 @@ class SignalMonitorTab(QFrame):
             buy_flow = sum(abs(t.get("qty", 0)) for t in window_trades if t.get("side", "") == "BUY")
             sell_flow = sum(abs(t.get("qty", 0)) for t in window_trades if t.get("side", "") == "SELL")
 
+            # SCALPING 1min: Ratio reducido a 1.2x (era 1.5x)
+            inst_ratio = SCALPING_INSTITUTIONAL_RATIO
             if self._signal_direction == "LONG":
-                if buy_flow >= INSTITUTIONAL_FLOW_BTC and buy_flow > sell_flow * 1.5:
+                if buy_flow >= INSTITUTIONAL_FLOW_BTC and buy_flow > sell_flow * inst_ratio:
                     print(f"[SIGNAL MONITOR] Flujo institucional: {buy_flow:.2f} BTC buy / {sell_flow:.2f} BTC sell en 2s")
                     return True
             else:
-                if sell_flow >= INSTITUTIONAL_FLOW_BTC and sell_flow > buy_flow * 1.5:
+                if sell_flow >= INSTITUTIONAL_FLOW_BTC and sell_flow > buy_flow * inst_ratio:
                     print(f"[SIGNAL MONITOR] Flujo institucional: {sell_flow:.2f} BTC sell / {buy_flow:.2f} BTC buy en 2s")
                     return True
 
@@ -6144,6 +7297,12 @@ class SignalMonitorTab(QFrame):
         if not walls:
             return True
 
+        # FLASH FAST PATH: si hay flash orgánico o ballena, esperar mucho menos
+        if self._flash_classification in ("ORGANICO", "BALLENA"):
+            max_wait = FLASH_ABSORPTION_WAIT_SEC
+        else:
+            max_wait = ABSORPTION_MAX_WAIT_SEC
+
         def top5_vol(wlist):
             top5 = sorted(
                 wlist,
@@ -6155,9 +7314,17 @@ class SignalMonitorTab(QFrame):
                 for w in top5
             )
 
+        # Flash orgánico: si delta spike + walls, entrar sin esperar
+        if self._flash_classification == "ORGANICO" and abs(getattr(self, '_delta', 0)) > FLASH_MIN_DELTA:
+            # Registrar absorción instantánea
+            vol_actual = top5_vol(walls)
+            self._absorption_history.append((time.time(), vol_actual))
+            self._compute_whale_impact_score()
+            return True
+
         mediciones = []
         start = time.time()
-        while (time.time() - start) < ABSORPTION_MAX_WAIT_SEC:
+        while (time.time() - start) < max_wait:
             mediciones.append((time.time(), top5_vol(walls)))
             if len(mediciones) >= 3:
                 reduccion = mediciones[0][1] - mediciones[-1][1]
@@ -6267,6 +7434,21 @@ class SignalMonitorTab(QFrame):
         self._sig_conf_label.setStyleSheet(f"color: {sig_color}; font-size: 14px; background: transparent; border: none;")
         self._conf_bar.setValue(int(min(100, self._signal_confidence)))
         self._sig_reason.setText(self._trend_label)
+
+        # ── Update Signal Diagnostics (merged from BattleBar + SignalMonitorTab) ──
+        bb_diag = getattr(self.parent(), 'battle_bar', None)
+        bb_diag_list = getattr(bb_diag, 'signal_diagnostics', []) if bb_diag else []
+        sm_diag_list = getattr(self, '_signal_diagnostics', [])
+        merged = list(bb_diag_list)
+        for d in sm_diag_list:
+            if d not in merged:
+                merged.append(d)
+        if merged:
+            top = merged[:3]
+            self._sig_diag.setText("⚠ " + "\n".join(top))
+            self._sig_diag.setVisible(True)
+        else:
+            self._sig_diag.setVisible(False)
 
         # Update conditions — direction-aware checks
         is_long_sig = self._signal_direction == "LONG"
@@ -6475,12 +7657,12 @@ class SignalMonitorTab(QFrame):
         rr1 = abs(gain1 / max(abs(loss), 0.01))
         rr2 = abs(gain2 / max(abs(loss), 0.01)) if gain2 != 0 else 0
 
-        self._pnl_loss.setText(f"SL ${sl_price:,.0f} → ${loss:+,.2f} ({loss_pct:+.2f}%)")
+        self._pnl_loss.setText(f"SL ${format_price(sl_price)} → ${loss:+,.2f} ({loss_pct:+.2f}%)")
         self._pnl_loss.setStyleSheet(f"color: #bb00ff; font-size: 11px; background: transparent; border: none;")
-        self._pnl_gain1.setText(f"TP1 ${tp1_price:,.0f} → ${gain1:+,.2f} ({gain1_pct:+.2f}%)")
+        self._pnl_gain1.setText(f"TP1 ${format_price(tp1_price)} → ${gain1:+,.2f} ({gain1_pct:+.2f}%)")
         self._pnl_gain1.setStyleSheet(f"color: #00ff66; font-size: 11px; background: transparent; border: none;")
         if gain2 != 0:
-            self._pnl_gain2.setText(f"TP2 ${tp2_price:,.0f} → ${gain2:+,.2f} ({gain2_pct:+.2f}%)")
+            self._pnl_gain2.setText(f"TP2 ${format_price(tp2_price)} → ${gain2:+,.2f} ({gain2_pct:+.2f}%)")
             self._pnl_gain2.setStyleSheet(f"color: #00ff88; font-size: 11px; background: transparent; border: none;")
             self._pnl_gain2.setVisible(True)
         else:
@@ -7121,6 +8303,14 @@ class MainDashboard(QMainWindow):
         self.init_ui()
         self.init_data()
 
+        # ── Order Flow S/R Map (memoria de acumulación/distribución) ────
+        self._flow_sr_map = OrderFlowSRMap(
+            window_minutes=20,
+            touch_pct=0.05,
+            sweep_pct=0.12,
+            tick_speed_threshold=8,
+        )
+
         # Crear un único cliente Binance compartido — REAL production only
         from binance.client import Client
         _shared_api_key = settings.BINANCE_REAL_API_KEY
@@ -7147,6 +8337,146 @@ class MainDashboard(QMainWindow):
         # Wire up data engine to TelegramBot for /symbol hot-swap
         if hasattr(self, '_async_engine') and self._async_engine:
             self.telegram_bot.set_data_engine(self._async_engine)
+
+        # ── Notification Manager ─────────────────────────────────────────
+        _notify = get_notifier()
+        _notify.set_telegram_sender(
+            lambda text: self.telegram_bot._queue.put_nowait({
+                "type": "text", "text": text,
+            }) if hasattr(self, 'telegram_bot') else None
+        )
+
+        # ── WebSocket Server for Mobile Terminal ───────────────────────────
+        def _ws_data_provider() -> dict:
+            pos = getattr(self.signal_tab, '_position', None)
+            pos_data = None
+            if pos:
+                pos_data = {
+                    "direction": "LONG" if pos.get("amt", 0) > 0 else "SHORT",
+                    "amt": abs(pos.get("amt", 0)),
+                    "entry_price": pos.get("entry_price", 0),
+                    "mark_price": pos.get("mark_price", 0),
+                    "pnl": pos.get("pnl", 0),
+                    "pnl_pct": pos.get("pnl_pct", 0),
+                    "liquidation_price": pos.get("liquidation_price", 0),
+                }
+            return {
+                "price": self.data.get("price", 0),
+                "change_pct": self.data.get("price_change_pct", 0),
+                "day_high": self.data.get("day_high", 0),
+                "day_low": self.data.get("day_low", 0),
+                "signal": getattr(self.signal_tab, '_signal_direction', 'NEUTRAL'),
+                "confidence": getattr(self.signal_tab, '_signal_confidence', 0),
+                "trend_label": getattr(self.signal_tab, '_trend_label', ''),
+                "regimen_mercado": getattr(self.signal_tab, '_regimen_mercado', ''),
+                "balance": getattr(self.signal_tab, '_available', 0.0),
+                "position": pos_data,
+                "funding_rate": self.data.get("funding_rate", 0),
+                "oi_delta_5min": self.data.get("oi_delta_5min", 0),
+                "delta": self.data.get("delta", 0),
+                "cvd": self.data.get("cvd", 0),
+                "volume": self.data.get("volume", 0),
+                "rsi": self.data.get("rsi", 50),
+                "atr": self.data.get("atr", 0),
+                "signal_diagnostics": getattr(self.battle_bar, 'signal_diagnostics', []) if hasattr(self, 'battle_bar') else [],
+                "uptime": self.stats.get('uptime_seconds', 0),
+                "timestamp": self.stats.get('last_update', ''),
+            }
+
+        def _ws_on_command(data: dict) -> dict:
+            action = data.get("action", "")
+            log.info(f"[WS] Command from mobile: {action}")
+            price = self.data.get("price", 0)
+
+            if action == "TRADE":
+                direction = data.get("direction", "")
+                if direction not in ("ALZA", "BAJA", "LONG", "SHORT"):
+                    raise ValueError(f"Invalid direction: {direction}")
+                exec_dir = "ALZA" if direction in ("ALZA", "LONG") else "BAJA"
+                if price <= 0:
+                    raise ValueError("No price available")
+                sl = data.get("sl", 0) or getattr(self.signal_tab, '_bounce_sl', 0) or price * 0.995
+                tp = data.get("tp", 0) or getattr(self.signal_tab, '_provisional_tp', 0) or price * 1.01
+                leverage = data.get("leverage", 40)
+                risk_pct = data.get("risk_pct", 1.0)
+                capital = getattr(self.signal_tab, '_available', 100) * risk_pct / 100.0
+                confidence = getattr(self.signal_tab, '_signal_confidence', -1.0)
+
+                self.order_executor.execute_trade_signal(
+                    direction=exec_dir, entry_price=price,
+                    sl_price=sl, tp_price=tp,
+                    leverage=leverage, capital=capital,
+                    confidence=confidence,
+                    delta=self.data.get("delta", 0),
+                    cvd=self.data.get("cvd", 0),
+                    entry_filter="mobile_terminal",
+                )
+                return {"side": exec_dir, "price": price, "sl": sl, "tp": tp}
+
+            elif action == "CLOSE":
+                self.order_executor.close_position()
+                return {}
+
+            elif action == "CLOSE_PARTIAL":
+                pct = float(data.get("pct", 100))
+                if pct <= 0 or pct > 100:
+                    raise ValueError("Invalid close percentage")
+                self.order_executor.close_position()
+                return {"closed_pct": pct}
+
+            elif action == "MOVE_SL":
+                sl_price = float(data.get("price", 0))
+                if sl_price <= 0:
+                    raise ValueError("Invalid SL price")
+                # Cancel existing SL and place new one
+                result = self.order_executor.modify_stop_loss(sl_price)
+                return {"new_sl": sl_price, "result": result}
+
+            elif action == "MOVE_TP":
+                tp_price = float(data.get("price", 0))
+                if tp_price <= 0:
+                    raise ValueError("Invalid TP price")
+                result = self.order_executor.modify_take_profit(tp_price)
+                return {"new_tp": tp_price, "result": result}
+
+            elif action == "SET_LEVERAGE":
+                lev = int(data.get("leverage", 40))
+                if lev < 1 or lev > 100:
+                    raise ValueError("Leverage must be 1-100")
+                self.order_executor.set_leverage(lev)
+                return {"leverage": lev}
+
+            elif action == "AI_QUERY":
+                question = data.get("question", "")
+                if not question:
+                    raise ValueError("Empty question")
+                if hasattr(self, 'gemini_brain') and self.gemini_brain:
+                    from src.engine.gemini_brain import GeminiTradingDecision
+                    snap = self._build_snapshot()
+                    decision = self.gemini_brain.decide_trade(snap)
+                    answer = decision.explanation if decision else "AI not available"
+                else:
+                    answer = "Gemini not configured"
+                return {"answer": answer}
+
+            elif action == "GET_RISK":
+                return {
+                    "balance": getattr(self.signal_tab, '_available', 0),
+                    "position": getattr(self.signal_tab, '_position', None),
+                    "leverage": getattr(self.signal_tab, '_leverage', 0),
+                    "atr": self.data.get("atr", 0),
+                    "confidence": getattr(self.signal_tab, '_signal_confidence', 0),
+                }
+
+            else:
+                raise ValueError(f"Unknown action: {action}")
+
+        self._ws_server = BB450WSServer(
+            data_provider=_ws_data_provider,
+            on_command_callback=_ws_on_command,
+        )
+        self._ws_server.start()
+        log.info("[WS] Mobile terminal server initialized")
 
         # Wire up BrainAgent (Quantum Brain)
         try:
@@ -7178,6 +8508,35 @@ class MainDashboard(QMainWindow):
             gemini_brain=getattr(self, 'gemini_brain', None),
             brain_agent=getattr(self, 'brain_agent', None),
         )
+
+        # ── Start Gemini background regime monitor ──────────────────────
+        gb = getattr(self, 'gemini_brain', None)
+        if gb is not None and gb.is_enabled:
+            gb.start_background_regime_monitor(
+                snapshot_provider=lambda: {
+                    "price": self.data.get("price", 0),
+                    "delta": self.data.get("delta", 0),
+                    "cvd": self.data.get("cvd", 0),
+                    "buy_volume": self.data.get("buy_volume", 0),
+                    "sell_volume": self.data.get("sell_volume", 0),
+                    "rsi": self.data.get("rsi", 50),
+                    "tick_speed": self.market_state.get("momentum", {}).get("tick_speed", 0),
+                    "cancel_rate": self.market_state.get("momentum", {}).get("cancel_rate", 0),
+                    "spoofing_risk": self.data.get("spoofing_risk", 0),
+                    "trap_status": self.data.get("trap_status", "SIN TRAMPA"),
+                    "depth_imb_pct": self.market_state.get("liquidity", {}).get("depth_imbalance", 0),
+                    "ba_ratio": self.data.get("buy_volume", 1) / max(self.data.get("sell_volume", 1), 0.001),
+                    "trend_5m": self.market_state.get("mtf_trend", {}).get("t_5m", "WAIT"),
+                    "trend_1h": self.market_state.get("mtf_trend", {}).get("t_1h", "NEUTRAL"),
+                    "hft_speed": self.data.get("hft_speed", 0),
+                    "funding_rate": self.data.get("funding_rate", 0),
+                    "oi_delta_5min": self.data.get("oi_delta_5min", 0),
+                    "confluence_score": self.market_state.get("mtf_trend", {}).get("confluence_score", 50),
+                    "vwap": self.data.get("vwap", 0),
+                    "bb_position": self.data.get("bb_position", 50),
+                },
+                interval=30.0,
+            )
 
         # Auto-load last knowledge base from SQLite on startup
         self._load_persisted_knowledge_base()
@@ -7387,6 +8746,24 @@ class MainDashboard(QMainWindow):
             }}
         """)
         ingest_layout.addWidget(self.btn_load_knowledge)
+
+        self.btn_rebuild_knowledge = QPushButton("♻️ REBUILD CONCMT")
+        self.btn_rebuild_knowledge.setStyleSheet(f"""
+            QPushButton {{
+                background: rgba(255, 204, 0, 0.1);
+                color: {COLORS['accent_gold']};
+                border: 1px solid {COLORS['accent_gold']};
+                border-radius: 4px; padding: 8px;
+                font-size: 11px; font-weight: bold;
+            }}
+            QPushButton:hover {{
+                background: rgba(255, 204, 0, 0.25);
+            }}
+            QPushButton:pressed {{
+                background: rgba(255, 204, 0, 0.35);
+            }}
+        """)
+        ingest_layout.addWidget(self.btn_rebuild_knowledge)
         ingest_layout.addStretch()
 
         # ── Knowledge Index Stats ───────────────────────────────────────
@@ -7701,6 +9078,7 @@ class MainDashboard(QMainWindow):
 
         # Wire up brain UI signals
         self.btn_load_knowledge.clicked.connect(self._on_load_knowledge)
+        self.btn_rebuild_knowledge.clicked.connect(self._on_rebuild_knowledge)
         self.temp_slider.valueChanged.connect(self._on_temp_changed)
         self.brain_files_list.itemClicked.connect(self._on_knowledge_file_selected)
         self._btn_auto_learn.clicked.connect(self._on_toggle_auto_learn)
@@ -7772,6 +9150,45 @@ class MainDashboard(QMainWindow):
         self._brain_worker.finished_with_data.connect(
             self._on_brain_data_ready)
         self._brain_worker.start()
+
+    def _on_rebuild_knowledge(self):
+        """Scan CONCMT/ for lesson .md files and rebuild KnowledgeIndex."""
+        try:
+            from src.engine.quantum_brain import rebuild_knowledge_embeddings_from_md
+        except ImportError:
+            print("[⚠️ REBUILD] No se pudo importar rebuild_knowledge_embeddings_from_md")
+            return
+
+        concmt = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               '..', 'CONCMT')
+        if not os.path.isdir(concmt):
+            concmt = os.path.join(os.getcwd(), "CONCMT")
+
+        print(f"[♻️ REBUILD] Escaneando {concmt} ...")
+        self.brain_status.setText("♻️ REBUILD: Procesando lecciones...")
+        self.btn_rebuild_knowledge.setEnabled(False)
+
+        blocks, index = rebuild_knowledge_embeddings_from_md(concmt)
+
+        if blocks and getattr(self, 'brain_agent', None) is not None:
+            self._brain_knowledge_blocks = blocks
+            self.brain_agent.set_knowledge_blocks(blocks)
+
+            self.brain_files_list.clear()
+            for b in blocks:
+                preview = b[:60].replace('\n', ' ')
+                self.brain_files_list.addItem(preview)
+
+            self.brain_status.setText(
+                f"♻️ REBUILD OK — {len(blocks)} lecciones cargadas")
+            self.brain_progress.setValue(100)
+            print(f"[♻️ REBUILD] {len(blocks)} bloques reconstruidos desde CONCMT")
+        else:
+            self.brain_status.setText(
+                "♻️ REBUILD: Sin lecciones en CONCMT/")
+            print("[♻️ REBUILD] No se encontraron lecciones en CONCMT/")
+
+        self.btn_rebuild_knowledge.setEnabled(True)
 
     def _on_brain_data_ready(self, blocks: list, filenames: list):
         """Atomic handoff from worker — runs in main thread via signal."""
@@ -8440,7 +9857,7 @@ class MainDashboard(QMainWindow):
         self.data['price'] = float(klines[-1][4])
         self.data['last_price'] = self.data['price']
         
-        supabase_manager.connect()
+        local_trade_db.connect()
         self.stats['db_connected'] = True
         
         self.update_timer = QTimer()
@@ -8455,6 +9872,7 @@ class MainDashboard(QMainWindow):
 
             import time
             start_time = time.time()
+            _cycle_start_ms = int(time.time() * 1000)  # 🕐 capturado ANTES de cualquier update
 
             # ── Read ALL pre-computed data from AsyncDataEngine (zero REST) ──
             ms = self.market_state
@@ -8540,6 +9958,22 @@ class MainDashboard(QMainWindow):
 
             self.data['price_change_pct'] = (self.data['price_change'] / max(self.data['last_price'], 0.0001) * 100) if self.data['last_price'] > 0 else 0
 
+            # ── Order Flow S/R Map (memoria de acumulación/distribución) ──
+            try:
+                ww = ms.get('whale_walls', {}) or {}
+                self._flow_sr_map.update(
+                    price=self.data.get('price', 0),
+                    delta=self.data.get('delta', 0),
+                    cvd=self.data.get('cvd', 0),
+                    tick_speed=mom.get('tick_speed', 0),
+                    whale_bid_walls=ww.get('buy_walls', []),
+                    whale_ask_walls=ww.get('sell_walls', []),
+                )
+                flow_snap = self._flow_sr_map.get_snapshot(self.data.get('price', 0))
+                self.data.update(flow_snap)
+            except Exception:
+                pass
+
             # ── Update Galaxy Order Flow Chart ──
             self.panels['HEATMAP'].update_indicators(self.data)
             self.panels['HEATMAP'].update_klines(self.data.get('klines', []))
@@ -8562,9 +9996,12 @@ class MainDashboard(QMainWindow):
                 sv = self.data.get('window_sell_volume', self.data.get('sell_volume', 0))
                 total_vol = bv + sv
                 ld = self.data.get('liquidity_data', {})
+                tech = self.data.get('technical_levels', {})
                 cl = self.data.get('klines', [])
                 closes = [float(k[4]) for k in cl[-20:]] if cl else []
                 snapshot = {
+                    # 🕐 Anti-latencia: wall-clock del inicio del ciclo (ms)
+                    '_snapshot_time': _cycle_start_ms,
                     # Precio y cambio
                     'symbol': settings.get_symbol(),
                     'price': self.data.get('price', 0),
@@ -8673,13 +10110,33 @@ class MainDashboard(QMainWindow):
                     'last_price': self.data.get('last_price', 0),
                     'change': self.data.get('price_change', 0),
 
+                    # ── Niveles técnicos (para BrainAgent features 53-54) ──
+                    'nearest_support': tech.get('nearest_support', 0.0) or 0.0,
+                    'nearest_resistance': tech.get('nearest_resistance', 0.0) or 0.0,
+
+                    # ── Sesgo de régimen de Gemini (para BrainAgent feature 55) ──
+                    'gemini_regime_bias': (
+                        (lambda r: (
+                            1.0 if r.get('regime', '') in (
+                                'DIRECCIONAL_CON_VOLUMEN_HFT',
+                                'ABSORCION_INSTITUCIONAL_CONFIRMADA',
+                                'LIQUIDITY_SWEEP_REVERSAL',
+                                'DIRECCIONAL_A_FAVOR_DE_TENDENCIA',
+                            ) else -1.0 if r.get('regime', '') in (
+                                'BLOQUEO_POR_SPOOFING',
+                                'EVITANDO_TRAMPA_DEL_BOOK',
+                            ) else 0.0 if r.get('regime', '') == 'RANGO_INDECISO' else 0.0
+                        ))(
+                            getattr(self, 'gemini_brain', None).get_cached_regime()
+                            if getattr(self, 'gemini_brain', None) is not None
+                            else {'regime': ''}
+                        )
+                    ),
+
                     # Trap detection (derived from available data)
                     'directional_probability': 50.0,
                     'market_bias': 'INCIERTO',
                     'trap_status': 'SIN TRAMPA',
-
-                    # Anti-latency: wall-clock snapshot timestamp
-                    '_snapshot_time': time.time(),
 
                     # ── Debug: _compute_signal component scores ──────────
                     'debug_vol_pct': getattr(self.battle_bar, 'debug_vol_pct', None),
@@ -8692,6 +10149,83 @@ class MainDashboard(QMainWindow):
                     'debug_cvd_raw': getattr(self.battle_bar, 'debug_cvd_raw', None),
                     'debug_delta_raw': getattr(self.battle_bar, 'debug_delta_raw', None),
                     'debug_cvd_relativo': getattr(self.battle_bar, 'debug_cvd_relativo', None),
+                    'debug_liq_sentiment': getattr(self.battle_bar, 'debug_liq_sentiment', None),
+                    'debug_divergence': getattr(self.battle_bar, 'debug_divergence', None),
+                    'debug_ct_multiplier': getattr(self.battle_bar, 'debug_ct_multiplier', None),
+                    'debug_context_bullish': getattr(self.battle_bar, 'debug_context_bullish', None),
+                    'debug_context_bearish': getattr(self.battle_bar, 'debug_context_bearish', None),
+                    'debug_trigger_bull': getattr(self.battle_bar, 'debug_trigger_bull', None),
+                    'debug_trigger_bear': getattr(self.battle_bar, 'debug_trigger_bear', None),
+
+                    # ── Debug: Pullback Entry System ──────────────────────
+                    'debug_expected_direction': getattr(self.battle_bar, 'debug_expected_direction', None),
+                    'debug_pullback_detected': getattr(self.battle_bar, 'debug_pullback_detected', False),
+                    'debug_pullback_modifier': getattr(self.battle_bar, 'debug_pullback_modifier', 1.0),
+                    'debug_fomo_penalty': getattr(self.battle_bar, 'debug_fomo_penalty', False),
+
+                    # ── Debug: Delta Exhaustion ────────────────────────────
+                    'debug_upside_exhaust': getattr(self.battle_bar, 'debug_upside_exhaust', False),
+                    'debug_downside_exhaust': getattr(self.battle_bar, 'debug_downside_exhaust', False),
+                    'debug_delta_accel_2': getattr(self.battle_bar, 'debug_delta_accel_2', 0.0),
+                    'debug_cvd_vel': getattr(self.battle_bar, 'debug_cvd_vel', 0.0),
+                    'debug_cvd_accel': getattr(self.battle_bar, 'debug_cvd_accel', 0.0),
+                    'debug_exhaustion_bonus': getattr(self.battle_bar, 'debug_exhaustion_bonus', False),
+
+                    # ── NUEVO: Force, Flash, Contraparte, Reversión ─────────
+                    'whale_impact_score': getattr(self.signal_tab, '_whale_impact_score', 0),
+                    'whale_impact_label': getattr(self.signal_tab, '_whale_impact_label', 'LOW'),
+                    'force_score': getattr(self.signal_tab, '_force_score', 0),
+                    'force_absorption_btc_s': getattr(self.signal_tab, '_force_absorption_btc_s', 0),
+                    'flash_detected': getattr(self.signal_tab, '_flash_detected', False),
+                    'flash_classification': getattr(self.signal_tab, '_flash_classification', 'NONE'),
+                    'flash_price_change': getattr(self.signal_tab, '_flash_price_change', 0),
+                    'flash_velocity': getattr(self.signal_tab, '_flash_velocity_pct', 0),
+                    'next_cluster_price': getattr(self.signal_tab, '_next_cluster_price', 0),
+                    'next_cluster_btc': getattr(self.signal_tab, '_next_cluster_btc', 0),
+                    'next_cluster_distance': getattr(self.signal_tab, '_next_cluster_distance', 0),
+                    'projected_move_pct': getattr(self.signal_tab, '_projected_move_pct', 0),
+                    'projected_move_ticks': getattr(self.signal_tab, '_projected_move_ticks', 0),
+                    'counterparty_price': getattr(self.signal_tab, '_next_cluster_price', 0),
+                    'counterparty_btc': getattr(self.signal_tab, '_next_cluster_btc', 0),
+                    'counterparty_distance': getattr(self.signal_tab, '_next_cluster_distance', 0),
+                    'counterparty_side': 'BID' if getattr(self.signal_tab, '_signal_direction', 'NEUTRAL') == 'SHORT' else 'ASK',
+                    'wall_impact_side': 'ASK' if getattr(self.signal_tab, '_signal_direction', 'NEUTRAL') == 'LONG' else 'BID',
+                    'wall_impact_btc': max(
+                        getattr(self.signal_tab, '_force_absorption_btc_s', 0) * 0.5,
+                        FORCE_WHALE_IMPACT_BTC if getattr(self.signal_tab, '_whale_impact_score', 0) > FORCE_WHALE_IMPACT_MED else 0
+                    ),
+                    'wall_impact_price': getattr(self.signal_tab, '_next_cluster_price', 0),
+                    'wall_impact_velocity': getattr(self.signal_tab, '_force_absorption_btc_s', 0),
+                    'reversal_probability': max(
+                        0, min(95,
+                            # CVD divergence: precio sube pero CVD baja → reversión
+                            (lambda cvd_now, cvd_prev, p, clus_p, clus_d: (
+                                (abs(cvd_now - cvd_prev) * 10)  # cambio CVD
+                                + (30 if clus_d < 0.3 else 15 if clus_d < 0.6 else 0)  # cercanía
+                                + (20 if cvd_now < cvd_prev and p > clus_p * 0.999 else 0)  # divergencia
+                                + (10 if self.data.get('rsi', 50) > 70 or self.data.get('rsi', 50) < 30 else 0)
+                            ))(
+                                self.data.get('cvd', 0),
+                                self._prev_cvd,
+                                self.data.get('price', 0),
+                                getattr(self.signal_tab, '_next_cluster_price', 0),
+                                getattr(self.signal_tab, '_next_cluster_distance', 0)
+                            ) if getattr(self.signal_tab, '_signal_direction', 'NEUTRAL') in ('LONG', 'SHORT') else 0
+                        )
+                    ),
+                    'reversal_zone_price': getattr(self.signal_tab, '_next_cluster_price', 0),
+                    'reversal_side': 'BID' if getattr(self.signal_tab, '_signal_direction', 'NEUTRAL') == 'LONG' else 'ASK',
+                    'reversal_next_level': getattr(self.signal_tab, '_next_cluster_price', 0) * 0.999 if getattr(self.signal_tab, '_signal_direction', 'NEUTRAL') == 'LONG' else getattr(self.signal_tab, '_next_cluster_price', 0) * 1.001,
+
+                    # ── Order Flow S/R Map ──────────────────────────────────
+                    'flow_supports': self.data.get('flow_supports', []),
+                    'flow_resistances': self.data.get('flow_resistances', []),
+                    'flow_nearest_support_price': self.data.get('flow_nearest_support_price', 0.0),
+                    'flow_nearest_support_strength': self.data.get('flow_nearest_support_strength', 0.0),
+                    'flow_nearest_resistance_price': self.data.get('flow_nearest_resistance_price', 0.0),
+                    'flow_nearest_resistance_strength': self.data.get('flow_nearest_resistance_strength', 0.0),
+                    'flow_support_count': self.data.get('flow_support_count', 0),
+                    'flow_resistance_count': self.data.get('flow_resistance_count', 0),
                 }
 
                 # ── Enrich trap & bias from battle_bar ────────────────────
@@ -8727,26 +10261,73 @@ class MainDashboard(QMainWindow):
                 if has_wall and cancel_rate < 35.0:
                     pass  # keep SIN TRAMPA
 
-                # Trap OFF: cancel_rate between 35-55% or depth_imb < 45% → operational
-                elif has_wall and (cancel_rate < 55.0 or abs(depth_imb) < 45.0):
+                # Trap OFF: cancel_rate < TRAP_CANCEL_RATE_THRESHOLD or depth_imb < TRAP_DEPTH_IMB_THRESHOLD → operational
+                elif has_wall and (cancel_rate < TRAP_CANCEL_RATE_THRESHOLD or abs(depth_imb) < TRAP_DEPTH_IMB_THRESHOLD):
                     pass  # keep SIN TRAMPA
 
-                # Trap ON: cancel_rate > 55% AND depth_imb > 45%
-                elif has_wall and cancel_rate > 55.0 and abs(depth_imb) > 45.0:
-                    if rsi_val < 25 and bb_pos < 15 and snapshot.get('market_bias') == 'ALZA':
-                        # Tick Speed Brake: require delta_vel > 500 c/s AND tick_speed < 15
-                        if delta_vel_mag > 500 and tick_speed < 15:
+                # Trap ON: cancel_rate > TRAP_CANCEL_RATE_THRESHOLD AND depth_imb > TRAP_DEPTH_IMB_THRESHOLD
+                elif has_wall and cancel_rate > TRAP_CANCEL_RATE_THRESHOLD and abs(depth_imb) > TRAP_DEPTH_IMB_THRESHOLD:
+                    # Binance crypto: RSI extremes ampliados (35/65 vs 25/75)
+                    rsi_low = 35
+                    rsi_high = 65
+                    bb_low = 25
+                    bb_high = 75
+                    if rsi_val < rsi_low and bb_pos < bb_low and snapshot.get('market_bias') == 'ALZA':
+                        # Tick Speed Brake: delta_vel > TRAP_TICK_BRAKE_THRESHOLD AND tick_speed < TRAP_TICK_SPEED_MAX
+                        if delta_vel_mag > TRAP_TICK_BRAKE_THRESHOLD and tick_speed < TRAP_TICK_SPEED_MAX:
                             snapshot['trap_status'] = '🔴 TRAMPA BAJISTA (FALSO SOPORTE)'
-                    elif rsi_val > 75 and bb_pos > 85 and snapshot.get('market_bias') == 'BAJA':
-                        if delta_vel_mag > 500 and tick_speed < 15:
+                    elif rsi_val > rsi_high and bb_pos > bb_high and snapshot.get('market_bias') == 'BAJA':
+                        if delta_vel_mag > TRAP_TICK_BRAKE_THRESHOLD and tick_speed < TRAP_TICK_SPEED_MAX:
                             snapshot['trap_status'] = '🔴 TRAMPA ALCISTA (FALSA RESISTENCIA)'
 
                 # Store trap_status in data for UI banner
                 self.data['trap_status'] = snapshot['trap_status']
 
+                # ── NUEVO: Reversal probability ──────────────────────────────
+                price = snapshot.get('price', 0)
+                cvd = snapshot.get('cvd', 0)
+                delta = snapshot.get('delta', 0)
+                cp_dist = getattr(self.signal_tab, '_next_cluster_distance', 0)
+                cp_price = getattr(self.signal_tab, '_next_cluster_price', 0)
+                sig_dir = snapshot.get('signal_text', 'NEUTRAL')
+                rev_prob = 0
+                rev_next = 0
+                rev_side = 'BID'
+                if cp_dist > 0 and cp_dist < 0.20 and cp_price > 0:
+                    # Precio cerca de un cluster: evaluar divergencia
+                    cvd_divergente = (sig_dir == 'LONG' and cvd < -1) or (sig_dir == 'SHORT' and cvd > 1)
+                    delta_divergente = (sig_dir == 'LONG' and delta < -100) or (sig_dir == 'SHORT' and delta > 100)
+                    if cvd_divergente and delta_divergente:
+                        rev_prob = 70 + min(25, abs(cvd) * 5)
+                        rev_side = 'BID' if sig_dir == 'LONG' else 'ASK'
+                        rev_next = cp_price
+                    elif cvd_divergente or delta_divergente:
+                        rev_prob = 40 + min(30, abs(delta) / 10)
+                        rev_side = 'BID' if sig_dir == 'LONG' else 'ASK'
+                        rev_next = cp_price
+                    else:
+                        rev_prob = 15
+                snapshot['reversal_probability'] = rev_prob
+                snapshot['reversal_zone_price'] = cp_price
+                snapshot['reversal_side'] = rev_side
+                snapshot['reversal_next_level'] = rev_next
+
                 # Track CVD for exhaustion engine (prev_cvd used by check_market_exhaustion)
                 current_cvd = snapshot.get('cvd', 0.0)
                 self._prev_cvd = current_cvd
+
+                # ── Paper Trading: inject balance info into snapshot ─────────
+                snapshot['available_balance'] = getattr(self.signal_tab, '_available', 0.0)
+                snapshot['is_paper_trading'] = snapshot['available_balance'] <= 0
+
+                # ── Signal Diagnostics: merge BattleBar + SignalMonitorTab ───
+                bb_diag = getattr(self.battle_bar, 'signal_diagnostics', []) if hasattr(self, 'battle_bar') else []
+                sm_diag = getattr(self.signal_tab, '_signal_diagnostics', []) if hasattr(self, 'signal_tab') else []
+                merged = list(bb_diag)
+                for d in sm_diag:
+                    if d not in merged:
+                        merged.append(d)
+                snapshot['signal_diagnostics'] = merged
 
                 # Push market snapshot to Telegram (lightning fast, no brain)
                 self.telegram_bot.push_update(snapshot)
@@ -9431,6 +11012,7 @@ class MainDashboard(QMainWindow):
 
         # ── Relative Volume (current vs avg) ──────────────────────────
         relative_volume = (self.data.get('buy_volume', 0) + self.data.get('sell_volume', 0)) / max(avg_vol, 0.001)
+        vol_ratio = relative_volume
 
         # ── Depth imbalance ───────────────────────────────────────────
         depth_imb_pct = lq.get('depth_imbalance', 0.0)
@@ -9460,6 +11042,7 @@ class MainDashboard(QMainWindow):
                 "bb_lower": self.data.get("bb_lower", 0),
                 "atr": self.data.get("atr", 0),
                 "delta": self.data.get("delta", 0),
+                "vol_ratio": vol_ratio,
                 "cvd": self.data.get("cvd", 0),
                 "buy_volume": self.data.get("buy_volume", 0),
                 "sell_volume": self.data.get("sell_volume", 0),
@@ -9497,7 +11080,7 @@ class MainDashboard(QMainWindow):
                 # ── Mejora 2: whale walls para absorción ────────────
                 "whale_bid_walls": self.data.get('liquidity_data', {}).get('buy_walls', []),
                 "whale_ask_walls": self.data.get('liquidity_data', {}).get('sell_walls', []),
-                "signal_ts": datetime.utcnow(),
+                "signal_ts": datetime.now(timezone.utc),
             })
 
         self.battle_bar.update_battle(
@@ -9555,6 +11138,8 @@ class MainDashboard(QMainWindow):
             book_depth_asks_volume=self.data.get('book_depth_asks_volume', 0.0),
             funding_rate=self.data.get('funding_rate', 0.0),
             oi_delta_5min=self.data.get('oi_delta_5min', 0.0),
+            flow_supports=self.data.get('flow_supports', []),
+            flow_resistances=self.data.get('flow_resistances', []),
         )
             
         # ═══════════════════════════════════════════════════════════════

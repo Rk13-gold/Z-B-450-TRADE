@@ -12,7 +12,7 @@ from config.settings import settings
 from src.engine.binance_client import binance_client
 from src.engine.order_flow import order_flow_engine
 from src.engine.strategy import trading_strategy
-from src.database.supabase_manager import supabase_manager
+from src.database.supabase_manager import local_trade_db
 
 console = Console()
 
@@ -81,7 +81,7 @@ class TradingBot:
                 self.mock_mode = True
                 await self._init_mock_data()
 
-        supabase_manager.connect()
+        local_trade_db.connect()
         console.print("✅ [green]Sistema inicializado[/green]")
 
     async def _init_mock_data(self):

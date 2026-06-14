@@ -15,7 +15,7 @@ from config.settings import settings
 from src.engine.binance_client import binance_client
 from src.engine.order_flow import order_flow_engine
 from src.engine.strategy import trading_strategy
-from src.database.supabase_manager import supabase_manager
+from src.database.supabase_manager import local_trade_db
 
 
 class TradingDashboard(App):
@@ -123,7 +123,7 @@ class TradingDashboard(App):
             if historical_klines:
                 self.price = float(historical_klines[-1][4])
 
-            supabase_manager.connect()
+            local_trade_db.connect()
             
             await binance_client.start_kline_stream(self.handle_kline)
             await binance_client.start_trade_stream(self.handle_trade)
