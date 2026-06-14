@@ -8382,6 +8382,25 @@ class MainDashboard(QMainWindow):
                 "uptime": self.stats.get('uptime_seconds', 0),
                 "timestamp": self.stats.get('last_update', ''),
                 "bore_port": self._get_bore_port(),
+                # ── Narrative Data ───────────────────────────────────────
+                "buy_volume": self.data.get("buy_volume", 0),
+                "sell_volume": self.data.get("sell_volume", 0),
+                "tick_speed": self.data.get("tick_speed", 0),
+                "cancel_rate": getattr(self.signal_tab, '_cancel_rate', 0) if hasattr(self, 'signal_tab') else 0,
+                "kaufman_eff": self.data.get("kaufman_eff", 0.5),
+                "spread_velocity": self.data.get("spread_velocity", 0),
+                "hft_speed": getattr(self.signal_tab, '_hft_speed', 0) if hasattr(self, 'signal_tab') else 0,
+                "depth_imb_pct": getattr(self.signal_tab, '_depth_imb_pct', 0) if hasattr(self, 'signal_tab') else 0,
+                "spoofing_risk": getattr(self.signal_tab, '_spoofing_risk', 0) if hasattr(self, 'signal_tab') else 0,
+                "trend": self.data.get("trend", "NEUTRAL"),
+                "liquidity_data": self.data.get("liquidity_data", {}),
+                "liquidation_events": self.data.get("liquidation_events", []),
+                "order_book": {
+                    "bids": [[float(b[0]), float(b[1])] for b in (self.data.get('order_book', {}).get('bids', [])[:5])],
+                    "asks": [[float(a[0]), float(a[1])] for a in (self.data.get('order_book', {}).get('asks', [])[:5])],
+                },
+                "decision": getattr(self.battle_bar, 'decision', 'ESPERAR') if hasattr(self, 'battle_bar') else 'ESPERAR',
+                "active_trap": getattr(self.battle_bar, 'active_trap', '') if hasattr(self, 'battle_bar') else '',
             }
 
         def _ws_on_command(data: dict) -> dict:

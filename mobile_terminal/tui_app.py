@@ -1,32 +1,21 @@
-"""
-tui_app.py — Textual-based TUI for BB-450 mobile terminal (Termux).
-
-7 panels: BANNER | PRICE | SIGNAL | NOTIFICATIONS | AI | ACCOUNT | TRADE
-Keyboard-driven, full trading capabilities via WebSocket.
-"""
-
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
+import subprocess
 import time
 from collections import deque
 from typing import Any, Optional
 
 from rich.panel import Panel
 from rich.text import Text
-from rich.table import Table
 from textual.app import App
 from textual.reactive import reactive
 from textual.widget import Widget
 
-from config import WS_URI
-from ws_client import BB450WSClient
+from config import WS_URI, SOUND_LONG, SOUND_SHORT, SOUND_CLOSE, NOTIFY_ENABLED
 
 log = logging.getLogger(__name__)
-
-# ── Constants ─────────────────────────────────────────────────────────
 
 RECONNECT_BLINK = 0.5
 COLORS = {
@@ -40,8 +29,6 @@ COLORS = {
     "dim": "#555555",
     "white": "#cccccc",
 }
-
-# ── Utility ────────────────────────────────────────────────────────────
 
 _notif_severity_colors = {
     "critical": COLORS["red"],
@@ -65,7 +52,32 @@ def _severity_color(sev: str) -> str:
     return _notif_severity_colors.get(sev, COLORS["white"])
 
 
-# ── Widgets (each with reactive({}) + render()) ─────────────────────
+def _notify_android(title: str, body: str):
+    if not NOTIFY_ENABLED:
+        return
+    try:
+        subprocess.run(
+            ["termux-notification", "--title", title, "--content", body,
+             "--led-color", "ff0000", "--priority", "high", "--sound"],
+            timeout=2, capture_output=True,
+        )
+    except Exception:
+        pass
+
+
+def _play_sound(wav_path: str):
+    if not NOTIFY_ENABLED or not wav_path:
+        return
+    try:
+        subprocess.run(
+            ["termux-media-player", "play", wav_path],
+            timeout=2, capture_output=True,
+        )
+    except Exception:
+        pass
+
+
+# ── Widgets ────────────────────────────────────────────────────────
 
 class BannerWidget(Widget):
     data = reactive({})
@@ -121,13 +133,161 @@ class SignalWidget(Widget):
             sig_text = f"\U0001f7e3 SHORT {conf:.0f}%"
         else:
             sig_color = COLORS["gold"]
-            sig_text = f"\u26aa WAIT"
+            sig_text = "\u26aa WAIT"
 
         text = Text.assemble(
             (f" {sig_text} ", f"bold {sig_color}"),
             (f"\n  Regimen: {regime[:25]}", COLORS["dim"]),
         )
         return Panel(text, title="SIGNAL", border_style=sig_color)
+
+
+class NarrativeWidget(Widget):
+    data = reactive({})
+
+    def render(self) -> Panel:
+        d = self.data
+        bv = d.get("buy_volume", 0)
+        sv = d.get("sell_volume", 0)
+        total = bv + sv + 0.001
+        delta = bv - sv
+        delta_pct = (delta / total) * 100
+        tick_sp = d.get("tick_speed", 0)
+        hft = d.get("hft_speed", 0)
+        cvd = d.get("cvd", 0)
+        depth_imb = d.get("depth_imb_pct", 0)
+        spoof = d.get("spoofing_risk", 0)
+        decision = d.get("decision", "")
+        active_trap = d.get("active_trap", "")
+
+        lines = []
+
+        # Whale sonar
+        if abs(delta_pct) > 35 and total > 3:
+            dir_emoji = "\U0001f7e3" if delta > 0 else "\U0001f534"
+            w_text = f"{dir_emoji} BALLENA {'COMPRADORA' if delta > 0 else 'VENDEDORA'}"
+            lines.append(f"  {w_text} \u0394 {delta:+.1f}\u20bf ({delta_pct:+.1f}%)")
+        elif abs(delta_pct) > 15 and total > 3:
+            dir_emoji = "\U0001f7e2" if delta > 0 else "\U0001f7e3"
+            w_text = f"{dir_emoji} AGRESION {'COMPRADORA' if delta > 0 else 'VENDEDORA'}"
+            lines.append(f"  {w_text} \u0394 {delta:+.1f}\u20bf ({delta_pct:+.1f}%)")
+        else:
+            lines.append(f"  \u26aa Vol: {total:.1f}\u20bf  \u0394 {delta:+.1f}\u20bf")
+
+        hft_color = COLORS["red"] if hft > 5 else COLORS["gold"] if hft > 2 else COLORS["dim"]
+        lines.append(f"   HFT: {hft:.1f}/s  Tick: {tick_sp:.0f}/s  Spoof: {spoof:.0f}%")
+
+        # Traps
+        if active_trap:
+            lines.append(f"  \u26a0\ufe0f {active_trap[:40]}")
+
+        # CVD + Depth imbalance
+        cvd_label = "BULLISH" if cvd > 2 else "BEARISH" if cvd < -2 else "FLAT"
+        cvd_color = COLORS["green"] if cvd > 2 else COLORS["red"] if cvd < -2 else COLORS["dim"]
+        lines.append(f"  CVD: {cvd_label} ({cvd:+.1f})  Depth: {depth_imb:+.1f}%")
+
+        # Decision
+        if decision:
+            if "LONG" in decision:
+                d_color = COLORS["green"]
+            elif "SHORT" in decision:
+                d_color = COLORS["red"]
+            elif "TRAMPA" in decision:
+                d_color = COLORS["red"]
+            elif "PARCIAL" in decision:
+                d_color = COLORS["gold"]
+            else:
+                d_color = COLORS["dim"]
+            lines.append(f"  {decision[:50]}")
+
+        text = Text("\n".join(lines))
+        border_col = COLORS["cyan"]
+        if "TRAMPA" in decision:
+            border_col = COLORS["red"]
+        elif "LONG CONFIRMADO" in decision:
+            border_col = COLORS["green"]
+        elif "SHORT CONFIRMADO" in decision:
+            border_col = COLORS["red"]
+        return Panel(text, title="INSTITUTIONAL NARRATIVE", border_style=border_col)
+
+
+class ActionWidget(Widget):
+    data = reactive({
+        "signal": "NEUTRAL",
+        "decision": "",
+        "in_position": False,
+        "bidir": "ALZA",
+    })
+
+    def __init__(self, client: BB450WSClient, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._client = client
+
+    def render(self) -> Panel:
+        d = self.data
+        sig = d.get("signal", "NEUTRAL")
+        decision = d.get("decision", "")
+        in_pos = d.get("in_position", False)
+
+        lines = []
+        show_long = False
+        show_short = False
+        show_close = False
+
+        if "LONG CONFIRMADO" in decision or sig == "LONG":
+            show_long = True
+        if "SHORT CONFIRMADO" in decision or sig == "SHORT":
+            show_short = True
+        if "TRAMPA" in decision and in_pos:
+            show_close = True
+        if in_pos:
+            show_close = True
+        if "PARCIAL" not in decision and "SIN VENTAJA" not in decision:
+            if not show_long and not show_short and not in_pos:
+                show_long = True
+                show_short = True
+
+        if show_long:
+            lines.append("  [\U0001f7e2 ENTRAR LONG]  (presiona 1)")
+        if show_short:
+            lines.append("  [\U0001f7e3 ENTRAR SHORT] (presiona 2)")
+        if show_close:
+            lines.append("  [\U0001f534 CERRAR POS]  (presiona 3)")
+
+        if not lines:
+            lines.append("  \u26aa Esperando se\u00f1al...")
+
+        text = Text("\n".join(lines))
+        border_col = COLORS["gold"]
+        if show_long and not show_short:
+            border_col = COLORS["green"]
+        elif show_short and not show_long:
+            border_col = COLORS["red"]
+        return Panel(text, title="QUICK ACTIONS", border_style=border_col)
+
+    async def action_long(self):
+        ok = await self._client.trade(
+            direction="ALZA", sl=0, tp=0,
+            leverage=40, risk_pct=1.0, split=False,
+        )
+        self.app.query_one(TradeWidget).data["status"] = \
+            "\u2705 LONG ENVIADA" if ok else "\u274c LONG FALLIDA"
+        self.app.query_one(TradeWidget).refresh()
+
+    async def action_short(self):
+        ok = await self._client.trade(
+            direction="BAJA", sl=0, tp=0,
+            leverage=40, risk_pct=1.0, split=False,
+        )
+        self.app.query_one(TradeWidget).data["status"] = \
+            "\u2705 SHORT ENVIADA" if ok else "\u274c SHORT FALLIDA"
+        self.app.query_one(TradeWidget).refresh()
+
+    async def action_close(self):
+        ok = await self._client.close_all()
+        self.app.query_one(TradeWidget).data["status"] = \
+            "\u2705 CIERRE ENVIADO" if ok else "\u274c CIERRE FALLIDO"
+        self.app.query_one(TradeWidget).refresh()
 
 
 class NotificationWidget(Widget):
@@ -208,22 +368,14 @@ class DiagnosticsWidget(Widget):
             return Panel(" No active blocks", title="DIAGNOSTICS",
                          border_style=COLORS["dim"])
         text = Text()
-        for r in reasons[:4]:
+        for r in reasons[:3]:
             text.append(f" \u26a0 {r}\n", COLORS["orange"])
-        if len(reasons) > 4:
-            text.append(f" ... y {len(reasons)-4} mas", COLORS["dim"])
+        if len(reasons) > 3:
+            text.append(f" ... y {len(reasons)-3} mas", COLORS["dim"])
         return Panel(text, title="DIAGNOSTICS", border_style=COLORS["orange"])
 
 
 class TradeWidget(Widget):
-    """Interactive trade execution panel.
-
-    Keyboard-driven:
-      Tab       → move between fields
-      Up/Down   → change value (direction toggle, increment/decrement)
-      Enter     → execute trade
-    """
-
     data = reactive({
         "direction": "LONG",
         "sl": "",
@@ -242,28 +394,21 @@ class TradeWidget(Widget):
     def render(self) -> Panel:
         d = self.data
         dir_text = f"[{'LONG' if d['direction'] == 'LONG' else 'SHORT'}]"
-        dir_color = COLORS["green"] if d["direction"] == "LONG" else COLORS["red"]
         focus = d.get("focus", 0)
 
         lines = []
-        # Direction
         sel = " <" if focus == 0 else "  "
-        lines.append(f"{sel}DIR: {dir_text} (TAB to change){sel}")
-        # SL
+        lines.append(f"{sel}DIR: {dir_text} (TAB){sel}")
         sel = " <" if focus == 1 else "  "
         sl_val = d.get("sl", "") or "auto"
         lines.append(f"{sel}SL: {sl_val}{sel}")
-        # TP
         sel = " <" if focus == 2 else "  "
         tp_val = d.get("tp", "") or "auto"
         lines.append(f"{sel}TP: {tp_val}{sel}")
-        # Leverage
         sel = " <" if focus == 3 else "  "
         lines.append(f"{sel}LEV: {d['leverage']}x{sel}")
-        # Risk %
         sel = " <" if focus == 4 else "  "
         lines.append(f"{sel}RISK: {d['risk_pct']:.1f}%{sel}")
-        # Split entry
         sel = " <" if focus == 5 else "  "
         split_txt = "YES" if d["split"] else "NO"
         lines.append(f"{sel}SPLIT: {split_txt}{sel}")
@@ -276,7 +421,6 @@ class TradeWidget(Widget):
         return Panel(text, title="TRADE", border_style=COLORS["white"])
 
     async def on_key(self, event):
-        """Handle keyboard input for the trade widget."""
         focus = self.data.get("focus", 0)
         max_focus = 5
 
@@ -286,11 +430,11 @@ class TradeWidget(Widget):
             event.stop()
             self.refresh()
 
-        elif event.key == "up" or event.key == "down":
+        elif event.key in ("up", "down"):
             direction = 1 if event.key == "up" else -1
-            if focus == 0:  # direction toggle
+            if focus == 0:
                 self.data["direction"] = "SHORT" if self.data["direction"] == "LONG" else "LONG"
-            elif focus == 5:  # split toggle
+            elif focus == 5:
                 self.data["split"] = not self.data.get("split", False)
             else:
                 step = {1: 10, 2: 10, 3: 5, 4: 0.1}.get(focus, 1)
@@ -303,11 +447,11 @@ class TradeWidget(Widget):
                         except ValueError:
                             current = 0
                     new_val = current + step * direction
-                    if focus == 3:  # leverage
+                    if focus == 3:
                         new_val = max(1, min(100, new_val))
-                    elif focus == 4:  # risk pct
+                    elif focus == 4:
                         new_val = max(0.1, min(100, new_val))
-                    elif focus in (1, 2):  # sl/tp
+                    elif focus in (1, 2):
                         new_val = max(0, new_val)
                     self.data[key_map[focus]] = str(int(new_val)) if focus == 3 else f"{new_val:.1f}"
             event.stop()
@@ -342,6 +486,8 @@ class TradeWidget(Widget):
             split=split,
         )
         self.data["status"] = "\u2705 Order sent!" if ok else "\u274c Send failed"
+        if ok:
+            _play_sound(SOUND_LONG if direction == "LONG" else SOUND_SHORT)
         self.refresh()
 
 
@@ -351,12 +497,14 @@ class BB450MobileApp(App):
     CSS = """
     Screen { background: #0a0a0a; }
     BannerWidget { height: 3; }
-    PriceWidget { height: 5; }
-    SignalWidget { height: 4; }
-    NotificationWidget { height: 10; }
-    AIWidget { height: 8; }
-    AccountWidget { height: 6; }
-    DiagnosticsWidget { height: 5; }
+    PriceWidget { height: 4; }
+    SignalWidget { height: 3; }
+    NarrativeWidget { height: 8; }
+    ActionWidget { height: 4; }
+    NotificationWidget { height: 6; }
+    AIWidget { height: 5; }
+    AccountWidget { height: 4; }
+    DiagnosticsWidget { height: 3; }
     TradeWidget { height: 12; }
     """
 
@@ -365,12 +513,15 @@ class BB450MobileApp(App):
         self._client = BB450WSClient()
         self._notifications: deque = deque(maxlen=100)
         self._ws_task: Optional[asyncio.Task] = None
+        self._prev_signal = "NEUTRAL"
+        self._prev_decision = ""
 
     def compose(self):
-        """Layout: 3 columns top, full-width panels below."""
         yield BannerWidget()
         yield PriceWidget()
         yield SignalWidget()
+        yield NarrativeWidget()
+        yield ActionWidget(client=self._client)
         yield NotificationWidget()
         yield AIWidget()
         yield AccountWidget()
@@ -381,7 +532,6 @@ class BB450MobileApp(App):
         self.set_interval(0.5, self._blink_reconnect)
         self._ws_task = asyncio.create_task(self._run_client())
 
-        # Wire client callbacks
         self._client.on_market_state = self._on_market_state
         self._client.on_notification = self._on_notification
         self._client.on_command_ack = self._on_command_ack
@@ -389,6 +539,71 @@ class BB450MobileApp(App):
 
     async def _run_client(self):
         await self._client.connect()
+
+    # ── Keyboard shortcuts ─────────────────────────────────────────
+
+    def key_b(self):
+        self._quick_long()
+
+    def key_s(self):
+        self._quick_short()
+
+    def key_c(self):
+        self._quick_close()
+
+    def key_q(self):
+        self.exit()
+
+    def key_1(self):
+        self._quick_long()
+
+    def key_2(self):
+        self._quick_short()
+
+    def key_3(self):
+        self._quick_close()
+
+    def _quick_long(self):
+        asyncio.create_task(self._do_quick_long())
+
+    async def _do_quick_long(self):
+        ok = await self._client.trade(
+            direction="ALZA", sl=0, tp=0,
+            leverage=40, risk_pct=1.0, split=False,
+        )
+        tw = self.query_one(TradeWidget)
+        tw.data["status"] = "\u2705 LONG RAPIDA" if ok else "\u274c LONG FALLIDA"
+        tw.refresh()
+        if ok:
+            _play_sound(SOUND_LONG)
+            _notify_android("BB-450 LONG", "Orden LONG enviada")
+
+    def _quick_short(self):
+        asyncio.create_task(self._do_quick_short())
+
+    async def _do_quick_short(self):
+        ok = await self._client.trade(
+            direction="BAJA", sl=0, tp=0,
+            leverage=40, risk_pct=1.0, split=False,
+        )
+        tw = self.query_one(TradeWidget)
+        tw.data["status"] = "\u2705 SHORT RAPIDA" if ok else "\u274c SHORT FALLIDA"
+        tw.refresh()
+        if ok:
+            _play_sound(SOUND_SHORT)
+            _notify_android("BB-450 SHORT", "Orden SHORT enviada")
+
+    def _quick_close(self):
+        asyncio.create_task(self._do_quick_close())
+
+    async def _do_quick_close(self):
+        ok = await self._client.close_all()
+        tw = self.query_one(TradeWidget)
+        tw.data["status"] = "\u2705 CIERRE RAPIDO" if ok else "\u274c CIERRE FALLIDO"
+        tw.refresh()
+        if ok:
+            _play_sound(SOUND_CLOSE)
+            _notify_android("BB-450 CLOSE", "Posicion cerrada")
 
     # ── Callbacks ──────────────────────────────────────────────────
 
@@ -400,13 +615,22 @@ class BB450MobileApp(App):
             "change_pct": data.get("change_pct", 0),
             "day_high": data.get("day_high", 0),
             "day_low": data.get("day_low", 0),
-            "funding_rate": data.get("funding_rate", 0),
-            "oi_delta_5min": data.get("oi_delta_5min", 0),
         }
         self.query_one(SignalWidget).data = {
             "signal": data.get("signal", "NEUTRAL"),
             "confidence": data.get("confidence", 0),
             "regimen_mercado": data.get("regimen_mercado", ""),
+        }
+        self.query_one(NarrativeWidget).data = {
+            "buy_volume": data.get("buy_volume", 0),
+            "sell_volume": data.get("sell_volume", 0),
+            "tick_speed": data.get("tick_speed", 0),
+            "hft_speed": data.get("hft_speed", 0),
+            "cvd": data.get("cvd", 0),
+            "depth_imb_pct": data.get("depth_imb_pct", 0),
+            "spoofing_risk": data.get("spoofing_risk", 0),
+            "decision": data.get("decision", ""),
+            "active_trap": data.get("active_trap", ""),
         }
         self.query_one(AccountWidget).data = {
             "balance": data.get("balance", 0),
@@ -418,6 +642,27 @@ class BB450MobileApp(App):
         if diag:
             self.query_one(DiagnosticsWidget).data = {"reasons": diag}
 
+        sig = data.get("signal", "NEUTRAL")
+        decision = data.get("decision", "")
+        in_pos = data.get("position") is not None
+        self.query_one(ActionWidget).data = {
+            "signal": sig,
+            "decision": decision,
+            "in_position": in_pos,
+        }
+
+        if sig != self._prev_signal and sig in ("LONG", "SHORT"):
+            _play_sound(SOUND_LONG if sig == "LONG" else SOUND_SHORT)
+            _notify_android(f"BB-450 SENAL {sig}", f"Confianza: {data.get('confidence', 0):.0f}%")
+            self._prev_signal = sig
+
+        if decision != self._prev_decision and decision:
+            if "TRAMPA" in decision:
+                _notify_android("BB-450 TRAMPA", decision[:80])
+            elif "CONFIRMADO" in decision:
+                _notify_android(f"BB-450 {decision}", "Se\u00f1al confirmada")
+            self._prev_decision = decision
+
     def _on_notification(self, notif: dict):
         if not self.is_mounted:
             return
@@ -425,8 +670,6 @@ class BB450MobileApp(App):
         self.query_one(NotificationWidget).data = {
             "items": list(self._notifications),
         }
-
-        # Route to AI panel
         if notif.get("category") in ("ai_analysis", "sentiment"):
             self.query_one(AIWidget).data = {
                 "text": notif.get("body", ""),
@@ -452,7 +695,6 @@ class BB450MobileApp(App):
         }
 
     def _blink_reconnect(self):
-        """Periodic refresh to keep UI alive."""
         pass
 
 
