@@ -600,67 +600,83 @@ class BB450MobileApp(App):
         if not self.is_mounted:
             return
 
-        self.query_one(BannerWidget).data["port"] = data.get("bore_port", "")
-        self.query_one(BannerWidget).refresh()
+        try:
+            self.query_one(BannerWidget).data = {
+                "status": "connected",
+                "host": WS_URI,
+                "port": data.get("bore_port", ""),
+            }
 
-        self.query_one(PriceBarWidget).data = {
-            "price": data.get("price", 0),
-            "change_pct": data.get("change_pct", 0),
-            "high": data.get("day_high", 0),
-            "low": data.get("day_low", 0),
-        }
+            self.query_one(PriceBarWidget).data = {
+                "price": data.get("price", 0),
+                "change_pct": data.get("change_pct", 0),
+                "high": data.get("day_high", 0),
+                "low": data.get("day_low", 0),
+            }
 
-        sig = data.get("signal", "NEUTRAL")
-        conf = data.get("confidence", 0)
+            sig = data.get("signal", "NEUTRAL")
+            conf = data.get("confidence", 0)
 
-        self.query_one(StrengthBarWidget).data = {
-            "signal": sig,
-            "confidence": conf,
-            "buy_pressure": data.get("buy_pressure", 50),
-            "regime": data.get("regimen_mercado", ""),
-        }
+            self.query_one(StrengthBarWidget).data = {
+                "signal": sig,
+                "confidence": conf,
+                "buy_pressure": data.get("buy_pressure", 50),
+                "regime": data.get("regimen_mercado", ""),
+            }
 
-        self.query_one(NarrativeWidget).data = {
-            "buy_volume": data.get("buy_volume", 0),
-            "sell_volume": data.get("sell_volume", 0),
-            "tick_speed": data.get("tick_speed", 0),
-            "hft_speed": data.get("hft_speed", 0),
-            "cvd": data.get("cvd", 0),
-            "ba_ratio": data.get("ba_ratio", 1.0),
-            "depth_imb_pct": data.get("depth_imb_pct", 0),
-            "spoofing_risk": data.get("spoofing_risk", 0),
-            "decision": data.get("decision", ""),
-            "active_trap": data.get("active_trap", ""),
-        }
+            self.query_one(NarrativeWidget).data = {
+                "buy_volume": data.get("buy_volume", 0),
+                "sell_volume": data.get("sell_volume", 0),
+                "tick_speed": data.get("tick_speed", 0),
+                "hft_speed": data.get("hft_speed", 0),
+                "cvd": data.get("cvd", 0),
+                "ba_ratio": data.get("ba_ratio", 1.0),
+                "depth_imb_pct": data.get("depth_imb_pct", 0),
+                "spoofing_risk": data.get("spoofing_risk", 0),
+                "decision": data.get("decision", ""),
+                "active_trap": data.get("active_trap", ""),
+            }
 
-        self.query_one(WhaleWallWidget).data = {
-            "price": data.get("price", 0),
-            "bid_walls": data.get("whale_bid_walls", []),
-            "ask_walls": data.get("whale_ask_walls", []),
-        }
+            self.query_one(WhaleWallWidget).data = {
+                "price": data.get("price", 0),
+                "bid_walls": data.get("whale_bid_walls", []),
+                "ask_walls": data.get("whale_ask_walls", []),
+            }
 
-        self.query_one(ImbalanceWidget).data = {
-            "imbalance": data.get("imbalance", 0),
-            "depth_imb_pct": data.get("depth_imb_pct", 0),
-            "ba_ratio": data.get("ba_ratio", 1.0),
-            "book_depth_bids_volume": data.get("book_depth_bids_volume", 0),
-            "book_depth_asks_volume": data.get("book_depth_asks_volume", 0),
-        }
+            self.query_one(ImbalanceWidget).data = {
+                "imbalance": data.get("imbalance", 0),
+                "depth_imb_pct": data.get("depth_imb_pct", 0),
+                "ba_ratio": data.get("ba_ratio", 1.0),
+                "book_depth_bids_volume": data.get("book_depth_bids_volume", 0),
+                "book_depth_asks_volume": data.get("book_depth_asks_volume", 0),
+            }
 
-        self.query_one(AccountWidget).data = {
-            "balance": data.get("balance", 0),
-            "position": data.get("position"),
-            "funding_rate": data.get("funding_rate", 0),
-            "oi_delta_5min": data.get("oi_delta_5min", 0),
-        }
+            self.query_one(AccountWidget).data = {
+                "balance": data.get("balance", 0),
+                "position": data.get("position"),
+                "funding_rate": data.get("funding_rate", 0),
+                "oi_delta_5min": data.get("oi_delta_5min", 0),
+            }
 
-        decision = data.get("decision", "")
-        in_pos = data.get("position") is not None
-        tw = self.query_one(TradeWidget)
-        tw.data["signal"] = sig
-        tw.data["decision"] = decision
-        tw.data["in_position"] = in_pos
-        tw.refresh()
+            decision = data.get("decision", "")
+            in_pos = data.get("position") is not None
+            self.query_one(TradeWidget).data = {
+                "direction": self.query_one(TradeWidget).data.get("direction", "LONG"),
+                "sl": self.query_one(TradeWidget).data.get("sl", ""),
+                "tp": self.query_one(TradeWidget).data.get("tp", ""),
+                "leverage": self.query_one(TradeWidget).data.get("leverage", 40),
+                "risk_pct": self.query_one(TradeWidget).data.get("risk_pct", 1.0),
+                "split": self.query_one(TradeWidget).data.get("split", False),
+                "focus": self.query_one(TradeWidget).data.get("focus", 0),
+                "status": self.query_one(TradeWidget).data.get("status", ""),
+                "signal": sig,
+                "decision": decision,
+                "in_position": in_pos,
+                "bidir": self.query_one(TradeWidget).data.get("bidir", ""),
+            }
+
+        except Exception as e:
+            log.error(f"[TUI] _on_market_state error: {e}")
 
         # Sound on signal change
         if sig != self._prev_signal and sig in ("LONG", "SHORT"):
