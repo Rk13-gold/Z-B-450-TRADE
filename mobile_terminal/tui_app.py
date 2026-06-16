@@ -4,7 +4,6 @@ import asyncio
 import logging
 import subprocess
 import time
-from collections import deque
 from typing import Any, Optional
 
 from rich.panel import Panel
@@ -29,6 +28,8 @@ COLORS = {
     "dim": "#555555",
     "white": "#cccccc",
 }
+
+ALIGN_RIGHT = 38
 
 
 def _format_price(p: float) -> str:
@@ -62,20 +63,16 @@ def _play_sound(wav_path: str):
         pass
 
 
-def _bar_segments(pct: float, total_chars: int = 16) -> tuple[str, str]:
-    filled = int(total_chars * pct / 100)
-    empty = total_chars - filled
-    return "\u2588" * filled, "\u2591" * empty
+def _bar(pct: float, n: int = 12) -> tuple[str, str]:
+    f = int(n * pct / 100)
+    e = n - f
+    return "\u2588" * f, "\u2591" * e
 
 
 def _price_dist(current: float, wall_price: float) -> str:
     if current <= 0 or wall_price <= 0:
         return ""
-    dist = (wall_price / current - 1) * 100
-    return f"{dist:+.2f}%"
-
-
-ALIGN_RIGHT = 40
+    return f"{(wall_price / current - 1) * 100:+.2f}%"
 
 
 # ── Widgets ────────────────────────────────────────────────────────
@@ -85,19 +82,30 @@ class BannerWidget(Widget):
 
     def render(self) -> Panel:
         d = self.data
-        connected = d.get("status") == "connected"
-        emoji = "\U0001f7e2" if connected else "\U0001f534"
-        status = "CONNECTED" if connected else "DISCONNECTED"
-        color = COLORS["green"] if connected else COLORS["red"]
+        s = d.get("status", "disconnected")
         host = d.get("host", WS_URI)
         port = d.get("port", "")
+
+        if s == "connected":
+            emoji = "\u25cf"
+            label = "CONNECTED"
+            col = COLORS["green"]
+        elif s == "reconnecting":
+            emoji = "\u25cf"
+            label = "RECONNECTING"
+            col = COLORS["gold"]
+        else:
+            emoji = "\u25cf"
+            label = "DISCONNECTED"
+            col = COLORS["red"]
+
         text = Text.assemble(
-            (f" {emoji} BB-450 ", COLORS["magenta"]),
-            (f"| {status} ", color),
-            (f"| {host} ", COLORS["dim"]),
+            (f" {emoji} BB-450 ", f"bold {COLORS['magenta']}"),
+            (f"\u2014 {label} \u2014 ", f"bold {col}"),
+            (f"{host}", COLORS["dim"]),
             (f":{port}" if port else "", COLORS["dim"]),
         )
-        return Panel(text, style=f"bold {COLORS['bg']}", border_style=color)
+        return Panel(text, style=f"bold {COLORS['bg']}", border_style=col)
 
 
 class PriceBarWidget(Widget):
@@ -107,17 +115,17 @@ class PriceBarWidget(Widget):
         d = self.data
         p = d.get("price", 0)
         chg = d.get("change_pct", 0)
-        color = COLORS["green"] if chg >= 0 else COLORS["red"]
-        arrow = "\u25b2" if chg >= 0 else "\u25bc"
+        c = COLORS["green"] if chg >= 0 else COLORS["red"]
+        a = "\u25b2" if chg >= 0 else "\u25bc"
         hl = d.get("high", 0)
         ll = d.get("low", 0)
         text = Text.assemble(
             (f" {_format_price(p)} ", f"bold {COLORS['white']}"),
-            (f"{arrow} {chg:+.2f}% ", color),
+            (f"{a} {chg:+.2f}% ", c),
             (f"\n  H: {_format_price(hl)}  ", COLORS["dim"]),
             (f"L: {_format_price(ll)}", COLORS["dim"]),
         )
-        return Panel(text, title="PRICE", border_style=color)
+        return Panel(text, title="PRICE", border_style=c)
 
 
 class StrengthBarWidget(Widget):
@@ -127,32 +135,57 @@ class StrengthBarWidget(Widget):
         d = self.data
         sig = d.get("signal", "NEUTRAL")
         conf = d.get("confidence", 0)
-        pressure = d.get("buy_pressure", 50)
-        short_p = 100 - pressure
+        bp = d.get("buy_pressure", 50)
+        sp = 100 - bp
         regime = d.get("regime", "")
 
         if sig == "LONG":
-            sig_color = COLORS["green"]
-            sig_emoji = "\U0001f7e2"
+            sc = COLORS["green"]
+            se = "\U0001f7e2"
         elif sig == "SHORT":
-            sig_color = COLORS["red"]
-            sig_emoji = "\U0001f7e3"
+            sc = COLORS["red"]
+            se = "\U0001f7e3"
         else:
-            sig_color = COLORS["gold"]
-            sig_emoji = "\u26aa"
+            sc = COLORS["gold"]
+            se = "\u26aa"
 
-        long_fill, long_empty = _bar_segments(pressure)
+        lf, le = _bar(bp)
         text = Text()
-        text.append(f" LONG {pressure:.0f}% ", "bold green")
-        text.append(long_fill, "green")
-        text.append(long_empty, COLORS["dim"])
-        text.append(f" {short_p:.0f}% SHORT", "bold red")
-        text.append(f"\n  {sig_emoji} {sig} {conf:.0f}%", f"bold {sig_color}")
+        text.append(f" LONG {bp:.0f}% ", "bold green")
+        text.append(lf, "green")
+        text.append(le, COLORS["dim"])
+        text.append(f" {sp:.0f}% SHORT", "bold red")
+        text.append(f"\n  {se} {sig} {conf:.0f}%", f"bold {sc}")
         if regime:
             text.append(f" \u00b7 {regime[:20]}", COLORS["dim"])
+        return Panel(text, title="STRENGTH", border_style=sc)
 
-        border_col = sig_color
-        return Panel(text, title="STRENGTH", border_style=border_col)
+
+class IndicatorsWidget(Widget):
+    data = reactive({})
+
+    def render(self) -> Panel:
+        d = self.data
+        rsi = d.get("rsi", 50)
+        vol = d.get("volume", 0)
+        atr = d.get("atr", 0)
+        ke = d.get("kaufman_eff", 0.5)
+        trend = d.get("trend_label", "")
+
+        rsi_f, rsi_e = _bar(rsi, 10)
+        rsi_c = COLORS["green"] if rsi > 60 else COLORS["red"] if rsi < 40 else COLORS["gold"]
+
+        vol_s = f"{vol:,.0f}" if vol >= 1 else f"{vol:.2f}"
+        text = Text()
+        text.append(f" RSI {rsi:.0f} ", rsi_c)
+        text.append(rsi_f, rsi_c)
+        text.append(rsi_e, COLORS["dim"])
+        text.append(f"  Vol {vol_s}", COLORS["white"])
+        text.append(f"\n  ATR ${atr:.0f}  KE {ke:.2f}", COLORS["dim"])
+        if trend:
+            tc = COLORS["green"] if "LONG" in trend or "BULL" in trend else COLORS["red"] if "SHORT" in trend or "BEAR" in trend else COLORS["gold"]
+            text.append(f"  {trend[:15]}", tc)
+        return Panel(text, title="INDICATORS", border_style=COLORS["cyan"])
 
 
 class NarrativeWidget(Widget):
@@ -164,65 +197,49 @@ class NarrativeWidget(Widget):
         sv = d.get("sell_volume", 0)
         total = bv + sv + 0.001
         delta = bv - sv
-        delta_pct = (delta / total) * 100
-        tick_sp = d.get("tick_speed", 0)
+        dp = (delta / total) * 100
+        tick = d.get("tick_speed", 0)
         hft = d.get("hft_speed", 0)
         cvd = d.get("cvd", 0)
         ba = d.get("ba_ratio", 1.0)
-        depth_imb = d.get("depth_imb_pct", 0)
+        imb = d.get("depth_imb_pct", 0)
         spoof = d.get("spoofing_risk", 0)
         decision = d.get("decision", "")
-        active_trap = d.get("active_trap", "")
+        trap = d.get("active_trap", "")
 
         lines = []
 
-        # Whale sonar
-        if abs(delta_pct) > 35 and total > 3:
-            dir_emoji = "\U0001f7e3" if delta > 0 else "\U0001f534"
-            w_text = f"{dir_emoji} BALLENA {'COMPRADORA' if delta > 0 else 'VENDEDORA'}"
-            lines.append(f"  {w_text} \u0394{delta:+.1f}\u20bf ({delta_pct:+.1f}%)")
-        elif abs(delta_pct) > 15 and total > 3:
-            dir_emoji = "\U0001f7e2" if delta > 0 else "\U0001f7e3"
-            w_text = f"{dir_emoji} AGRESION {'COMPRADORA' if delta > 0 else 'VENDEDORA'} \u0394"
-            lines.append(f"  {w_text} {delta:+.1f}\u20bf ({delta_pct:+.1f}%)")
+        if abs(dp) > 35 and total > 3:
+            de = "\U0001f7e3" if delta > 0 else "\U0001f534"
+            lines.append(f"  {de} BALLENA {'COMPRADORA' if delta > 0 else 'VENDEDORA'} \u0394{delta:+.1f}\u20bf ({dp:+.1f}%)")
+        elif abs(dp) > 15 and total > 3:
+            de = "\U0001f7e2" if delta > 0 else "\U0001f7e3"
+            lines.append(f"  {de} AGRESION {'COMPRADORA' if delta > 0 else 'VENDEDORA'} \u0394{delta:+.1f}\u20bf ({dp:+.1f}%)")
         else:
             lines.append(f"  \u26aa Vol: {total:.1f}\u20bf  \u0394{delta:+.1f}\u20bf")
 
-        # Microstructure line
-        hft_color = COLORS["red"] if hft > 5 else COLORS["gold"] if hft > 2 else COLORS["dim"]
-        lines.append(f"   HFT: {hft:.1f}/s  Tick: {tick_sp:.0f}/s  Spoof: {spoof:.0f}%")
+        hc = COLORS["red"] if hft > 5 else COLORS["gold"] if hft > 2 else COLORS["dim"]
+        lines.append(f"   HFT: {hft:.1f}/s  Tick: {tick:.0f}/s  Spoof: {spoof:.0f}%")
 
-        # B/A ratio
-        ba_color = COLORS["green"] if ba > 1.2 else COLORS["red"] if ba < 0.8 else COLORS["dim"]
-        lines.append(f"   B/A: {ba:.2f}x  CVD: {cvd:+.1f}  Depth: {depth_imb:+.1f}%")
+        bc = COLORS["green"] if ba > 1.2 else COLORS["red"] if ba < 0.8 else COLORS["dim"]
+        lines.append(f"   B/A: {ba:.2f}x  CVD: {cvd:+.1f}  Depth: {imb:+.1f}%")
 
-        # Trap alert
-        if active_trap:
-            lines.append(f"  \u26a0\ufe0f {active_trap[:45]}")
+        if trap:
+            lines.append(f"  \u26a0\ufe0f {trap[:45]}")
 
-        # Decision
         if decision:
-            if "LONG" in decision:
-                d_color = COLORS["green"]
-            elif "SHORT" in decision:
-                d_color = COLORS["red"]
-            elif "TRAMPA" in decision:
-                d_color = COLORS["red"]
-            elif "PARCIAL" in decision:
-                d_color = COLORS["gold"]
-            else:
-                d_color = COLORS["dim"]
+            dc = COLORS["green"] if "LONG" in decision else COLORS["red"] if "SHORT" in decision or "TRAMPA" in decision else COLORS["gold"] if "PARCIAL" in decision else COLORS["dim"]
             lines.append(f"   {decision[:50]}")
 
         text = Text("\n".join(lines))
-        border_col = COLORS["cyan"]
+        bc2 = COLORS["cyan"]
         if "TRAMPA" in decision:
-            border_col = COLORS["red"]
+            bc2 = COLORS["red"]
         elif "LONG CONFIRMADO" in decision:
-            border_col = COLORS["green"]
+            bc2 = COLORS["green"]
         elif "SHORT CONFIRMADO" in decision:
-            border_col = COLORS["red"]
-        return Panel(text, title="INSTITUTIONAL NARRATIVE", border_style=border_col)
+            bc2 = COLORS["red"]
+        return Panel(text, title="NARRATIVE", border_style=bc2)
 
 
 class WhaleWallWidget(Widget):
@@ -231,39 +248,30 @@ class WhaleWallWidget(Widget):
     def render(self) -> Panel:
         d = self.data
         price = d.get("price", 0)
-        bid_walls: list = d.get("bid_walls", [])
-        ask_walls: list = d.get("ask_walls", [])
-
+        bids: list = d.get("bid_walls", [])
+        asks: list = d.get("ask_walls", [])
         lines = []
-        max_rows = max(len(bid_walls), len(ask_walls), 1)
-        for i in range(max_rows):
-            left = ""
-            right = ""
-            if i < len(bid_walls):
-                w = bid_walls[i]
-                w_price = float(w[0]) if isinstance(w, (list, tuple)) else 0
-                w_qty = float(w[1]) if isinstance(w, (list, tuple)) else 0
-                dist = _price_dist(price, w_price)
-                left = f"\U0001f40b {w_qty:.1f}\u20bf @ {_format_price(w_price)} ({dist})"
-            if i < len(ask_walls):
-                w = ask_walls[i]
-                w_price = float(w[0]) if isinstance(w, (list, tuple)) else 0
-                w_qty = float(w[1]) if isinstance(w, (list, tuple)) else 0
-                dist = _price_dist(price, w_price)
-                right = f"\U0001f43b {w_qty:.1f}\u20bf @ {_format_price(w_price)} ({dist})"
-
-            spacer = " " * max(1, ALIGN_RIGHT - len(left))
-            lines.append(f"  {left}{spacer}{right}")
-
-        if not bid_walls and not ask_walls:
-            lines.append("  \u26aa No institutional walls detected")
-
-        text = Text()
-        for line in lines:
-            text.append(f"{line}\n")
-
-        border_col = COLORS["gold"] if bid_walls or ask_walls else COLORS["dim"]
-        return Panel(text, title="WHALE WALLS", border_style=border_col)
+        n = max(len(bids), len(asks), 1)
+        for i in range(n):
+            l = r = ""
+            if i < len(bids):
+                w = bids[i]
+                wp = float(w[0]) if isinstance(w, (list, tuple)) else 0
+                wq = float(w[1]) if isinstance(w, (list, tuple)) else 0
+                l = f"\U0001f40b {wq:.1f}\u20bf {_format_price(wp)} ({_price_dist(price, wp)})"
+            if i < len(asks):
+                w = asks[i]
+                wp = float(w[0]) if isinstance(w, (list, tuple)) else 0
+                wq = float(w[1]) if isinstance(w, (list, tuple)) else 0
+                r = f"\U0001f43b {wq:.1f}\u20bf {_format_price(wp)} ({_price_dist(price, wp)})"
+            sp = " " * max(1, ALIGN_RIGHT - len(l))
+            lines.append(f"  {l}{sp}{r}")
+        if not bids and not asks:
+            lines.append("  \u26aa No institutional walls")
+        t = Text()
+        for ln in lines:
+            t.append(f"{ln}\n")
+        return Panel(t, title="WHALE WALLS", border_style=COLORS["gold"] if bids or asks else COLORS["dim"])
 
 
 class ImbalanceWidget(Widget):
@@ -272,29 +280,20 @@ class ImbalanceWidget(Widget):
     def render(self) -> Panel:
         d = self.data
         imb = d.get("imbalance", 0)
-        depth_imb = d.get("depth_imb_pct", 0)
+        dimb = d.get("depth_imb_pct", 0)
         ba = d.get("ba_ratio", 1.0)
-        bid_vol = d.get("book_depth_bids_volume", 0)
-        ask_vol = d.get("book_depth_asks_volume", 0)
-
-        # Map imbalance (-1..+1) to 0..100%
-        imb_centered = max(0, min(100, (imb + 1) * 50))
-        bid_fill, bid_empty = _bar_segments(imb_centered)
-
-        # Color by direction
-        bar_color = COLORS["green"] if imb > 0.2 else COLORS["red"] if imb < -0.2 else COLORS["dim"]
-
-        text = Text()
-        text.append(f"  BIDS ", COLORS["green"])
-        text.append(bid_fill, bar_color)
-        text.append(bid_empty, COLORS["dim"])
-        text.append(f" ASKS", COLORS["red"])
-
-        detail = f"  Depth: {depth_imb:+.1f}%  B/A: {ba:.2f}x  {bid_vol:.1f}/{ask_vol:.1f}\u20bf"
-        text.append(f"\n  {detail}", COLORS["dim"])
-
-        border_col = bar_color if abs(imb) > 0.2 else COLORS["dim"]
-        return Panel(text, title="ORDER BOOK IMBALANCE", border_style=border_col)
+        bv = d.get("book_depth_bids_volume", 0)
+        av = d.get("book_depth_asks_volume", 0)
+        ic = max(0, min(100, (imb + 1) * 50))
+        bf, be = _bar(ic)
+        bc2 = COLORS["green"] if imb > 0.2 else COLORS["red"] if imb < -0.2 else COLORS["dim"]
+        t = Text()
+        t.append("  BIDS ", COLORS["green"])
+        t.append(bf, bc2)
+        t.append(be, COLORS["dim"])
+        t.append(" ASKS", COLORS["red"])
+        t.append(f"\n  Depth: {dimb:+.1}h  B/A: {ba:.2f}x  {bv:.1f}/{av:.1f}\u20bf", COLORS["dim"])
+        return Panel(t, title="ORDER BOOK IMBALANCE", border_style=bc2 if abs(imb) > 0.2 else COLORS["dim"])
 
 
 class AccountWidget(Widget):
@@ -306,25 +305,22 @@ class AccountWidget(Widget):
         pos = d.get("position")
         funding = d.get("funding_rate", 0)
         oi = d.get("oi_delta_5min", 0)
-
-        text = Text()
-        text.append(f" Balance: ${bal:,.2f}", COLORS["green"])
-        text.append(f"  Funding: {funding:+.4f}%", COLORS["dim"])
-        text.append(f"  OI: {oi:+.1f}%", COLORS["dim"])
-
+        t = Text()
+        t.append(f" Balance: ${bal:,.2f}", COLORS["green"])
+        t.append(f"  Fund: {funding:+.4f}%", COLORS["dim"])
         if pos:
             side = pos.get("direction", "?")
             qty = pos.get("amt", 0)
             entry = pos.get("entry_price", 0)
             pnl = pos.get("pnl", 0)
-            pnl_color = COLORS["green"] if pnl >= 0 else COLORS["red"]
-            text.append(f"\n Position: {side} {abs(qty):.4f} BTC", COLORS["gold"])
-            text.append(f"  Entry: ${entry:,.0f}", COLORS["dim"])
-            text.append(f"  PnL: ${pnl:+,.2f}", pnl_color)
+            pc = COLORS["green"] if pnl >= 0 else COLORS["red"]
+            t.append(f"\n {side} {abs(qty):.4f} BTC", COLORS["gold"])
+            t.append(f"  Entry ${entry:,.0f}", COLORS["dim"])
+            t.append(f"  PnL ${pnl:+,.2f}", pc)
         else:
-            text.append(f"\n No open position", COLORS["dim"])
-
-        return Panel(text, title="ACCOUNT", border_style=COLORS["gold"])
+            t.append(f"\n No position", COLORS["dim"])
+            t.append(f"  OI: {oi:+.1f}%", COLORS["dim"])
+        return Panel(t, title="ACCOUNT", border_style=COLORS["gold"])
 
 
 class TradeWidget(Widget):
@@ -340,7 +336,7 @@ class TradeWidget(Widget):
         "signal": "NEUTRAL",
         "decision": "",
         "in_position": False,
-        "bidir": "",
+        "price": 0,
     })
 
     def __init__(self, client: BB450WSClient, *args, **kwargs):
@@ -349,98 +345,109 @@ class TradeWidget(Widget):
 
     def render(self) -> Panel:
         d = self.data
-        dir_text = f"[{'LONG' if d['direction'] == 'LONG' else 'SHORT'}]"
         focus = d.get("focus", 0)
         sig = d.get("signal", "NEUTRAL")
         decision = d.get("decision", "")
         in_pos = d.get("in_position", False)
+        price = d.get("price", 0)
+
+        dt = f"[{'LONG' if d['direction'] == 'LONG' else 'SHORT'}]"
+        dir_col = COLORS["green"] if d["direction"] == "LONG" else COLORS["red"]
 
         lines = []
-
-        sel = " <" if focus == 0 else "  "
-        lines.append(f"{sel}DIR: {dir_text} (TAB){sel}")
-        sel = " <" if focus == 1 else "  "
+        # Header row with direction toggle
+        sel = " \u25c0" if focus == 0 else "  "
+        lines.append(f"{sel} DIR  {dt}   (TAB){sel}")
+        # Params row 1
+        sel = " \u25c0" if focus == 1 else "  "
         sl_val = d.get("sl", "") or "auto"
-        lines.append(f"{sel}SL: {sl_val}{sel}")
-        sel = " <" if focus == 2 else "  "
+        lines.append(f"{sel} SL   {sl_val}")
+        sel = " \u25c0" if focus == 2 else "  "
         tp_val = d.get("tp", "") or "auto"
-        lines.append(f"{sel}TP: {tp_val}{sel}")
-        sel = " <" if focus == 3 else "  "
-        lines.append(f"{sel}LEV: {d['leverage']}x{sel}")
-        sel = " <" if focus == 4 else "  "
-        lines.append(f"{sel}RISK: {d['risk_pct']:.1f}%{sel}")
-        sel = " <" if focus == 5 else "  "
-        split_txt = "YES" if d["split"] else "NO"
-        lines.append(f"{sel}SPLIT: {split_txt}{sel}")
+        lines.append(f"{sel} TP   {tp_val}")
+        # Params row 2
+        sel = " \u25c0" if focus == 3 else "  "
+        lines.append(f"{sel} LEV  {d['leverage']}x")
+        sel = " \u25c0" if focus == 4 else "  "
+        lines.append(f"{sel} RISK {d['risk_pct']:.1f}%")
+        sel = " \u25c0" if focus == 5 else "  "
+        st = "YES" if d["split"] else "NO"
+        lines.append(f"{sel} SPLT {st}")
 
-        lines.append("")
+        lines.append("  " + "\u2500" * 28)
 
         # Action buttons
-        show_long = show_short = show_close = False
+        sl2 = ss2 = sc2 = False
         if "LONG CONFIRMADO" in decision or (sig == "LONG" and not in_pos):
-            show_long = True
+            sl2 = True
         if "SHORT CONFIRMADO" in decision or (sig == "SHORT" and not in_pos):
-            show_short = True
-        if in_pos or ("TRAMPA" in decision and in_pos):
-            show_close = True
+            ss2 = True
+        if in_pos:
+            sc2 = True
         if "PARCIAL" not in decision and "SIN VENTAJA" not in decision:
-            if not show_long and not show_short and not in_pos:
-                show_long = True
-                show_short = True
+            if not sl2 and not ss2 and not in_pos:
+                sl2 = True
+                ss2 = True
 
-        if show_long:
-            lines.append("  [\U0001f7e2 ENTRAR LONG]  (1/b)")
-        if show_short:
-            lines.append("  [\U0001f7e3 ENTRAR SHORT] (2/s)")
-        if show_close:
-            lines.append("  [\U0001f534 CERRAR POS]  (3/c)")
+        btn_line = ""
+        if sl2:
+            btn_line += "[\U0001f7e2 LONG]  "
+        if ss2:
+            btn_line += "[\U0001f7e3 SHORT] "
+        if sc2:
+            btn_line += "[\U0001f534 CLOSE]"
+        if not btn_line:
+            btn_line = " \u26aa WAIT"
+        lines.append(f"  {btn_line}")
+
+        lines.append(f"  (1) LONG  (2) SHORT  (3) CLOSE")
 
         status = d.get("status", "")
         if status:
             lines.append(f"\n  {status}")
 
-        text = Text("\n".join(lines))
-        border_col = COLORS["white"]
-        if show_long and not show_short:
-            border_col = COLORS["green"]
-        elif show_short and not show_long:
-            border_col = COLORS["red"]
-        return Panel(text, title="TRADE", border_style=border_col)
+        t = Text("\n".join(lines))
+        bc3 = COLORS["white"]
+        if sl2 and not ss2:
+            bc3 = COLORS["green"]
+        elif ss2 and not sl2:
+            bc3 = COLORS["red"]
+        return Panel(t, title="TRADE", border_style=bc3)
 
     async def on_key(self, event):
         focus = self.data.get("focus", 0)
-        max_focus = 5
+        mf = 5
 
         if event.key == "tab":
-            focus = (focus + 1) % (max_focus + 1) if focus < max_focus else 0
+            focus = (focus + 1) % (mf + 1) if focus < mf else 0
             self.data["focus"] = focus
             event.stop()
             self.refresh()
 
         elif event.key in ("up", "down"):
-            direction = 1 if event.key == "up" else -1
+            d2 = 1 if event.key == "up" else -1
             if focus == 0:
                 self.data["direction"] = "SHORT" if self.data["direction"] == "LONG" else "LONG"
             elif focus == 5:
                 self.data["split"] = not self.data.get("split", False)
             else:
                 step = {1: 10, 2: 10, 3: 5, 4: 0.1}.get(focus, 1)
-                key_map = {1: "sl", 2: "tp", 3: "leverage", 4: "risk_pct"}
-                if focus in key_map:
-                    current = self.data.get(key_map[focus], 0)
-                    if isinstance(current, str):
+                km = {1: "sl", 2: "tp", 3: "leverage", 4: "risk_pct"}
+                if focus in km:
+                    cur = self.data.get(km[focus], 0)
+                    if isinstance(cur, str):
                         try:
-                            current = float(current) if current else 0
+                            cur = float(cur) if cur else 0
                         except ValueError:
-                            current = 0
-                    new_val = current + step * direction
+                            cur = 0
+                    nv = cur + step * d2
                     if focus == 3:
-                        new_val = max(1, min(100, new_val))
+                        nv = max(1, min(100, nv))
                     elif focus == 4:
-                        new_val = max(0.1, min(100, new_val))
+                        nv = max(0.1, min(100, nv))
                     elif focus in (1, 2):
-                        new_val = max(0, new_val)
-                    self.data[key_map[focus]] = str(int(new_val)) if focus == 3 else f"{new_val:.1f}"
+                        nv = max(0, nv)
+                    self.data[km[focus]] = str(int(nv)) if focus == 3 else f"{nv:.1f}"
             event.stop()
             self.refresh()
 
@@ -462,17 +469,12 @@ class TradeWidget(Widget):
             tp = float(self.data.get("tp", 0)) if self.data.get("tp", "") else 0
         except ValueError:
             tp = 0
-        leverage = self.data.get("leverage", 40)
-        risk_pct = self.data.get("risk_pct", 1.0)
-        split = self.data.get("split", False)
-
-        exec_dir = "ALZA" if direction == "LONG" else "BAJA"
-        ok = await self._client.trade(
-            direction=exec_dir, sl=sl, tp=tp,
-            leverage=leverage, risk_pct=risk_pct,
-            split=split,
-        )
-        self.data["status"] = "\u2705 Order sent!" if ok else "\u274c Send failed"
+        lev = self.data.get("leverage", 40)
+        rp = self.data.get("risk_pct", 1.0)
+        sp = self.data.get("split", False)
+        ed = "ALZA" if direction == "LONG" else "BAJA"
+        ok = await self._client.trade(direction=ed, sl=sl, tp=tp, leverage=lev, risk_pct=rp, split=sp)
+        self.data["status"] = "\u2705 ENVIADA" if ok else "\u274c FALLIDA"
         if ok:
             _play_sound(SOUND_LONG if direction == "LONG" else SOUND_SHORT)
         self.refresh()
@@ -483,14 +485,16 @@ class TradeWidget(Widget):
 class BB450MobileApp(App):
     CSS = """
     Screen { background: #0a0a0a; }
-    BannerWidget { height: 2; }
+    * { background: #0a0a0a; color: #cccccc; }
+    BannerWidget { height: 3; }
     PriceBarWidget { height: 4; }
     StrengthBarWidget { height: 3; }
+    IndicatorsWidget { height: 3; }
     NarrativeWidget { height: 6; }
     WhaleWallWidget { height: 4; }
     ImbalanceWidget { height: 3; }
     AccountWidget { height: 3; }
-    TradeWidget { height: 12; }
+    TradeWidget { height: 13; }
     """
 
     def __init__(self):
@@ -504,6 +508,7 @@ class BB450MobileApp(App):
         yield BannerWidget()
         yield PriceBarWidget()
         yield StrengthBarWidget()
+        yield IndicatorsWidget()
         yield NarrativeWidget()
         yield WhaleWallWidget()
         yield ImbalanceWidget()
@@ -519,8 +524,6 @@ class BB450MobileApp(App):
 
     async def _run_client(self):
         await self._client.connect()
-
-    # ── Keyboard shortcuts ─────────────────────────────────────────
 
     def key_b(self):
         self._quick_long()
@@ -547,31 +550,25 @@ class BB450MobileApp(App):
         asyncio.create_task(self._do_quick_long())
 
     async def _do_quick_long(self):
-        ok = await self._client.trade(
-            direction="ALZA", sl=0, tp=0,
-            leverage=40, risk_pct=1.0, split=False,
-        )
+        ok = await self._client.trade(direction="ALZA", sl=0, tp=0, leverage=40, risk_pct=1.0, split=False)
         tw = self.query_one(TradeWidget)
-        tw.data["status"] = "\u2705 LONG RAPIDA" if ok else "\u274c LONG FALLIDA"
+        tw.data["status"] = "\u2705 RAPIDA" if ok else "\u274c FALLIDA"
         tw.refresh()
         if ok:
             _play_sound(SOUND_LONG)
-            _notify_android("BB-450 LONG", "Orden LONG enviada")
+            _notify_android("BB-450 LONG", "LONG enviada")
 
     def _quick_short(self):
         asyncio.create_task(self._do_quick_short())
 
     async def _do_quick_short(self):
-        ok = await self._client.trade(
-            direction="BAJA", sl=0, tp=0,
-            leverage=40, risk_pct=1.0, split=False,
-        )
+        ok = await self._client.trade(direction="BAJA", sl=0, tp=0, leverage=40, risk_pct=1.0, split=False)
         tw = self.query_one(TradeWidget)
-        tw.data["status"] = "\u2705 SHORT RAPIDA" if ok else "\u274c SHORT FALLIDA"
+        tw.data["status"] = "\u2705 RAPIDA" if ok else "\u274c FALLIDA"
         tw.refresh()
         if ok:
             _play_sound(SOUND_SHORT)
-            _notify_android("BB-450 SHORT", "Orden SHORT enviada")
+            _notify_android("BB-450 SHORT", "SHORT enviada")
 
     def _quick_close(self):
         asyncio.create_task(self._do_quick_close())
@@ -579,13 +576,11 @@ class BB450MobileApp(App):
     async def _do_quick_close(self):
         ok = await self._client.close_all()
         tw = self.query_one(TradeWidget)
-        tw.data["status"] = "\u2705 CIERRE RAPIDO" if ok else "\u274c CIERRE FALLIDO"
+        tw.data["status"] = "\u2705 CERRADA" if ok else "\u274c FALLIDA"
         tw.refresh()
         if ok:
             _play_sound(SOUND_CLOSE)
             _notify_android("BB-450 CLOSE", "Posicion cerrada")
-
-    # ── Callbacks ──────────────────────────────────────────────────
 
     def _on_ws_status(self, connected: bool):
         if not self.is_mounted:
@@ -599,31 +594,33 @@ class BB450MobileApp(App):
     def _on_market_state(self, data: dict):
         if not self.is_mounted:
             return
-
         try:
             self.query_one(BannerWidget).data = {
                 "status": "connected",
                 "host": WS_URI,
                 "port": data.get("bore_port", ""),
             }
-
             self.query_one(PriceBarWidget).data = {
                 "price": data.get("price", 0),
                 "change_pct": data.get("change_pct", 0),
                 "high": data.get("day_high", 0),
                 "low": data.get("day_low", 0),
             }
-
             sig = data.get("signal", "NEUTRAL")
             conf = data.get("confidence", 0)
-
             self.query_one(StrengthBarWidget).data = {
                 "signal": sig,
                 "confidence": conf,
                 "buy_pressure": data.get("buy_pressure", 50),
                 "regime": data.get("regimen_mercado", ""),
             }
-
+            self.query_one(IndicatorsWidget).data = {
+                "rsi": data.get("rsi", 50),
+                "volume": data.get("volume", 0),
+                "atr": data.get("atr", 0),
+                "kaufman_eff": data.get("kaufman_eff", 0.5),
+                "trend_label": data.get("trend_label", ""),
+            }
             self.query_one(NarrativeWidget).data = {
                 "buy_volume": data.get("buy_volume", 0),
                 "sell_volume": data.get("sell_volume", 0),
@@ -636,13 +633,11 @@ class BB450MobileApp(App):
                 "decision": data.get("decision", ""),
                 "active_trap": data.get("active_trap", ""),
             }
-
             self.query_one(WhaleWallWidget).data = {
                 "price": data.get("price", 0),
                 "bid_walls": data.get("whale_bid_walls", []),
                 "ask_walls": data.get("whale_ask_walls", []),
             }
-
             self.query_one(ImbalanceWidget).data = {
                 "imbalance": data.get("imbalance", 0),
                 "depth_imb_pct": data.get("depth_imb_pct", 0),
@@ -650,49 +645,45 @@ class BB450MobileApp(App):
                 "book_depth_bids_volume": data.get("book_depth_bids_volume", 0),
                 "book_depth_asks_volume": data.get("book_depth_asks_volume", 0),
             }
-
             self.query_one(AccountWidget).data = {
                 "balance": data.get("balance", 0),
                 "position": data.get("position"),
                 "funding_rate": data.get("funding_rate", 0),
                 "oi_delta_5min": data.get("oi_delta_5min", 0),
             }
-
             decision = data.get("decision", "")
             in_pos = data.get("position") is not None
-            self.query_one(TradeWidget).data = {
-                "direction": self.query_one(TradeWidget).data.get("direction", "LONG"),
-                "sl": self.query_one(TradeWidget).data.get("sl", ""),
-                "tp": self.query_one(TradeWidget).data.get("tp", ""),
-                "leverage": self.query_one(TradeWidget).data.get("leverage", 40),
-                "risk_pct": self.query_one(TradeWidget).data.get("risk_pct", 1.0),
-                "split": self.query_one(TradeWidget).data.get("split", False),
-                "focus": self.query_one(TradeWidget).data.get("focus", 0),
-                "status": self.query_one(TradeWidget).data.get("status", ""),
+            tw = self.query_one(TradeWidget)
+            tw.data = {
+                "direction": tw.data.get("direction", "LONG"),
+                "sl": tw.data.get("sl", ""),
+                "tp": tw.data.get("tp", ""),
+                "leverage": tw.data.get("leverage", 40),
+                "risk_pct": tw.data.get("risk_pct", 1.0),
+                "split": tw.data.get("split", False),
+                "focus": tw.data.get("focus", 0),
+                "status": tw.data.get("status", ""),
                 "signal": sig,
                 "decision": decision,
                 "in_position": in_pos,
-                "bidir": self.query_one(TradeWidget).data.get("bidir", ""),
+                "price": data.get("price", 0),
             }
-
         except Exception as e:
-            log.error(f"[TUI] _on_market_state error: {e}")
+            log.error(f"[TUI] _on_market_state: {e}")
 
-        # Sound on signal change
         if sig != self._prev_signal and sig in ("LONG", "SHORT"):
             _play_sound(SOUND_LONG if sig == "LONG" else SOUND_SHORT)
-            _notify_android(f"BB-450 SENAL {sig}", f"Confianza: {conf:.0f}%")
+            _notify_android(f"BB-450 {sig}", f"Conf: {conf:.0f}%")
             self._prev_signal = sig
-
         if decision != self._prev_decision and decision:
             if "TRAMPA" in decision:
                 _notify_android("BB-450 TRAMPA", decision[:80])
             elif "CONFIRMADO" in decision:
-                _notify_android(f"BB-450 {decision}", "Se\u00f1al confirmada")
+                _notify_android(f"BB-450 {decision}", "Confirmada")
             self._prev_decision = decision
 
     def _on_notification(self, notif: dict):
-        pass  # Notifications disabled in v2 UI
+        pass
 
     def _on_command_ack(self, action: str, status: str, result: dict):
         if not self.is_mounted:
@@ -701,13 +692,12 @@ class BB450MobileApp(App):
         if status == "ok":
             tw.data["status"] = f"\u2705 {action} OK"
         else:
-            tw.data["status"] = f"\u274c {action} FAILED: {result.get('message', '')}"
+            tw.data["status"] = f"\u274c {action}: {result.get('message', '')}"
         tw.refresh()
 
 
 def run():
-    app = BB450MobileApp()
-    app.run()
+    BB450MobileApp().run()
 
 
 if __name__ == "__main__":
