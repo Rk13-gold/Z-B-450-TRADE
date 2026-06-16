@@ -2,8 +2,11 @@
 set -e
 
 BORE_PORT_FILE="${BORE_PORT_FILE:-/tmp/bb450/bore_port.txt}"
+BORE_PORT_DIR="$(dirname "$BORE_PORT_FILE")"
 DASHBOARD_DIR="${DASHBOARD_DIR:-/home/RK13/RK13/BB-450}"
 
+mkdir -p "$BORE_PORT_DIR"
+chmod 777 "$BORE_PORT_DIR"
 cd "$DASHBOARD_DIR"
 
 # Start bore, capture stderr to get the port announcement
