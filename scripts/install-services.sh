@@ -3,11 +3,13 @@ set -e
 
 echo "==> Instalando servicios systemd para BB-450..."
 
-# Copy service files
+# Copy service files and tmpfiles config
 sudo cp /home/RK13/RK13/BB-450/scripts/bb450-dashboard.service /etc/systemd/system/
 sudo cp /home/RK13/RK13/BB-450/scripts/bb450-bore.service /etc/systemd/system/
+sudo cp /home/RK13/RK13/BB-450/scripts/bb450-tmpfiles.conf /etc/tmpfiles.d/bb450.conf
 
 sudo mkdir -p /tmp/bb450
+sudo chmod 777 /tmp/bb450
 
 # Reload systemd, enable and start
 sudo systemctl daemon-reload
