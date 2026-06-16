@@ -61,7 +61,10 @@ class BB450WSClient:
                     close_timeout=5,
                 ) as ws:
                     self._ws = ws
-                    self.on_status(True)
+                    try:
+                        self.on_status(True)
+                    except Exception as exc:
+                        log.warning("[WS] on_status callback raised: %s", exc)
                     log.info("[WS] Connected to %s", self.uri)
                     await self._reader(ws)
             except asyncio.CancelledError:
@@ -71,7 +74,10 @@ class BB450WSClient:
                             exc, self._reconnect_delay)
             finally:
                 self._ws = None
-                self.on_status(False)
+                try:
+                    self.on_status(False)
+                except Exception as exc:
+                    log.warning("[WS] on_status callback raised: %s", exc)
                 if self._running:
                     await asyncio.sleep(self._reconnect_delay)
 

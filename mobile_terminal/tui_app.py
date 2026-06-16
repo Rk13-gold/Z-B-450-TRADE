@@ -287,13 +287,15 @@ class ImbalanceWidget(Widget):
         ic = max(0, min(100, (imb + 1) * 50))
         bf, be = _bar(ic)
         bc2 = COLORS["green"] if imb > 0.2 else COLORS["red"] if imb < -0.2 else COLORS["dim"]
-        t = Text()
-        t.append("  BIDS ", COLORS["green"])
-        t.append(bf, bc2)
-        t.append(be, COLORS["dim"])
-        t.append(" ASKS", COLORS["red"])
-        t.append(f"\n  Depth: {dimb:+.1f}%  B/A: {ba:.2f}x  {bv:.1f}/{av:.1f}\u20bf", COLORS["dim"])
-        return Panel(t, title="ORDER BOOK IMBALANCE", border_style=bc2 if abs(imb) > 0.2 else COLORS["dim"])
+        text = Text.assemble(
+            ("  BIDS ", COLORS["green"]),
+            (bf, bc2),
+            (be, COLORS["dim"]),
+            (" ASKS", COLORS["red"]),
+            "\n",
+            (f"  Depth: {dimb:+.1f}%  B/A: {ba:.2f}x  {bv:.1f}/{av:.1f}\u20bf", COLORS["dim"]),
+        )
+        return Panel(text, title="ORDER BOOK IMBALANCE", border_style=bc2 if abs(imb) > 0.2 else COLORS["dim"])
 
 
 class AccountWidget(Widget):
@@ -485,15 +487,15 @@ class TradeWidget(Widget):
 class BB450MobileApp(App):
     CSS = """
     Screen { background: #0a0a0a; }
-    BannerWidget { height: 3; }
-    PriceBarWidget { height: 4; }
-    StrengthBarWidget { height: 3; }
-    IndicatorsWidget { height: 3; }
-    NarrativeWidget { height: 6; }
-    WhaleWallWidget { height: 4; }
-    ImbalanceWidget { height: 3; }
-    AccountWidget { height: 3; }
-    TradeWidget { height: 13; }
+    BannerWidget { height: 3; border: none; }
+    PriceBarWidget { height: 4; border: none; }
+    StrengthBarWidget { height: 3; border: none; }
+    IndicatorsWidget { height: 3; border: none; }
+    NarrativeWidget { height: 6; border: none; }
+    WhaleWallWidget { height: 4; border: none; }
+    ImbalanceWidget { height: 3; border: none; }
+    AccountWidget { height: 3; border: none; }
+    TradeWidget { height: 13; border: none; }
     """
 
     def __init__(self):
@@ -585,11 +587,14 @@ class BB450MobileApp(App):
     def _on_ws_status(self, connected: bool):
         if not self.is_mounted:
             return
-        self.query_one(BannerWidget).data = {
-            "status": "connected" if connected else "disconnected",
-            "host": WS_URI,
-            "port": "",
-        }
+        try:
+            self.query_one(BannerWidget).data = {
+                "status": "connected" if connected else "disconnected",
+                "host": WS_URI,
+                "port": "",
+            }
+        except Exception as e:
+            log.error(f"[TUI] _on_ws_status: {e}")
 
     def _on_market_state(self, data: dict):
         if not self.is_mounted:
@@ -597,79 +602,82 @@ class BB450MobileApp(App):
         sig = data.get("signal", "NEUTRAL")
         conf = data.get("confidence", 0)
         decision = data.get("decision", "")
-        try:
-            self.query_one(BannerWidget).data = {
-                "status": "connected",
-                "host": WS_URI,
-                "port": data.get("bore_port", ""),
-            }
-            self.query_one(PriceBarWidget).data = {
-                "price": data.get("price", 0),
-                "change_pct": data.get("change_pct", 0),
-                "high": data.get("day_high", 0),
-                "low": data.get("day_low", 0),
-            }
-            self.query_one(StrengthBarWidget).data = {
-                "signal": sig,
-                "confidence": conf,
-                "buy_pressure": data.get("buy_pressure", 50),
-                "regime": data.get("regimen_mercado", ""),
-            }
-            self.query_one(IndicatorsWidget).data = {
-                "rsi": data.get("rsi", 50),
-                "volume": data.get("volume", 0),
-                "atr": data.get("atr", 0),
-                "kaufman_eff": data.get("kaufman_eff", 0.5),
-                "trend_label": data.get("trend_label", ""),
-            }
-            self.query_one(NarrativeWidget).data = {
-                "buy_volume": data.get("buy_volume", 0),
-                "sell_volume": data.get("sell_volume", 0),
-                "tick_speed": data.get("tick_speed", 0),
-                "hft_speed": data.get("hft_speed", 0),
-                "cvd": data.get("cvd", 0),
-                "ba_ratio": data.get("ba_ratio", 1.0),
-                "depth_imb_pct": data.get("depth_imb_pct", 0),
-                "spoofing_risk": data.get("spoofing_risk", 0),
-                "active_trap": data.get("active_trap", ""),
-                "decision": decision,
-            }
-            self.query_one(WhaleWallWidget).data = {
-                "price": data.get("price", 0),
-                "bid_walls": data.get("whale_bid_walls", []),
-                "ask_walls": data.get("whale_ask_walls", []),
-            }
-            self.query_one(ImbalanceWidget).data = {
-                "imbalance": data.get("imbalance", 0),
-                "depth_imb_pct": data.get("depth_imb_pct", 0),
-                "ba_ratio": data.get("ba_ratio", 1.0),
-                "book_depth_bids_volume": data.get("book_depth_bids_volume", 0),
-                "book_depth_asks_volume": data.get("book_depth_asks_volume", 0),
-            }
-            self.query_one(AccountWidget).data = {
-                "balance": data.get("balance", 0),
-                "position": data.get("position"),
-                "funding_rate": data.get("funding_rate", 0),
-                "oi_delta_5min": data.get("oi_delta_5min", 0),
-            }
-            in_pos = data.get("position") is not None
-            tw = self.query_one(TradeWidget)
-            tw.data = {
-                "direction": tw.data.get("direction", "LONG"),
-                "sl": tw.data.get("sl", ""),
-                "tp": tw.data.get("tp", ""),
-                "leverage": tw.data.get("leverage", 40),
-                "risk_pct": tw.data.get("risk_pct", 1.0),
-                "split": tw.data.get("split", False),
-                "focus": tw.data.get("focus", 0),
-                "status": tw.data.get("status", ""),
-                "signal": sig,
-                "decision": decision,
-                "in_position": in_pos,
-                "price": data.get("price", 0),
-            }
-        except Exception as e:
-            log.error(f"[TUI] _on_market_state: {e}")
+
+        def _set(w, d):
+            try:
+                self.query_one(w).data = d
+            except Exception as e:
+                log.error(f"[TUI] _on_market_state {w.__name__}: {e}")
+
+        _set(BannerWidget, {
+            "status": "connected",
+            "host": WS_URI,
+            "port": data.get("bore_port", ""),
+        })
+        _set(PriceBarWidget, {
+            "price": data.get("price", 0),
+            "change_pct": data.get("change_pct", 0),
+            "high": data.get("day_high", 0),
+            "low": data.get("day_low", 0),
+        })
+        _set(StrengthBarWidget, {
+            "signal": sig,
+            "confidence": conf,
+            "buy_pressure": data.get("buy_pressure", 50),
+            "regime": data.get("regimen_mercado", ""),
+        })
+        _set(IndicatorsWidget, {
+            "rsi": data.get("rsi", 50),
+            "volume": data.get("volume", 0),
+            "atr": data.get("atr", 0),
+            "kaufman_eff": data.get("kaufman_eff", 0.5),
+            "trend_label": data.get("trend_label", ""),
+        })
+        _set(NarrativeWidget, {
+            "buy_volume": data.get("buy_volume", 0),
+            "sell_volume": data.get("sell_volume", 0),
+            "tick_speed": data.get("tick_speed", 0),
+            "hft_speed": data.get("hft_speed", 0),
+            "cvd": data.get("cvd", 0),
+            "ba_ratio": data.get("ba_ratio", 1.0),
+            "depth_imb_pct": data.get("depth_imb_pct", 0),
+            "spoofing_risk": data.get("spoofing_risk", 0),
+            "active_trap": data.get("active_trap", ""),
+            "decision": decision,
+        })
+        _set(WhaleWallWidget, {
+            "price": data.get("price", 0),
+            "bid_walls": data.get("whale_bid_walls", []),
+            "ask_walls": data.get("whale_ask_walls", []),
+        })
+        _set(ImbalanceWidget, {
+            "imbalance": data.get("imbalance", 0),
+            "depth_imb_pct": data.get("depth_imb_pct", 0),
+            "ba_ratio": data.get("ba_ratio", 1.0),
+            "book_depth_bids_volume": data.get("book_depth_bids_volume", 0),
+            "book_depth_asks_volume": data.get("book_depth_asks_volume", 0),
+        })
+        _set(AccountWidget, {
+            "balance": data.get("balance", 0),
+            "position": data.get("position"),
+            "funding_rate": data.get("funding_rate", 0),
+            "oi_delta_5min": data.get("oi_delta_5min", 0),
+        })
+        in_pos = data.get("position") is not None
+        _set(TradeWidget, {
+            "direction": "LONG",
+            "sl": "",
+            "tp": "",
+            "leverage": 40,
+            "risk_pct": 1.0,
+            "split": False,
+            "focus": 0,
+            "status": "",
+            "signal": sig,
+            "decision": decision,
+            "in_position": in_pos,
+            "price": data.get("price", 0),
+        })
 
         if sig != self._prev_signal and sig in ("LONG", "SHORT"):
             _play_sound(SOUND_LONG if sig == "LONG" else SOUND_SHORT)
@@ -688,12 +696,15 @@ class BB450MobileApp(App):
     def _on_command_ack(self, action: str, status: str, result: dict):
         if not self.is_mounted:
             return
-        tw = self.query_one(TradeWidget)
-        if status == "ok":
-            tw.data["status"] = f"\u2705 {action} OK"
-        else:
-            tw.data["status"] = f"\u274c {action}: {result.get('message', '')}"
-        tw.refresh()
+        try:
+            tw = self.query_one(TradeWidget)
+            if status == "ok":
+                tw.data["status"] = f"\u2705 {action} OK"
+            else:
+                tw.data["status"] = f"\u274c {action}: {result.get('message', '')}"
+            tw.refresh()
+        except Exception as e:
+            log.error(f"[TUI] _on_command_ack: {e}")
 
 
 def run():
