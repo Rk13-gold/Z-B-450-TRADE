@@ -170,21 +170,29 @@ class IndicatorsWidget(Widget):
         vol = d.get("volume", 0)
         atr = d.get("atr", 0)
         ke = d.get("kaufman_eff", 0.5)
+        delta = d.get("delta", 0)
+        cvd = d.get("cvd", 0)
         trend = d.get("trend_label", "")
 
         rsi_f, rsi_e = _bar(rsi, 10)
         rsi_c = COLORS["green"] if rsi > 60 else COLORS["red"] if rsi < 40 else COLORS["gold"]
 
         vol_s = f"{vol:,.0f}" if vol >= 1 else f"{vol:.2f}"
+        dc = COLORS["green"] if delta > 0 else COLORS["red"] if delta < 0 else COLORS["dim"]
+        cc = COLORS["green"] if cvd > 0 else COLORS["red"] if cvd < 0 else COLORS["dim"]
+        ke_c = COLORS["green"] if ke > 0.6 else COLORS["gold"] if ke > 0.3 else COLORS["dim"]
+
         text = Text()
         text.append(f" RSI {rsi:.0f} ", rsi_c)
         text.append(rsi_f, rsi_c)
         text.append(rsi_e, COLORS["dim"])
         text.append(f"  Vol {vol_s}", COLORS["white"])
-        text.append(f"\n  ATR ${atr:.0f}  KE {ke:.2f}", COLORS["dim"])
+        text.append(f"\n ATR ${atr:.0f}  KE {ke:.2f}", ke_c)
         if trend:
             tc = COLORS["green"] if "LONG" in trend or "BULL" in trend else COLORS["red"] if "SHORT" in trend or "BEAR" in trend else COLORS["gold"]
-            text.append(f"  {trend[:15]}", tc)
+            text.append(f"  {trend[:12]}", tc)
+        text.append(f"\n {dc}\u0394DELTA{COLORS['dim']} {delta:+.1f}  ", dc)
+        text.append(f"{cc}CVD{COLORS['dim']} {cvd:+.1f}", cc)
         return Panel(text, title="INDICATORS", border_style=COLORS["cyan"])
 
 
@@ -206,32 +214,48 @@ class NarrativeWidget(Widget):
         spoof = d.get("spoofing_risk", 0)
         decision = d.get("decision", "")
         trap = d.get("active_trap", "")
+        regime = d.get("regime", "")
 
-        lines = []
+        text = Text()
 
+        # Line 1: Volume dominance
         if abs(dp) > 35 and total > 3:
             de = "\U0001f7e3" if delta > 0 else "\U0001f534"
-            lines.append(f"  {de} BALLENA {'COMPRADORA' if delta > 0 else 'VENDEDORA'} \u0394{delta:+.1f}\u20bf ({dp:+.1f}%)")
+            text.append(f"  {de} BALLENA {'COMPRADORA' if delta > 0 else 'VENDEDORA'} ", COLORS["gold"])
+            text.append(f"\u0394{delta:+.1f}\u20bf ({dp:+.1f}%)", COLORS["white"])
         elif abs(dp) > 15 and total > 3:
             de = "\U0001f7e2" if delta > 0 else "\U0001f7e3"
-            lines.append(f"  {de} AGRESION {'COMPRADORA' if delta > 0 else 'VENDEDORA'} \u0394{delta:+.1f}\u20bf ({dp:+.1f}%)")
+            text.append(f"  {de} AGRESION {'COMPRADORA' if delta > 0 else 'VENDEDORA'} ", COLORS["gold"])
+            text.append(f"\u0394{delta:+.1f}\u20bf ({dp:+.1f}%)", COLORS["white"])
         else:
-            lines.append(f"  \u26aa Vol: {total:.1f}\u20bf  \u0394{delta:+.1f}\u20bf")
+            text.append(f"  \u26aa Vol: {total:.1f}\u20bf  \u0394{delta:+.1f}\u20bf", COLORS["dim"])
 
+        # Line 2: Flow metrics
         hc = COLORS["red"] if hft > 5 else COLORS["gold"] if hft > 2 else COLORS["dim"]
-        lines.append(f"   HFT: {hft:.1f}/s  Tick: {tick:.0f}/s  Spoof: {spoof:.0f}%")
+        ba_c = COLORS["green"] if ba > 1.2 else COLORS["red"] if ba < 0.8 else COLORS["dim"]
+        text.append(f"\n  \u0394Delta: {delta:+.1f}  CVD: {cvd:+.1f}  ", COLORS["dim"])
+        text.append(f"B/A: {ba:.2f}x", ba_c)
+        text.append(f"  HFT: {hft:.1f}/s", hc)
+        text.append(f"  Tick: {tick:.0f}/s", COLORS["dim"])
 
-        bc = COLORS["green"] if ba > 1.2 else COLORS["red"] if ba < 0.8 else COLORS["dim"]
-        lines.append(f"   B/A: {ba:.2f}x  CVD: {cvd:+.1f}  Depth: {imb:+.1f}%")
+        # Line 3: Risk metrics
+        sp_c = COLORS["red"] if spoof > 30 else COLORS["gold"] if spoof > 10 else COLORS["dim"]
+        text.append(f"\n  Spoof: {spoof:.0f}% ", sp_c)
+        text.append(f"Depth: {imb:+.1f}% ", COLORS["dim"])
+        if regime:
+            rc = COLORS["green"] if "TREND" in regime.upper() or "ALCISTA" in regime else COLORS["red"] if "BAJISTA" in regime else COLORS["gold"]
+            text.append(f"Regimen: {regime[:18]}", rc)
 
+        # Line 4: Trap / Decision
         if trap:
-            lines.append(f"  \u26a0\ufe0f {trap[:45]}")
-
+            text.append(f"\n  \u26a0\ufe0f {trap[:50]}", COLORS["red"])
         if decision:
             dc = COLORS["green"] if "LONG" in decision else COLORS["red"] if "SHORT" in decision or "TRAMPA" in decision else COLORS["gold"] if "PARCIAL" in decision else COLORS["dim"]
-            lines.append(f"   {decision[:50]}")
+            if trap:
+                text.append(f"  {decision[:50]}", dc)
+            else:
+                text.append(f"\n  {decision[:55]}", dc)
 
-        text = Text("\n".join(lines))
         bc2 = COLORS["cyan"]
         if "TRAMPA" in decision:
             bc2 = COLORS["red"]
@@ -256,14 +280,14 @@ class WhaleWallWidget(Widget):
             l = r = ""
             if i < len(bids):
                 w = bids[i]
-                wp = float(w[0]) if isinstance(w, (list, tuple)) else 0
-                wq = float(w[1]) if isinstance(w, (list, tuple)) else 0
-                l = f"\U0001f40b {wq:.1f}\u20bf {_format_price(wp)} ({_price_dist(price, wp)})"
+                wp = float(w.get("price", 0)) if isinstance(w, dict) else (float(w[0]) if isinstance(w, (list, tuple)) else 0)
+                wq = float(w.get("quantity", 0)) if isinstance(w, dict) else (float(w[1]) if isinstance(w, (list, tuple)) else 0)
+                l = f"\U0001f40b {wq:.2f}\u20bf {_format_price(wp)} ({_price_dist(price, wp)})"
             if i < len(asks):
                 w = asks[i]
-                wp = float(w[0]) if isinstance(w, (list, tuple)) else 0
-                wq = float(w[1]) if isinstance(w, (list, tuple)) else 0
-                r = f"\U0001f43b {wq:.1f}\u20bf {_format_price(wp)} ({_price_dist(price, wp)})"
+                wp = float(w.get("price", 0)) if isinstance(w, dict) else (float(w[0]) if isinstance(w, (list, tuple)) else 0)
+                wq = float(w.get("quantity", 0)) if isinstance(w, dict) else (float(w[1]) if isinstance(w, (list, tuple)) else 0)
+                r = f"\U0001f43b {wq:.2f}\u20bf {_format_price(wp)} ({_price_dist(price, wp)})"
             sp = " " * max(1, ALIGN_RIGHT - len(l))
             lines.append(f"  {l}{sp}{r}")
         if not bids and not asks:
@@ -284,18 +308,76 @@ class ImbalanceWidget(Widget):
         ba = d.get("ba_ratio", 1.0)
         bv = d.get("book_depth_bids_volume", 0)
         av = d.get("book_depth_asks_volume", 0)
+        delta = d.get("delta", 0)
+        spread_vel = d.get("spread_velocity", 0)
+        cancel = d.get("cancel_rate", 0)
+        ob = d.get("order_book", {})
+        top_bid = ob.get("bids", [[0, 0]])[0] if ob.get("bids") else [0, 0]
+        top_ask = ob.get("asks", [[0, 0]])[0] if ob.get("asks") else [0, 0]
+        tbp = float(top_bid[0]) if isinstance(top_bid, (list, tuple)) else 0
+        tbq = float(top_bid[1]) if isinstance(top_bid, (list, tuple)) else 0
+        tap = float(top_ask[0]) if isinstance(top_ask, (list, tuple)) else 0
+        taq = float(top_ask[1]) if isinstance(top_ask, (list, tuple)) else 0
+        spread = tap - tbp
+
         ic = max(0, min(100, (imb + 1) * 50))
         bf, be = _bar(ic)
         bc2 = COLORS["green"] if imb > 0.2 else COLORS["red"] if imb < -0.2 else COLORS["dim"]
+        dc = COLORS["green"] if delta > 0 else COLORS["red"] if delta < 0 else COLORS["dim"]
         text = Text.assemble(
             ("  BIDS ", COLORS["green"]),
             (bf, bc2),
             (be, COLORS["dim"]),
             (" ASKS", COLORS["red"]),
             "\n",
-            (f"  Depth: {dimb:+.1f}%  B/A: {ba:.2f}x  {bv:.1f}/{av:.1f}\u20bf", COLORS["dim"]),
+            (f"  Depth: {dimb:+.1f}%  B/A: {ba:.2f}x  BVol: {bv:.1f}/{av:.1f}\u20bf", COLORS["dim"]),
+            "\n",
+            (f"  \u0394Delta: {delta:+.1f}  ", dc),
+            (f"Spread: ${spread:.1f}  Cancel: {cancel:.0f}%", COLORS["dim"]),
         )
-        return Panel(text, title="ORDER BOOK IMBALANCE", border_style=bc2 if abs(imb) > 0.2 else COLORS["dim"])
+        return Panel(text, title="ORDER BOOK", border_style=bc2 if abs(imb) > 0.2 else COLORS["dim"])
+
+
+class OrderFlowWidget(Widget):
+    data = reactive({})
+
+    def render(self) -> Panel:
+        d = self.data
+        delta = d.get("delta", 0)
+        cvd = d.get("cvd", 0)
+        tick = d.get("tick_speed", 0)
+        hft = d.get("hft_speed", 0)
+        cancel = d.get("cancel_rate", 0)
+        spoof = d.get("spoofing_risk", 0)
+        spread_vel = d.get("spread_velocity", 0)
+
+        dc = COLORS["green"] if delta > 0 else COLORS["red"] if delta < 0 else COLORS["dim"]
+        cc = COLORS["green"] if cvd > 0 else COLORS["red"] if cvd < 0 else COLORS["dim"]
+        hc = COLORS["red"] if hft > 5 else COLORS["gold"] if hft > 2 else COLORS["dim"]
+        sc = COLORS["red"] if spoof > 30 else COLORS["gold"] if spoof > 10 else COLORS["dim"]
+        canc = COLORS["red"] if cancel > 20 else COLORS["gold"] if cancel > 10 else COLORS["dim"]
+
+        text = Text.assemble(
+            ("  \u0394Delta: ", COLORS["dim"]),
+            (f"{delta:+.1f}  ", dc),
+            ("CVD: ", COLORS["dim"]),
+            (f"{cvd:+.1f}  ", cc),
+            ("Tick: ", COLORS["dim"]),
+            (f"{tick:.0f}/s  ", COLORS["white"]),
+            ("HFT: ", COLORS["dim"]),
+            (f"{hft:.1f}/s", hc),
+            "\n",
+            ("  Cancel: ", COLORS["dim"]),
+            (f"{cancel:.0f}%  ", canc),
+            ("Spoof: ", COLORS["dim"]),
+            (f"{spoof:.0f}%  ", sc),
+            ("SpreadVel: ", COLORS["dim"]),
+            (f"{spread_vel:.1f}ms", COLORS["white"]),
+        )
+        bc = COLORS["cyan"]
+        if abs(delta) > 20:
+            bc = COLORS["green"] if delta > 0 else COLORS["red"]
+        return Panel(text, title="ORDER FLOW", border_style=bc)
 
 
 class AccountWidget(Widget):
@@ -325,6 +407,51 @@ class AccountWidget(Widget):
         return Panel(t, title="ACCOUNT", border_style=COLORS["gold"])
 
 
+class AIAnalysisWidget(Widget):
+    data = reactive({})
+
+    def render(self) -> Panel:
+        d = self.data
+        sig = d.get("signal", "NEUTRAL")
+        conf = d.get("confidence", 0)
+        decision = d.get("decision", "")
+        diag: list = d.get("signal_diagnostics", [])
+        trend = d.get("trend", "")
+        regime = d.get("regime", "")
+        trap = d.get("active_trap", "")
+
+        sc = COLORS["green"] if sig == "LONG" else COLORS["red"] if sig == "SHORT" else COLORS["gold"]
+        tc = COLORS["green"] if "ALCISTA" in trend else COLORS["red"] if "BAJISTA" in trend else COLORS["dim"]
+
+        text = Text.assemble(
+            ("  \U0001f916 AI ", COLORS["magenta"]),
+            (f"{sig} ", f"bold {sc}"),
+            (f"{conf:.0f}% ", f"bold {sc}"),
+        )
+        if trend:
+            text.append(f"Trend: {trend[:10]} ", tc)
+        text.append("\n")
+
+        if diag:
+            for di in diag[:3]:
+                di_c = COLORS["green"] if any(w in di.upper() for w in ["LONG", "BUY", "ALZA", "BULL"]) else COLORS["red"] if any(w in di.upper() for w in ["SHORT", "SELL", "BAJA", "BEAR"]) else COLORS["dim"]
+                text.append(f"  \u2022 {di[:55]}", di_c)
+                text.append("\n")
+        else:
+            text.append("  \u26aa No active signal analysis", COLORS["dim"])
+            text.append("\n")
+
+        if trap:
+            text.append(f"  \u26a0\ufe0f Trap: {trap[:50]}", COLORS["red"])
+        elif decision and "CONFIRMADO" in decision:
+            text.append(f"  \u2705 Senal confirmada: {decision[:50]}", COLORS["green"])
+        else:
+            text.append(f"  Esperando senal...", COLORS["dim"])
+
+        bc = sc if sig != "NEUTRAL" else COLORS["dim"]
+        return Panel(text, title="AI ANALYSIS", border_style=bc)
+
+
 class TradeWidget(Widget):
     data = reactive({
         "direction": "LONG",
@@ -347,7 +474,6 @@ class TradeWidget(Widget):
 
     def render(self) -> Panel:
         d = self.data
-        focus = d.get("focus", 0)
         sig = d.get("signal", "NEUTRAL")
         decision = d.get("decision", "")
         in_pos = d.get("in_position", False)
@@ -355,64 +481,30 @@ class TradeWidget(Widget):
 
         dt = f"[{'LONG' if d['direction'] == 'LONG' else 'SHORT'}]"
         dir_col = COLORS["green"] if d["direction"] == "LONG" else COLORS["red"]
+        sl_val = d.get("sl", "") or "auto"
+        tp_val = d.get("tp", "") or "auto"
 
         lines = []
-        # Header row with direction toggle
-        sel = " \u25c0" if focus == 0 else "  "
-        lines.append(f"{sel} DIR  {dt}   (TAB){sel}")
-        # Params row 1
-        sel = " \u25c0" if focus == 1 else "  "
-        sl_val = d.get("sl", "") or "auto"
-        lines.append(f"{sel} SL   {sl_val}")
-        sel = " \u25c0" if focus == 2 else "  "
-        tp_val = d.get("tp", "") or "auto"
-        lines.append(f"{sel} TP   {tp_val}")
-        # Params row 2
-        sel = " \u25c0" if focus == 3 else "  "
-        lines.append(f"{sel} LEV  {d['leverage']}x")
-        sel = " \u25c0" if focus == 4 else "  "
-        lines.append(f"{sel} RISK {d['risk_pct']:.1f}%")
-        sel = " \u25c0" if focus == 5 else "  "
-        st = "YES" if d["split"] else "NO"
-        lines.append(f"{sel} SPLT {st}")
+        lines.append(f"  DIR {dt}  SL {sl_val}  TP {tp_val}")
+        lines.append(f"  LEV {d['leverage']}x  RISK {d['risk_pct']:.1f}%  SPLIT {'YES' if d['split'] else 'NO'}")
 
         lines.append("  " + "\u2500" * 28)
 
-        # Action buttons
-        sl2 = ss2 = sc2 = False
-        if "LONG CONFIRMADO" in decision or (sig == "LONG" and not in_pos):
-            sl2 = True
-        if "SHORT CONFIRMADO" in decision or (sig == "SHORT" and not in_pos):
-            ss2 = True
-        if in_pos:
-            sc2 = True
-        if "PARCIAL" not in decision and "SIN VENTAJA" not in decision:
-            if not sl2 and not ss2 and not in_pos:
-                sl2 = True
-                ss2 = True
-
-        btn_line = ""
-        if sl2:
-            btn_line += "[\U0001f7e2 LONG]  "
-        if ss2:
-            btn_line += "[\U0001f7e3 SHORT] "
-        if sc2:
-            btn_line += "[\U0001f534 CLOSE]"
-        if not btn_line:
-            btn_line = " \u26aa WAIT"
-        lines.append(f"  {btn_line}")
-
-        lines.append(f"  (1) LONG  (2) SHORT  (3) CLOSE")
+        sig_col = COLORS["green"] if sig == "LONG" else COLORS["red"] if sig == "SHORT" else COLORS["gold"]
+        dec_col = COLORS["green"] if "LONG" in decision else COLORS["red"] if "SHORT" in decision or "TRAMPA" in decision else COLORS["gold"] if "CONFIRMADO" in decision else COLORS["dim"]
+        lines.append(f"  Signal: {sig}  {decision[:45] if decision else 'Esperando...'}")
 
         status = d.get("status", "")
         if status:
-            lines.append(f"\n  {status}")
+            lines.append(f"  {status}")
+        else:
+            lines.append(f"  In position: {'YES' if in_pos else 'NO'}  Price: {_format_price(price)}")
 
         t = Text("\n".join(lines))
         bc3 = COLORS["white"]
-        if sl2 and not ss2:
+        if "LONG" in decision and "CONFIRMADO" in decision:
             bc3 = COLORS["green"]
-        elif ss2 and not sl2:
+        elif "SHORT" in decision or "TRAMPA" in decision:
             bc3 = COLORS["red"]
         return Panel(t, title="TRADE", border_style=bc3)
 
@@ -490,12 +582,14 @@ class BB450MobileApp(App):
     BannerWidget { height: 3; border: none; }
     PriceBarWidget { height: 4; border: none; }
     StrengthBarWidget { height: 3; border: none; }
-    IndicatorsWidget { height: 3; border: none; }
-    NarrativeWidget { height: 6; border: none; }
-    WhaleWallWidget { height: 4; border: none; }
-    ImbalanceWidget { height: 3; border: none; }
+    IndicatorsWidget { height: 4; border: none; }
+    NarrativeWidget { height: 5; border: none; }
+    WhaleWallWidget { height: 5; border: none; }
+    ImbalanceWidget { height: 4; border: none; }
+    OrderFlowWidget { height: 3; border: none; }
+    AIAnalysisWidget { height: 5; border: none; }
     AccountWidget { height: 3; border: none; }
-    TradeWidget { height: 13; border: none; }
+    TradeWidget { height: 6; border: none; }
     """
 
     def __init__(self):
@@ -514,6 +608,8 @@ class BB450MobileApp(App):
         yield NarrativeWidget()
         yield WhaleWallWidget()
         yield ImbalanceWidget()
+        yield OrderFlowWidget()
+        yield AIAnalysisWidget()
         yield AccountWidget()
         yield TradeWidget(client=self._client)
 
@@ -631,6 +727,8 @@ class BB450MobileApp(App):
             "volume": data.get("volume", 0),
             "atr": data.get("atr", 0),
             "kaufman_eff": data.get("kaufman_eff", 0.5),
+            "delta": data.get("delta", 0),
+            "cvd": data.get("cvd", 0),
             "trend_label": data.get("trend_label", ""),
         })
         _set(NarrativeWidget, {
@@ -644,6 +742,7 @@ class BB450MobileApp(App):
             "spoofing_risk": data.get("spoofing_risk", 0),
             "active_trap": data.get("active_trap", ""),
             "decision": decision,
+            "regime": data.get("regimen_mercado", ""),
         })
         _set(WhaleWallWidget, {
             "price": data.get("price", 0),
@@ -656,6 +755,28 @@ class BB450MobileApp(App):
             "ba_ratio": data.get("ba_ratio", 1.0),
             "book_depth_bids_volume": data.get("book_depth_bids_volume", 0),
             "book_depth_asks_volume": data.get("book_depth_asks_volume", 0),
+            "delta": data.get("delta", 0),
+            "spread_velocity": data.get("spread_velocity", 0),
+            "cancel_rate": data.get("cancel_rate", 0),
+            "order_book": data.get("order_book", {}),
+        })
+        _set(OrderFlowWidget, {
+            "delta": data.get("delta", 0),
+            "cvd": data.get("cvd", 0),
+            "tick_speed": data.get("tick_speed", 0),
+            "hft_speed": data.get("hft_speed", 0),
+            "cancel_rate": data.get("cancel_rate", 0),
+            "spoofing_risk": data.get("spoofing_risk", 0),
+            "spread_velocity": data.get("spread_velocity", 0),
+        })
+        _set(AIAnalysisWidget, {
+            "signal": sig,
+            "confidence": conf,
+            "decision": decision,
+            "signal_diagnostics": data.get("signal_diagnostics", []),
+            "trend": data.get("trend", ""),
+            "regime": data.get("regimen_mercado", ""),
+            "active_trap": data.get("active_trap", ""),
         })
         _set(AccountWidget, {
             "balance": data.get("balance", 0),
