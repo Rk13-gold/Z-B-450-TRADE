@@ -16,7 +16,7 @@ log = logging.getLogger(__name__)
 class BB450WSServer:
     """WebSocket server for BB-450 mobile terminal (Termux).
 
-    Broadcasts market_state every 1s + notification events to all
+    Broadcasts market_state every 200ms + notification events to all
     connected clients.  Accepts full trading commands from the mobile app.
     """
 
@@ -35,6 +35,7 @@ class BB450WSServer:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._running = False
         self._thread: Optional[threading.Thread] = None
+        self._cached_state: dict = {}
 
     # ── Public API ─────────────────────────────────────────────────
 
@@ -126,16 +127,18 @@ class BB450WSServer:
         while self._running:
             try:
                 data = self._data_provider()
-                if data and self._clients:
+                if data:
+                    self._cached_state = data
+                if self._cached_state and self._clients:
                     msg = json.dumps({
                         "type": "market_state",
-                        "data": data,
+                        "data": self._cached_state,
                         "timestamp": time.time(),
                     }, default=str)
                     await self._send_to_all(msg)
             except Exception as e:
                 log.error(f"[WS] Broadcast error: {e}")
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.2)
 
     async def _send_to_all(self, msg: str):
         if not self._clients:

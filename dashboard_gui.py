@@ -8401,6 +8401,14 @@ class MainDashboard(QMainWindow):
                 },
                 "decision": getattr(self.battle_bar, 'decision', 'ESPERAR') if hasattr(self, 'battle_bar') else 'ESPERAR',
                 "active_trap": getattr(self.battle_bar, 'active_trap', '') if hasattr(self, 'battle_bar') else '',
+                # ── TUI Redesign v2 fields ─────────────────────────────
+                "buy_pressure": getattr(self.battle_bar, 'current_buy_pct', 50) if hasattr(self, 'battle_bar') else 50,
+                "imbalance": self.data.get('liquidity_data', {}).get('imbalance', 0),
+                "whale_bid_walls": self.data.get('liquidity_data', {}).get('buy_walls', []),
+                "whale_ask_walls": self.data.get('liquidity_data', {}).get('sell_walls', []),
+                "book_depth_bids_volume": getattr(self.battle_bar, '_book_depth_bids_volume', 0) if hasattr(self, 'battle_bar') else 0,
+                "book_depth_asks_volume": getattr(self.battle_bar, '_book_depth_asks_volume', 0) if hasattr(self, 'battle_bar') else 0,
+                "ba_ratio": self.data.get('ba_ratio', 1.0),
             }
 
         def _ws_on_command(data: dict) -> dict:
@@ -11032,6 +11040,8 @@ class MainDashboard(QMainWindow):
 
         # ── B/A ratio (absorption detection) ──────────────────────────
         ba_ratio = total_bid_vol / max(total_ask_vol, 0.001)
+        self.data['ba_ratio'] = ba_ratio
+        self.data['hft_speed'] = hft_speed
 
         # Volatility data
         b_squeeze = self.data.get('bb_squeeze', 'NORMAL')
