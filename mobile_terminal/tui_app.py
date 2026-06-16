@@ -14,6 +14,7 @@ from textual.reactive import reactive
 from textual.widget import Widget
 
 from config import WS_URI, SOUND_LONG, SOUND_SHORT, SOUND_CLOSE, NOTIFY_ENABLED
+from ws_client import BB450WSClient
 
 log = logging.getLogger(__name__)
 
@@ -89,11 +90,13 @@ class BannerWidget(Widget):
         status_emoji = "\U0001f7e2" if connected else "\U0001f534"
         status_text = "CONNECTED" if connected else "DISCONNECTED"
         host = d.get("host", WS_URI)
+        port = d.get("port", "")
         color = COLORS["green"] if connected else COLORS["red"]
         text = Text.assemble(
-            (f" {status_emoji} BB-450 Mobile Terminal ", COLORS["magenta"]),
+            (f" {status_emoji} BB-450 ", COLORS["magenta"]),
             (f"| {status_text} ", color),
             (f"| {host} ", COLORS["dim"]),
+            (f":{port}" if port else "", COLORS["dim"]),
         )
         return Panel(text, style=f"bold {COLORS['bg']}", border_style=color)
 
@@ -607,9 +610,20 @@ class BB450MobileApp(App):
 
     # ── Callbacks ──────────────────────────────────────────────────
 
+    def _on_ws_status(self, connected: bool):
+        if not self.is_mounted:
+            return
+        self.query_one(BannerWidget).data = {
+            "status": "connected" if connected else "disconnected",
+            "host": WS_URI,
+            "port": "",
+        }
+
     def _on_market_state(self, data: dict):
         if not self.is_mounted:
             return
+        self.query_one(BannerWidget).data["port"] = data.get("bore_port", "")
+        self.query_one(BannerWidget).refresh()
         self.query_one(PriceWidget).data = {
             "price": data.get("price", 0),
             "change_pct": data.get("change_pct", 0),

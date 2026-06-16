@@ -482,7 +482,7 @@ class GeminiBrainManager:
                 config=types.GenerateContentConfig(
                     system_instruction=self._system_instruction,
                     temperature=0.1,
-                    max_output_tokens=1024,
+                    max_output_tokens=4096,
                     response_mime_type="application/json",
                     response_schema=GeminiTradingDecision,
                 ),
@@ -507,20 +507,28 @@ class GeminiBrainManager:
             except Exception:
                 pass
 
-            # Fallback: extraer decision vía regex, devolver ESPERAR seguro
+            # Fallback: extraer fields vía regex desde JSON truncado
             import re
-            m = re.search(r'"decision"\s*:\s*"([^"]+)"', raw)
-            if m and m.group(1) == "ESPERAR":
-                log.warning("[GeminiBrain] JSON truncado — forzando ESPERAR safe-default")
+            dec = re.search(r'"decision"\s*:\s*"([^"]+)"', raw)
+            conf = re.search(r'"confianza"\s*:\s*([\d.]+)', raw)
+            trig = re.search(r'"trigger_price"\s*:\s*([\d.]+)', raw)
+            sl = re.search(r'"stop_loss"\s*:\s*([\d.]+)', raw)
+            tp = re.search(r'"take_profit"\s*:\s*([\d.]+)', raw)
+            reg = re.search(r'"regimen_mercado"\s*:\s*"([^"]+)"', raw)
+            mult = re.search(r'"multiplicador_posicion"\s*:\s*([\d.]+)', raw)
+            anal = re.search(r'"analisis_cuant"\s*:\s*"([^"]+)"', raw)
+
+            if dec and dec.group(1) in ("ALZA", "BAJA", "ESPERAR"):
+                log.warning("[GeminiBrain] JSON truncado — extrayendo fields vía regex")
                 return GeminiTradingDecision(
-                    decision="ESPERAR",
-                    confianza=0.0,
-                    trigger_price=0.0,
-                    stop_loss=0.0,
-                    take_profit=0.0,
-                    regimen_mercado="RANGO_INDECISO",
-                    multiplicador_posicion=1.0,
-                    analisis_cuant="Gemini response truncated — defaulting to ESPERAR",
+                    decision=dec.group(1),
+                    confianza=float(conf.group(1)) if conf else 0.0,
+                    trigger_price=float(trig.group(1)) if trig else 0.0,
+                    stop_loss=float(sl.group(1)) if sl else 0.0,
+                    take_profit=float(tp.group(1)) if tp else 0.0,
+                    regimen_mercado=reg.group(1) if reg else "RANGO_INDECISO",
+                    multiplicador_posicion=float(mult.group(1)) if mult else 1.0,
+                    analisis_cuant=anal.group(1)[:200] if anal else "JSON truncado",
                 )
 
             log.error(f"[GeminiBrain] JSON inválido irrecuperable: {raw[:200]}")
