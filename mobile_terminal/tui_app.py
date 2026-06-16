@@ -292,7 +292,7 @@ class ImbalanceWidget(Widget):
         t.append(bf, bc2)
         t.append(be, COLORS["dim"])
         t.append(" ASKS", COLORS["red"])
-        t.append(f"\n  Depth: {dimb:+.1}h  B/A: {ba:.2f}x  {bv:.1f}/{av:.1f}\u20bf", COLORS["dim"])
+        t.append(f"\n  Depth: {dimb:+.1f}%  B/A: {ba:.2f}x  {bv:.1f}/{av:.1f}\u20bf", COLORS["dim"])
         return Panel(t, title="ORDER BOOK IMBALANCE", border_style=bc2 if abs(imb) > 0.2 else COLORS["dim"])
 
 
@@ -485,7 +485,6 @@ class TradeWidget(Widget):
 class BB450MobileApp(App):
     CSS = """
     Screen { background: #0a0a0a; }
-    * { background: #0a0a0a; color: #cccccc; }
     BannerWidget { height: 3; }
     PriceBarWidget { height: 4; }
     StrengthBarWidget { height: 3; }
@@ -594,6 +593,9 @@ class BB450MobileApp(App):
     def _on_market_state(self, data: dict):
         if not self.is_mounted:
             return
+        sig = data.get("signal", "NEUTRAL")
+        conf = data.get("confidence", 0)
+        decision = data.get("decision", "")
         try:
             self.query_one(BannerWidget).data = {
                 "status": "connected",
@@ -606,8 +608,6 @@ class BB450MobileApp(App):
                 "high": data.get("day_high", 0),
                 "low": data.get("day_low", 0),
             }
-            sig = data.get("signal", "NEUTRAL")
-            conf = data.get("confidence", 0)
             self.query_one(StrengthBarWidget).data = {
                 "signal": sig,
                 "confidence": conf,
@@ -630,8 +630,8 @@ class BB450MobileApp(App):
                 "ba_ratio": data.get("ba_ratio", 1.0),
                 "depth_imb_pct": data.get("depth_imb_pct", 0),
                 "spoofing_risk": data.get("spoofing_risk", 0),
-                "decision": data.get("decision", ""),
                 "active_trap": data.get("active_trap", ""),
+                "decision": decision,
             }
             self.query_one(WhaleWallWidget).data = {
                 "price": data.get("price", 0),
@@ -651,7 +651,6 @@ class BB450MobileApp(App):
                 "funding_rate": data.get("funding_rate", 0),
                 "oi_delta_5min": data.get("oi_delta_5min", 0),
             }
-            decision = data.get("decision", "")
             in_pos = data.get("position") is not None
             tw = self.query_one(TradeWidget)
             tw.data = {
