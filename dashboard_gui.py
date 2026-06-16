@@ -8402,11 +8402,10 @@ class MainDashboard(QMainWindow):
                 "decision": getattr(self.battle_bar, 'decision', 'ESPERAR') if hasattr(self, 'battle_bar') else 'ESPERAR',
                 "active_trap": getattr(self.battle_bar, 'active_trap', '') if hasattr(self, 'battle_bar') else '',
                 # ── TUI Redesign v2 fields ─────────────────────────────
-                "buy_pressure": max(5, min(95,
-                    ((self.data.get("buy_volume", 0) / max(self.data.get("buy_volume", 0) + self.data.get("sell_volume", 0) + 0.001, 0.001)) * 100) * 0.40 +
-                    max(5, min(95, 50 + (self.data.get("cvd", 0) / 20) * 50)) * 0.35 +
-                    (50 + (getattr(self.signal_tab, '_depth_imb_pct', 0) if hasattr(self, 'signal_tab') else 0)) * 0.25
-                )),
+                "buy_pressure": (
+                    getattr(getattr(self, 'battle_bar', None), 'target_buy_pct', 50)
+                    if hasattr(self, 'battle_bar') else 50
+                ),
                 "imbalance": self.data.get('liquidity_data', {}).get('imbalance', 0),
                 "whale_bid_walls": self.data.get('liquidity_data', {}).get('buy_walls', []),
                 "whale_ask_walls": self.data.get('liquidity_data', {}).get('sell_walls', []),

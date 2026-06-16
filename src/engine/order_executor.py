@@ -513,21 +513,23 @@ class OrderExecutor(QThread):
 
     @property
     def is_testnet(self) -> bool:
-        return False  # BB-450 locked to REAL production
+        return settings.BINANCE_TESTNET
 
     def switch_environment(self, testnet: bool) -> dict:
-        """BLOCKED: BB-450 operates on REAL production only."""
-        import logging
-        log = logging.getLogger(__name__)
+        """Switch between REAL and TESTNET."""
+        from config.settings import settings as s
         if testnet:
-            log.error("[OrderExec] switch_environment(TESTNET) REJECTED — "
-                      "production-locked mode")
-            return {"success": False,
-                    "message": "TESTNET bloqueado — BB-450 solo opera en REAL",
-                    "balance": 0.0, "available": 0.0, "unrealized_pnl": 0.0}
-        return {"success": True,
-                "message": "REAL ya activo — ningún cambio necesario",
-                "balance": 0.0, "available": 0.0, "unrealized_pnil": 0.0}
+            s.BINANCE_TESTNET = True
+            self._build_client()
+            if self._client:
+                return {"success": True, "message": "Switched to TESTNET"}
+            return {"success": False, "message": "TESTNET init failed"}
+        else:
+            s.BINANCE_TESTNET = False
+            self._build_client()
+            if self._client:
+                return {"success": True, "message": "Switched to REAL"}
+            return {"success": False, "message": "REAL init failed"}
 
     # ── Thread main loop ────────────────────────────────────────────────────
 
@@ -701,17 +703,25 @@ class OrderExecutor(QThread):
     # ── Internals ───────────────────────────────────────────────────────────
 
     def _build_client(self) -> None:
-        """Create Binance Futures client — REAL production only."""
-        api_key = settings.BINANCE_REAL_API_KEY
-        secret = settings.BINANCE_REAL_SECRET_KEY
+        """Create Binance Futures client — real or testnet."""
+        if settings.BINANCE_TESTNET:
+            api_key = settings.BINANCE_API_KEY
+            secret = settings.BINANCE_SECRET_KEY
+            tn = True
+            tag = "TESTNET"
+        else:
+            api_key = settings.BINANCE_REAL_API_KEY
+            secret = settings.BINANCE_REAL_SECRET_KEY
+            tn = False
+            tag = "REAL"
         if not api_key or not secret:
-            log.error("[OrderExec] REAL API keys missing — "
-                      "check BINANCE_REAL_API_KEY / BINANCE_REAL_SECRET_KEY")
+            log.error(f"[OrderExec] {tag} API keys missing — "
+                      f"check {tag}_API_KEY / {tag}_SECRET_KEY")
             return
         try:
-            self._client = Client(api_key, secret, testnet=False, ping=False)
+            self._client = Client(api_key, secret, testnet=tn, ping=False)
         except Exception as exc:
-            log.error(f"[OrderExec] Failed to build REAL client: {exc}")
+            log.error(f"[OrderExec] Failed to build {tag} client: {exc}")
             self._client = None
 
     def _execute_single(self, task: dict) -> None:

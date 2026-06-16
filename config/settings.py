@@ -11,6 +11,10 @@ class Settings:
     # Real Binance Futures API (production only)
     BINANCE_REAL_API_KEY = os.getenv("BINANCE_REAL_API_KEY", "")
     BINANCE_REAL_SECRET_KEY = os.getenv("BINANCE_REAL_SECRET_KEY", "")
+    # Testnet Binance Futures API
+    BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
+    BINANCE_SECRET_KEY = os.getenv("BINANCE_SECRET_KEY", "")
+    BINANCE_TESTNET = os.getenv("BINANCE_TESTNET", "False").lower() in ("true", "1", "yes")
     SYMBOL = os.getenv("SYMBOL", "BTCUSDT")
 
     # ── Thread-safe active symbol (hot-swappable via Telegram) ──────────
@@ -70,10 +74,17 @@ class Settings:
     def validate(cls) -> None:
         """Fail fast on missing critical environment variables."""
         missing = []
-        if not cls.BINANCE_REAL_API_KEY:
-            missing.append("BINANCE_REAL_API_KEY")
-        if not cls.BINANCE_REAL_SECRET_KEY:
-            missing.append("BINANCE_REAL_SECRET_KEY")
+        is_testnet = cls.BINANCE_TESTNET
+        if is_testnet:
+            if not cls.BINANCE_API_KEY:
+                missing.append("BINANCE_API_KEY (testnet)")
+            if not cls.BINANCE_SECRET_KEY:
+                missing.append("BINANCE_SECRET_KEY (testnet)")
+        else:
+            if not cls.BINANCE_REAL_API_KEY:
+                missing.append("BINANCE_REAL_API_KEY")
+            if not cls.BINANCE_REAL_SECRET_KEY:
+                missing.append("BINANCE_REAL_SECRET_KEY")
         if not cls.GEMINI_API_KEY:
             missing.append("GEMINI_API_KEY")
         if not cls.TELEGRAM_BOT_TOKEN:
@@ -85,7 +96,8 @@ class Settings:
             print(f"[🔴 FATAL] Revisa que exista el archivo:")
             print(f"           {dotenv_path}")
             sys.exit(1)
-        print(f"[✅ CONFIG] Variables de entorno validadas — PRODUCCIÓN REAL")
+        tag = "TESTNET" if is_testnet else "PRODUCCIÓN REAL"
+        print(f"[✅ CONFIG] Variables de entorno validadas — {tag}")
 
 
 settings = Settings()

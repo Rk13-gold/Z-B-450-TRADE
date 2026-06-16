@@ -13,11 +13,15 @@ log = logging.getLogger("BinanceClient")
 
 class BinanceClient:
     def __init__(self):
-        self.client = Client(
-            settings.BINANCE_REAL_API_KEY,
-            settings.BINANCE_REAL_SECRET_KEY,
-            testnet=False
-        )
+        if settings.BINANCE_TESTNET:
+            api_key = settings.BINANCE_API_KEY
+            secret = settings.BINANCE_SECRET_KEY
+            tn = True
+        else:
+            api_key = settings.BINANCE_REAL_API_KEY
+            secret = settings.BINANCE_REAL_SECRET_KEY
+            tn = False
+        self.client = Client(api_key, secret, testnet=tn)
         self.symbol = settings.get_symbol()
 
         self.kline_callback: Optional[Callable] = None

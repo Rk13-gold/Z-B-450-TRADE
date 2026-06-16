@@ -498,6 +498,7 @@ class BB450MobileApp(App):
 
     def __init__(self):
         super().__init__()
+        self.dark = True
         self._client = BB450WSClient()
         self._ws_task: Optional[asyncio.Task] = None
         self._prev_signal = "NEUTRAL"
