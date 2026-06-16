@@ -5394,17 +5394,27 @@ class SignalDataWorker(QThread):
         if self._client is not None:
             return True
         try:
-            api_key = settings.BINANCE_REAL_API_KEY
-            secret = settings.BINANCE_REAL_SECRET_KEY
-            if not api_key or not secret:
-                raise ValueError("Missing REAL API keys — check BINANCE_REAL_API_KEY/SECRET")
-            self._client = Client(api_key, secret, testnet=False)
-            self._backoff = 1.0
-            self.connection_status.emit(True, "Conectado a Binance REAL")
+            use_testnet = settings.BINANCE_TESTNET
+            if use_testnet:
+                api_key = settings.BINANCE_API_KEY
+                secret = settings.BINANCE_SECRET_KEY
+                if not api_key or not secret:
+                    raise ValueError("Missing TESTNET API keys — check BINANCE_API_KEY/SECRET")
+                self._client = Client(api_key, secret, testnet=True)
+                self._backoff = 1.0
+                self.connection_status.emit(True, "Conectado a Binance TESTNET")
+            else:
+                api_key = settings.BINANCE_REAL_API_KEY
+                secret = settings.BINANCE_REAL_SECRET_KEY
+                if not api_key or not secret:
+                    raise ValueError("Missing REAL API keys — check BINANCE_REAL_API_KEY/SECRET")
+                self._client = Client(api_key, secret, testnet=False)
+                self._backoff = 1.0
+                self.connection_status.emit(True, "Conectado a Binance REAL")
             return True
         except Exception as exc:
             self._client = None
-            self.connection_status.emit(False, f"Error REAL: {exc}")
+            self.connection_status.emit(False, f"Error: {exc}")
             return False
 
     def fetch_all(self):
@@ -8311,16 +8321,27 @@ class MainDashboard(QMainWindow):
             tick_speed_threshold=8,
         )
 
-        # Crear un único cliente Binance compartido — REAL production only
+        # Crear un único cliente Binance compartido (testnet o real según config)
         from binance.client import Client
-        _shared_api_key = settings.BINANCE_REAL_API_KEY
-        _shared_secret = settings.BINANCE_REAL_SECRET_KEY
+        use_testnet = settings.BINANCE_TESTNET
+        if use_testnet:
+            _shared_api_key = settings.BINANCE_API_KEY
+            _shared_secret = settings.BINANCE_SECRET_KEY
+            if not _shared_api_key or not _shared_secret:
+                log.warning("TESTNET API keys missing, falling back to REAL")
+                _shared_api_key = settings.BINANCE_REAL_API_KEY
+                _shared_secret = settings.BINANCE_REAL_SECRET_KEY
+                use_testnet = False
+        else:
+            _shared_api_key = settings.BINANCE_REAL_API_KEY
+            _shared_secret = settings.BINANCE_REAL_SECRET_KEY
         self._shared_client = Client(
             _shared_api_key,
             _shared_secret,
-            testnet=False,
+            testnet=use_testnet,
             ping=False,
         )
+        log.info("Binance client created: testnet=%s", use_testnet)
 
         # Wire up OrderExecutor FIRST (valida credenciales antes de arrancar nada)
         self.order_executor = OrderExecutor(client=self._shared_client)

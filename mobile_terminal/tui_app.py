@@ -20,7 +20,7 @@ log = logging.getLogger(__name__)
 COLORS = {
     "bg": "#0a0a0a",
     "green": "#00ff66",
-    "red": "#ff4444",
+    "red": "#bb00ff",
     "gold": "#ffcc00",
     "magenta": "#bb00ff",
     "cyan": "#00ccff",
@@ -85,19 +85,30 @@ class BannerWidget(Widget):
         s = d.get("status", "disconnected")
         host = d.get("host", WS_URI)
         port = d.get("port", "")
+        sig = d.get("signal", "")
+        conf = d.get("confidence", 0)
 
         if s == "connected":
-            emoji = "\u25cf"
-            label = "CONNECTED"
-            col = COLORS["green"]
+            if sig == "LONG":
+                emoji = "\U0001f7e2"
+                label = f"LONG {conf:.0f}%"
+                col = COLORS["green"]
+            elif sig == "SHORT":
+                emoji = "\U0001f535"
+                label = f"SHORT {conf:.0f}%"
+                col = COLORS["red"]
+            else:
+                emoji = "\u25cf"
+                label = "NEUTRAL"
+                col = COLORS["gold"]
         elif s == "reconnecting":
-            emoji = "\u25cf"
+            emoji = "\u26a1"
             label = "RECONNECTING"
             col = COLORS["gold"]
         else:
             emoji = "\u25cf"
             label = "DISCONNECTED"
-            col = COLORS["red"]
+            col = COLORS["dim"]
 
         text = Text.assemble(
             (f" {emoji} BB-450 ", f"bold {COLORS['magenta']}"),
@@ -154,7 +165,7 @@ class StrengthBarWidget(Widget):
         text.append(f" LONG {bp:.0f}% ", "bold green")
         text.append(lf, "green")
         text.append(le, COLORS["dim"])
-        text.append(f" {sp:.0f}% SHORT", "bold red")
+        text.append(f" {sp:.0f}% SHORT", f"bold {COLORS['red']}")
         text.append(f"\n  {se} {sig} {conf:.0f}%", f"bold {sc}")
         if regime:
             text.append(f" \u00b7 {regime[:20]}", COLORS["dim"])
@@ -231,7 +242,7 @@ class NarrativeWidget(Widget):
             text.append(f"  \u26aa Vol: {total:.1f}\u20bf  \u0394{delta:+.1f}\u20bf", COLORS["dim"])
 
         # Line 2: Flow metrics
-        hc = COLORS["red"] if hft > 5 else COLORS["gold"] if hft > 2 else COLORS["dim"]
+        hc = COLORS["orange"] if hft > 5 else COLORS["gold"] if hft > 2 else COLORS["dim"]
         ba_c = COLORS["green"] if ba > 1.2 else COLORS["red"] if ba < 0.8 else COLORS["dim"]
         text.append(f"\n  \u0394Delta: {delta:+.1f}  CVD: {cvd:+.1f}  ", COLORS["dim"])
         text.append(f"B/A: {ba:.2f}x", ba_c)
@@ -239,7 +250,7 @@ class NarrativeWidget(Widget):
         text.append(f"  Tick: {tick:.0f}/s", COLORS["dim"])
 
         # Line 3: Risk metrics
-        sp_c = COLORS["red"] if spoof > 30 else COLORS["gold"] if spoof > 10 else COLORS["dim"]
+        sp_c = COLORS["orange"] if spoof > 30 else COLORS["gold"] if spoof > 10 else COLORS["dim"]
         text.append(f"\n  Spoof: {spoof:.0f}% ", sp_c)
         text.append(f"Depth: {imb:+.1f}% ", COLORS["dim"])
         if regime:
@@ -248,9 +259,9 @@ class NarrativeWidget(Widget):
 
         # Line 4: Trap / Decision
         if trap:
-            text.append(f"\n  \u26a0\ufe0f {trap[:50]}", COLORS["red"])
+            text.append(f"\n  \u26a0\ufe0f {trap[:50]}", COLORS["orange"])
         if decision:
-            dc = COLORS["green"] if "LONG" in decision else COLORS["red"] if "SHORT" in decision or "TRAMPA" in decision else COLORS["gold"] if "PARCIAL" in decision else COLORS["dim"]
+            dc = COLORS["green"] if "LONG" in decision else COLORS["red"] if "SHORT" in decision else COLORS["orange"] if "TRAMPA" in decision else COLORS["gold"] if "PARCIAL" in decision else COLORS["dim"]
             if trap:
                 text.append(f"  {decision[:50]}", dc)
             else:
@@ -258,7 +269,7 @@ class NarrativeWidget(Widget):
 
         bc2 = COLORS["cyan"]
         if "TRAMPA" in decision:
-            bc2 = COLORS["red"]
+            bc2 = COLORS["orange"]
         elif "LONG CONFIRMADO" in decision:
             bc2 = COLORS["green"]
         elif "SHORT CONFIRMADO" in decision:
@@ -353,9 +364,9 @@ class OrderFlowWidget(Widget):
 
         dc = COLORS["green"] if delta > 0 else COLORS["red"] if delta < 0 else COLORS["dim"]
         cc = COLORS["green"] if cvd > 0 else COLORS["red"] if cvd < 0 else COLORS["dim"]
-        hc = COLORS["red"] if hft > 5 else COLORS["gold"] if hft > 2 else COLORS["dim"]
-        sc = COLORS["red"] if spoof > 30 else COLORS["gold"] if spoof > 10 else COLORS["dim"]
-        canc = COLORS["red"] if cancel > 20 else COLORS["gold"] if cancel > 10 else COLORS["dim"]
+        hc = COLORS["orange"] if hft > 5 else COLORS["gold"] if hft > 2 else COLORS["dim"]
+        sc = COLORS["orange"] if spoof > 30 else COLORS["gold"] if spoof > 10 else COLORS["dim"]
+        canc = COLORS["orange"] if cancel > 20 else COLORS["gold"] if cancel > 10 else COLORS["dim"]
 
         text = Text.assemble(
             ("  \u0394Delta: ", COLORS["dim"]),
@@ -434,7 +445,7 @@ class AIAnalysisWidget(Widget):
 
         if diag:
             for di in diag[:3]:
-                di_c = COLORS["green"] if any(w in di.upper() for w in ["LONG", "BUY", "ALZA", "BULL"]) else COLORS["red"] if any(w in di.upper() for w in ["SHORT", "SELL", "BAJA", "BEAR"]) else COLORS["dim"]
+                di_c = COLORS["green"] if any(w in di.upper() for w in ["LONG", "BUY", "ALZA", "BULL"]) else COLORS["red"] if any(w in di.upper() for w in ["SHORT", "SELL", "BAJA", "BEAR"]) else COLORS["orange"] if any(w in di.upper() for w in ["TRAP", "SPOOF"]) else COLORS["dim"]
                 text.append(f"  \u2022 {di[:55]}", di_c)
                 text.append("\n")
         else:
@@ -442,7 +453,7 @@ class AIAnalysisWidget(Widget):
             text.append("\n")
 
         if trap:
-            text.append(f"  \u26a0\ufe0f Trap: {trap[:50]}", COLORS["red"])
+            text.append(f"  \u26a0\ufe0f Trap: {trap[:50]}", COLORS["orange"])
         elif decision and "CONFIRMADO" in decision:
             text.append(f"  \u2705 Senal confirmada: {decision[:50]}", COLORS["green"])
         else:
@@ -491,7 +502,7 @@ class TradeWidget(Widget):
         lines.append("  " + "\u2500" * 28)
 
         sig_col = COLORS["green"] if sig == "LONG" else COLORS["red"] if sig == "SHORT" else COLORS["gold"]
-        dec_col = COLORS["green"] if "LONG" in decision else COLORS["red"] if "SHORT" in decision or "TRAMPA" in decision else COLORS["gold"] if "CONFIRMADO" in decision else COLORS["dim"]
+        dec_col = COLORS["green"] if "LONG" in decision else COLORS["red"] if "SHORT" in decision else COLORS["orange"] if "TRAMPA" in decision else COLORS["gold"] if "CONFIRMADO" in decision else COLORS["dim"]
         lines.append(f"  Signal: {sig}  {decision[:45] if decision else 'Esperando...'}")
 
         status = d.get("status", "")
@@ -504,8 +515,10 @@ class TradeWidget(Widget):
         bc3 = COLORS["white"]
         if "LONG" in decision and "CONFIRMADO" in decision:
             bc3 = COLORS["green"]
-        elif "SHORT" in decision or "TRAMPA" in decision:
+        elif "SHORT" in decision:
             bc3 = COLORS["red"]
+        elif "TRAMPA" in decision:
+            bc3 = COLORS["orange"]
         return Panel(t, title="TRADE", border_style=bc3)
 
     async def on_key(self, event):
@@ -709,6 +722,8 @@ class BB450MobileApp(App):
             "status": "connected",
             "host": WS_URI,
             "port": data.get("bore_port", ""),
+            "signal": sig,
+            "confidence": conf,
         })
         _set(PriceBarWidget, {
             "price": data.get("price", 0),
