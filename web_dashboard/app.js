@@ -7,14 +7,22 @@
 
     // ── Config ────────────────────────────────────────────────────
     const RENDER_WS_URL = (() => {
+        // 1. Forzar URL desde variable global (definida en index.html)
+        if (window.BB450_WS_URL) return window.BB450_WS_URL;
+
+        // 2. Local dev
         const host = window.location.hostname;
         if (host === 'localhost' || host === '127.0.0.1') {
             return 'ws://localhost:8000/ws';
         }
-        // In production, point to your Render service
-        // Override by setting window.BB450_WS_URL before this script loads
-        if (window.BB450_WS_URL) return window.BB450_WS_URL;
-        // Auto-detect: same host, ws:// or wss://
+
+        // 3. GitHub Pages — no auto-detect, usar variable predefinida
+        if (host.includes('github.io')) {
+            console.warn('[BB450] GitHub Pages detectado — define BB450_WS_URL en index.html');
+            return null; // will fail connection, shows disconnected
+        }
+
+        // 4. Render directo o custom domain
         const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         return `${proto}//${host}/ws`;
     })();
