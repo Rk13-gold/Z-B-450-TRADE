@@ -1,0 +1,38 @@
+services:
+  - type: web
+    name: bb-450
+    runtime: python
+    region: oregon
+    plan: free
+    buildCommand: pip install -r requirements-render.txt
+    startCommand: python render_main.py
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: 8000
+      - key: BINANCE_REAL_API_KEY
+        sync: false
+      - key: BINANCE_REAL_SECRET_KEY
+        sync: false
+      - key: BINANCE_API_KEY
+        sync: false
+      - key: BINANCE_SECRET_KEY
+        sync: false
+      - key: BINANCE_TESTNET
+        value: "False"
+      - key: SYMBOL
+        value: "BTCUSDT"
+      - key: DEFAULT_LEVERAGE
+        value: "40"
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: TELEGRAM_ENABLED
+        value: "true"
+      - key: RISK_PERCENT
+        value: "20.0"
+      - key: USEALLIN
+        value: "False"

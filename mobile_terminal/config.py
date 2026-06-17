@@ -12,7 +12,10 @@ WS_PORT: int = 8765
 # Opción B — bore (no necesita nada en el teléfono):
 #   1. En el PC:  bore local 8765 --to bore.pub
 #   2. Descomenta la línea de abajo con el puerto que te dé
-WS_URI: str = "ws://bore.pub:27309"
+WS_URI: str = "wss://bb-450.onrender.com/ws"
+
+# Puedes sobrescribir WS_URI con la URL que te asigne Render:
+# WS_URI = "wss://TU-SERVICIO.onrender.com/ws"
 
 # Si WS_URI no está definido, se construye desde WS_HOST:WS_PORT
 try:
