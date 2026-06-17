@@ -103,6 +103,29 @@ app.add_middleware(
 
 # ── REST endpoints ──────────────────────────────────────────────────
 
+@app.get("/")
+async def root():
+    """Root endpoint — muestra estado básico."""
+    from fastapi.responses import HTMLResponse
+    p = market_state.get("price", 0)
+    sig = market_state.get("signal", "NINGUNA")
+    return HTMLResponse(f"""<!DOCTYPE html>
+<html><head><title>BB-450</title>
+<meta http-equiv="refresh" content="5">
+<style>body{{background:#0a0a0f;color:#00ff88;font-family:monospace;padding:40px}}</style>
+</head><body>
+<h1>🟢 BB-450 RUNNING</h1>
+<p>Precio: <b>${p:,.2f}</b></p>
+<p>Señal: <b>{sig}</b></p>
+<p>Symbol: <b>{settings.get_symbol()}</b></p>
+<p>Uptime: <b>{int(time.time() - _start_time)}s</b></p>
+<hr>
+<p><a href="/health" style="color:#00ff88">/health</a> |
+<a href="/api/state" style="color:#00ff88">/api/state</a> |
+WebSocket: <code>/ws</code></p>
+</body></html>""")
+
+
 @app.get("/health")
 async def health():
     """Health check endpoint — Render keeps the service alive."""
