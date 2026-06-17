@@ -2,7 +2,7 @@ services:
   - type: web
     name: bb-450
     runtime: python
-    region: frankfurt
+    region: singapore
     plan: free
     buildCommand: pip install -r requirements-render.txt
     startCommand: python render_main.py
