@@ -153,6 +153,19 @@ class AsyncDataEngine:
         self._last_price = 0.0
         log.info("AsyncDataEngine reset for symbol %s", new_symbol)
 
+    def set_timeframe(self, interval: str):
+        """Reinicia la collección de klines con un nuevo intervalo.
+
+        Se limpia el caché de klines y se actualiza la clave interna
+        para que el próximo ciclo _poll_klines_and_indicators use el
+        nuevo timeframe.
+        """
+        old = self.market_state.get("timeframe", "1m")
+        self.market_state["timeframe"] = interval
+        self._klines_cache.clear()
+        self._tech_levels_cache.clear()
+        log.info("AsyncDataEngine timeframe changed: %s → %s", old, interval)
+
     def _run_loop(self):
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)

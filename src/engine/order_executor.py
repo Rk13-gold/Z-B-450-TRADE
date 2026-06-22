@@ -92,6 +92,10 @@ class OrderExecutor(QThread):
         self._has_open_position: bool = False
         self._position_info: dict = {}
 
+        # ── SL/TP prices (exposed for chart overlay) ────────────────
+        self._sl_price: float = 0.0
+        self._tp_price: float = 0.0
+
         # ── Position-close tracking (PASO 2) ─────────────────────────
         self._open_position_data: Optional[dict] = None
         self._close_poll_timer: Optional[QTimer] = None
@@ -1078,6 +1082,10 @@ class OrderExecutor(QThread):
         if bracket_errors:
             result_data["bracket_errors"] = "; ".join(bracket_errors)
 
+        # Exponer SL/TP para el overlay del chart
+        self._sl_price = float(rounded_sl_str) if rounded_sl_str != "0" else 0.0
+        self._tp_price = float(rounded_tp_str) if rounded_tp_str != "0" else 0.0
+
         success = bool(entry_order_id) and not bracket_errors
         msg_parts = [
             f"[{env_tag}] {'✅' if success else '❌'} "
@@ -1566,6 +1574,8 @@ class OrderExecutor(QThread):
         Returns dict with success and leverage.
         """
         return self.change_leverage_direct(leverage)
+
+    def _fapi_create_order(self, **kwargs) -> dict:
         """Call futures_create_order with unified error handling.
 
         Usado exclusivamente para la orden de entrada MARKET.

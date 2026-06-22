@@ -212,6 +212,14 @@ from src.engine.strategy import trading_strategy
 from src.engine.async_data_engine import AsyncDataEngine
 from src.database.supabase_manager import local_trade_db
 from src.engine.gemini_brain import GeminiBrainManager, GeminiTradingDecision
+from src.engine.trader_narrator import trader_narrator
+from src.ui.trader_panel import TraderPanel
+from src.ui.trading_control import TradingControlPanel
+from src.ui.position_marker import position_marker_manager
+from src.ui.order_flow_animation import order_flow_animation
+from src.ui.projection_indicator import projection_indicator_manager
+from src.ui.theme_engine import theme as get_theme
+from src.ui.settings_window import SettingsWindow
 
 
 # ── Validación temprana de variables de entorno ────────────────────────────
@@ -827,19 +835,10 @@ class OrderFlowNumericFeed(QOpenGLWidget):
         return self.price_levels
 
 
-class GalaxyOrderFlowChart(QOpenGLWidget):
-    """Professional Footprint + Candlestick chart with Order Flow grid.
-    
-    Draws Japanese candlesticks with a Footprint-style BID×ASK volume grid overlay.
-    Shows Volume Profile sidebar, per-candle delta bars, and bounce zone detection.
-    Similar to ATAS / Sierra Chart / Bookmap professional trading platforms.
-    
-    Optimizations:
-    - VOLUME_THRESHOLD: Filters retail noise below configurable BTC volume.
-    - Y-Axis Zoom: Mouse wheel / +- keys dynamically scale vertical resolution.
-    - Heatmap Meter: 3-tier color intensity (Retail/Medium/Whale) per cell.
-    """
-    def __init__(self, title="GALAXY ORDER FLOW", parent=None):
+class BB450Chart(QOpenGLWidget):
+    """BB-450 CHART OPPORTUNITY — Chart profesional con Order Flow y todos los indicadores."""
+
+    def __init__(self, title="BB-450 CHART OPPORTUNITY", parent=None):
         super().__init__(parent)
         self.title = title
         self.klines = []
@@ -891,6 +890,45 @@ class GalaxyOrderFlowChart(QOpenGLWidget):
         
         # ── Direction badge state ──
         self._direction_badge = None
+
+        # ── New indicator caches (SB, OB, FVG, Fib, etc.) ──
+        self._swing_highs: list[float] = []
+        self._swing_lows: list[float] = []
+        self._order_blocks: list[dict] = []
+        self._fvg_list: list[dict] = []
+        self._sr_levels_list: list[dict] = []
+        self._fib_start_price: float = 0.0
+        self._fib_end_price: float = 0.0
+        self._killzone_ranges: list[tuple[int, int, str]] = []
+
+        # ── Settings system ──
+        self._flags: dict = {
+            "ema_cloud": False, "vwap": False, "dpoc": False,
+            "imbalance_circles": False, "volatility_cone": False,
+            "liquidity_arrow": False, "pulse_entry": False,
+            "signal_strip": False, "grid_lines": True,
+            "footprint_numbers": False, "volume_profile": False,
+            "price_bar_extras": False, "candle_annotations": False,
+            "sr_levels": False, "order_blocks": False, "fvg": False,
+            "swing_liquidity": False,
+            "fib_retracement": False, "fib_extension": False, "fib_time_zones": False,
+            "entry_zones": False, "ict_killzones": False,
+            "orderflow_imbalance": False, "premium_discount": False,
+        }
+        self._position_data: Optional[dict] = None
+        self._settings_btn_rect = QRect(0, 0, 24, 24)
+        self._settings_btn_hover = False
+        self._toggle_btn_rect = QRect(0, 0, 24, 24)
+        self._toggle_btn_hover = False
+        self._show_zoom_controls = False
+        self._toolbar_btns: list[dict] = []
+        self._toolbar_hover: Optional[int] = None
+        self._zoom_btn_width = 0.0
+        self._zoom_anim_timer = QTimer(self)
+        self._zoom_anim_timer.timeout.connect(self._tick_zoom_animation)
+        self._timeframe: str = "1m"
+        self._settings_window: Optional[SettingsWindow] = None
+        self._custom_renderer = None
         
         self.anim_timer = QTimer(self)
         self.anim_timer.timeout.connect(self.update)
@@ -961,8 +999,11 @@ class GalaxyOrderFlowChart(QOpenGLWidget):
         btn_rst.setStyleSheet(btn_style)
         btn_rst.clicked.connect(self.reset_zoom)
         
-        for b in [btn_y_in, btn_y_out, btn_x_in, btn_x_out, btn_up, btn_dn, btn_rst]:
+        self._zoom_btns = [btn_y_in, btn_y_out, btn_x_in, btn_x_out, btn_up, btn_dn, btn_rst]
+        for b in self._zoom_btns:
             b.setCursor(Qt.PointingHandCursor)
+            b.setFixedWidth(0)
+            b.hide()
             header_layout.addWidget(b)
             
         layout.addLayout(header_layout)
@@ -988,7 +1029,7 @@ class GalaxyOrderFlowChart(QOpenGLWidget):
         self.y_scale_factor = 1.0
         self.y_scroll_offset = 0.0
         self.x_scroll_offset = 0
-        self.max_candles = 50
+        self.max_candles = 80
         self._update_title()
         self._slice_klines()
         self.update()
@@ -996,12 +1037,48 @@ class GalaxyOrderFlowChart(QOpenGLWidget):
     def mousePressEvent(self, event):
         """Grab focus on click so wheel/keyboard events work on this widget."""
         self.setFocus()
+        # ⚙ Settings button click
+        if event.button() == Qt.LeftButton and self._settings_btn_rect.contains(event.pos()):
+            self._open_settings()
+            return
+        # 🎛 Zoom toggle button click
+        if event.button() == Qt.LeftButton and self._toggle_btn_rect.contains(event.pos()):
+            self._show_zoom_controls = not self._show_zoom_controls
+            self._start_zoom_animation()
+            return
+        # Quick toolbar button click
+        if event.button() == Qt.LeftButton:
+            for tb in self._toolbar_btns:
+                if tb["rect"].contains(event.pos()):
+                    key = tb["key"]
+                    self._flags[key] = not self._flags.get(key, False)
+                    self.update()
+                    return
         if event.button() == Qt.LeftButton or event.button() == Qt.RightButton:
             self.is_panning = True
             self.last_mouse_pos = event.pos()
         super().mousePressEvent(event)
         
     def mouseMoveEvent(self, event):
+        # Hover sobre ⚙ settings button
+        hover = self._settings_btn_rect.contains(event.pos())
+        if hover != self._settings_btn_hover:
+            self._settings_btn_hover = hover
+            self.update()
+        # Hover sobre 🎛 toggle button
+        thover = self._toggle_btn_rect.contains(event.pos())
+        if thover != self._toggle_btn_hover:
+            self._toggle_btn_hover = thover
+            self.update()
+        # Hover sobre toolbar buttons
+        tb_hover = None
+        for i, tb in enumerate(self._toolbar_btns):
+            if tb["rect"].contains(event.pos()):
+                tb_hover = i
+                break
+        if tb_hover != self._toolbar_hover:
+            self._toolbar_hover = tb_hover
+            self.update()
         if self.is_panning and self.last_mouse_pos is not None:
             dy = event.pos().y() - self.last_mouse_pos.y()
             dx = event.pos().x() - self.last_mouse_pos.x()
@@ -1031,13 +1108,70 @@ class GalaxyOrderFlowChart(QOpenGLWidget):
         self.last_mouse_pos = None
         super().mouseReleaseEvent(event)
     
-    def _update_title(self):
-        """Update title with current zoom level indicator."""
-        zoom_pct = int(self.y_scale_factor * 100)
-        if zoom_pct == 100:
-            self.title_label.setText(self.title)
+    # ── Settings / Flags ───────────────────────────────────────────────
+    def update_flags(self, flags: dict):
+        """Actualiza los flags de indicadores desde SettingsWindow."""
+        self._flags.update(flags)
+        self.update()
+
+    def update_position_data(self, data: Optional[dict]):
+        """Actualiza los datos de posición activa (entry, SL, TP, PnL)."""
+        self._position_data = data
+        self.update()
+
+    def _open_settings(self):
+        """Abre la ventana de configuración."""
+        parent = self.window()
+        if self._settings_window is None:
+            self._settings_window = SettingsWindow(parent)
+            self._settings_window.indicators_changed.connect(
+                lambda flags: self.update_flags(flags))
+            self._settings_window.timeframe_changed.connect(
+                lambda tf: self._on_timeframe_changed(tf) if hasattr(self, '_on_timeframe_changed') else None)
+            self._settings_window.custom_indicators_changed.connect(
+                lambda indicators: self._on_custom_indicators_changed(indicators)
+                if hasattr(self, '_on_custom_indicators_changed') else None)
+        self._settings_window.show()
+        self._settings_window.raise_()
+        self._settings_window.activateWindow()
+
+    # ── Zoom controls toggle animation ───────────────────────────
+    def _start_zoom_animation(self):
+        self._zoom_anim_timer.stop()
+        self._zoom_anim_step = 0
+        self._zoom_anim_total_steps = 8
+        self._zoom_anim_timer.start(20)
+
+    def _tick_zoom_animation(self):
+        self._zoom_anim_step += 1
+        progress = self._zoom_anim_step / self._zoom_anim_total_steps
+        if self._show_zoom_controls:
+            w = int(min(progress, 1.0) * 44)
         else:
-            self.title_label.setText(f"{self.title}  🔍 {zoom_pct}%")
+            w = int(max(0.0, 1.0 - progress) * 44)
+        for b in self._zoom_btns:
+            b.setFixedWidth(w)
+            b.setVisible(w > 0)
+        if self._zoom_anim_step >= self._zoom_anim_total_steps:
+            self._zoom_anim_timer.stop()
+
+    def _on_timeframe_changed(self, tf: str):
+        """Callback cuando cambia el timeframe desde SettingsWindow."""
+        self._timeframe = tf
+        self._update_title()
+        self.update()
+
+    def _on_custom_indicators_changed(self, indicators: list):
+        """Callback cuando cambian los indicadores personalizados."""
+        print(f"[⚡] Indicadores personalizados actualizados: {len(indicators)}")
+
+    def _update_title(self):
+        zoom_pct = int(self.y_scale_factor * 100)
+        tf_tag = f" [{self._timeframe}]" if hasattr(self, '_timeframe') else ""
+        if zoom_pct == 100:
+            self.title_label.setText(f"{self.title}{tf_tag}")
+        else:
+            self.title_label.setText(f"{self.title}{tf_tag}  🔍 {zoom_pct}%")
 
     def update_indicators(self, data):
         current_trend = data.get('trend', 'NEUTRAL')
@@ -1130,6 +1264,14 @@ class GalaxyOrderFlowChart(QOpenGLWidget):
         start_idx = max(0, end_idx - self.max_candles)
         self.klines = self.all_klines[start_idx:end_idx]
         self._build_footprint()
+        # Precompute new indicators
+        self._detect_swing_points()
+        self._precompute_sr_levels()
+        self._precompute_order_blocks()
+        self._precompute_fvg()
+        self._detect_swing_fib()
+        if not self._killzone_ranges:
+            self._init_killzones()
 
     def update_trades(self, trades):
         if not trades: return
@@ -1408,24 +1550,44 @@ class GalaxyOrderFlowChart(QOpenGLWidget):
         scale_font = QFont(font)
         scale_font.setPointSize(7); scale_font.setBold(False); painter.setFont(scale_font)
         
-        grid_pen = QPen(QColor(255, 255, 255, 15), 1, Qt.DotLine)
+        tick_size, _ = get_tick_info(min_p + ps * 0.5)
+        if tick_size <= 0: tick_size = 1.0
+        major_tick_steps = max(1, int(round(50.0 / tick_size)))  # ~$50 major intervals
+        minor_tick_steps = max(1, major_tick_steps // 5)          # every tick group
         
-        # Horizontal Grid & Price Scale
-        for t in range(9):
-            tp = min_p + ps * (t / 8)
-            ty = py(tp)
+        # Round the start to nearest tick
+        if self._flags.get("grid_lines", True):
+            grid_start = math.floor(min_p / tick_size) * tick_size
+            grid_end = math.ceil(max_p / tick_size) * tick_size
+            grid_pen = QPen(QColor(255, 255, 255, 12), 1, Qt.DotLine)
+            major_grid_pen = QPen(QColor(255, 255, 255, 25), 1, Qt.DotLine)
+            price_font = QFont("Consolas", 7); price_font.setBold(False)
+            
+            gp = grid_start
+            tick_count = 0
+            while gp <= grid_end:
+                ty = py(gp)
+                if ty < draw_rect.top() - 10 or ty > draw_rect.bottom() + 10:
+                    gp += tick_size
+                    tick_count += 1
+                    continue
+                is_major = (tick_count % major_tick_steps == 0)
+                painter.setPen(major_grid_pen if is_major else grid_pen)
+                painter.drawLine(draw_rect.left(), int(ty), draw_rect.right() + vp_w, int(ty))
+                
+                if is_major:
+                    painter.setFont(price_font)
+                    painter.setPen(QColor(COLORS['text_secondary']))
+                    painter.drawText(self.rect().left() + 2, int(ty) + 3, f"${format_price(gp)}")
+                gp += tick_size
+                tick_count += 1
+                
+            # Vertical Grid (Time/Candle steps)
             painter.setPen(grid_pen)
-            painter.drawLine(draw_rect.left(), int(ty), draw_rect.right() + vp_w, int(ty))
-            
-            painter.setPen(QColor(COLORS['text_secondary']))
-            painter.drawText(self.rect().left() + 2, int(ty) + 3, f"${format_price(tp)}")
-            
-        # Vertical Grid (Time/Candle steps)
-        painter.setPen(grid_pen)
-        for idx in range(nc):
-            x = draw_rect.left() + (idx * cw)
-            if draw_rect.left() <= x <= draw_rect.right():
-                painter.drawLine(int(x), draw_rect.top(), int(x), draw_rect.bottom())
+            for idx in range(nc):
+                x = draw_rect.left() + (idx * cw)
+                if draw_rect.left() <= x <= draw_rect.right():
+                    painter.drawLine(int(x), draw_rect.top(), int(x), draw_rect.bottom())
 
         # 2. CAPA 2: LINEAS DE LIQUIDEZ TRANSLUCIDAS (max 20 each side)
         if hasattr(self, 'order_state') and self.order_state:
@@ -1477,14 +1639,15 @@ class GalaxyOrderFlowChart(QOpenGLWidget):
                     painter.drawText(draw_rect.right() + vp_w - 30, int(val_y) - 2, "VAL")
 
         # 2.3 VWAP LINE
-        vwap = self.indicators.get('vwap', 0)
-        if vwap and min_p <= vwap <= max_p:
-            vwap_y = py(vwap)
-            if vp_min_y <= vwap_y <= vp_max_y:
-                painter.setPen(QPen(QColor(255, 204, 0, 200), 2, Qt.DashLine))
-                painter.drawLine(draw_rect.left(), int(vwap_y), draw_rect.right() + vp_w, int(vwap_y))
-                painter.setPen(QColor(255, 204, 0))
-                painter.drawText(draw_rect.left() + 2, int(vwap_y) - 2, "VWAP")
+        if self._flags.get("vwap", False):
+            vwap = self.indicators.get('vwap', 0)
+            if vwap and min_p <= vwap <= max_p:
+                vwap_y = py(vwap)
+                if vp_min_y <= vwap_y <= vp_max_y:
+                    painter.setPen(QPen(QColor(255, 204, 0, 200), 2, Qt.DashLine))
+                    painter.drawLine(draw_rect.left(), int(vwap_y), draw_rect.right() + vp_w, int(vwap_y))
+                    painter.setPen(QColor(255, 204, 0))
+                    painter.drawText(draw_rect.left() + 2, int(vwap_y) - 2, "VWAP")
 
         # 3. FOOTPRINT CELLS - HISTORICAL
         painter.setFont(font)
@@ -1835,14 +1998,342 @@ class GalaxyOrderFlowChart(QOpenGLWidget):
             painter.setBrush(glow)
             painter.drawEllipse(QPointF(x, y), r, r)
 
+    # ────────────────────────────────────────────────────────────────
+    #  NEW PROFESSIONAL INDICATORS (BB-450 CHART OPPORTUNITY)
+    # ────────────────────────────────────────────────────────────────
+
+    def _detect_swing_points(self, lookback=8):
+        k = self.klines
+        if len(k) < lookback * 2 + 1:
+            self._swing_highs = []; self._swing_lows = []; return
+        half = lookback // 2
+        highs = []; lows = []
+        for i in range(half, len(k) - half):
+            high = float(k[i][2]); low = float(k[i][3])
+            left_h = [float(k[j][2]) for j in range(i - half, i)]
+            right_h = [float(k[j][2]) for j in range(i + 1, i + half + 1)]
+            left_l = [float(k[j][3]) for j in range(i - half, i)]
+            right_l = [float(k[j][3]) for j in range(i + 1, i + half + 1)]
+            if high > max(left_h + right_h + [0]):
+                highs.append((float(k[i][0]), high))
+            if low < min(left_l + right_l + [float('inf')]):
+                lows.append((float(k[i][0]), low))
+        self._swing_highs = highs[-12:]
+        self._swing_lows = lows[-12:]
+
+    def _precompute_sr_levels(self):
+        self._sr_levels_list = []
+        all_pivots = [p for _, p in self._swing_highs] + [p for _, p in self._swing_lows]
+        if not all_pivots:
+            return
+        tolerance = self.current_price * 0.002 if self.current_price else 0.5
+        all_pivots.sort()
+        groups = []; cur = [all_pivots[0]]
+        for p in all_pivots[1:]:
+            if abs(p - cur[-1]) / max(cur[-1], 1) < 0.002:
+                cur.append(p)
+            else:
+                groups.append(sum(cur) / len(cur)); cur = [p]
+        groups.append(sum(cur) / len(cur))
+        for price in groups[-10:]:
+            if abs(price - self.current_price) / max(self.current_price, 1) > 0.001:
+                self._sr_levels_list.append({"price": price, "is_support": price < self.current_price})
+
+    def _precompute_order_blocks(self):
+        self._order_blocks = []
+        k = self.klines
+        if len(k) < 5:
+            return
+        atr_val = self.indicators.get('atr', 0) if hasattr(self, 'indicators') and self.indicators else 0
+        if atr_val <= 0:
+            closes = [float(c[4]) for c in k[-20:]] or [0]
+            atr_val = (max(closes) - min(closes)) / max(len(closes), 1) * 2 or 50.0
+        threshold = atr_val * 1.5
+        for i in range(2, len(k) - 1):
+            move = abs(float(k[i+1][4]) - float(k[i-1][4]))
+            if move > threshold:
+                bull = float(k[i+1][4]) > float(k[i-1][4])
+                self._order_blocks.append({
+                    "high": float(k[i][2]), "low": float(k[i][3]),
+                    "side": "BUY" if bull else "SELL",
+                    "strength": min(move / max(atr_val, 0.01), 5.0),
+                })
+        self._order_blocks = self._order_blocks[-8:]
+
+    def _precompute_fvg(self):
+        self._fvg_list = []
+        k = self.klines
+        if len(k) < 4:
+            return
+        for i in range(len(k) - 2):
+            c0h, c0l = float(k[i][2]), float(k[i][3])
+            c1h, c1l = float(k[i+1][2]), float(k[i+1][3])
+            c2h, c2l = float(k[i+2][2]), float(k[i+2][3])
+            if c1l > c0h:
+                gh, gl = c1l, c0h
+                if gh - gl > 0:
+                    self._fvg_list.append({"gap_high": gh, "gap_low": gl, "side": "BUY",
+                                           "strength": min((gh - gl) / 0.5, 3.0)})
+            if c1h < c0l:
+                gh, gl = c0l, c1h
+                if gh - gl > 0:
+                    self._fvg_list.append({"gap_high": gh, "gap_low": gl, "side": "SELL",
+                                           "strength": min((gh - gl) / 0.5, 3.0)})
+        self._fvg_list = self._fvg_list[-10:]
+
+    def _detect_swing_fib(self):
+        price = self.current_price
+        above = [p for _, p in self._swing_highs if p > price]
+        below = [p for _, p in self._swing_lows if p < price]
+        if above and below:
+            self._fib_start_price = min(above)
+            self._fib_end_price = max(below)
+        elif above:
+            rl = [p for _, p in self._swing_lows]
+            self._fib_start_price = min(above)
+            self._fib_end_price = min(rl + [price * 0.98])
+        elif below:
+            rh = [p for _, p in self._swing_highs]
+            self._fib_start_price = max(rh + [price * 1.02])
+            self._fib_end_price = max(below)
+        else:
+            self._fib_start_price = price * 1.02
+            self._fib_end_price = price * 0.98
+
+    def _init_killzones(self):
+        self._killzone_ranges = [
+            (8 * 3600, 16 * 3600, "London"),
+            (13 * 3600, 20 * 3600, "NY AM"),
+            (20 * 3600, 24 * 3600, "NY PM"),
+        ]
+
+    def _render_sr_levels(self, painter, min_p, max_p, py, draw_rect, vp_max_y, vp_min_y, small_font):
+        if not self._flags.get("sr_levels") or not self._sr_levels_list:
+            return
+        theme = get_theme()
+        for lv in self._sr_levels_list:
+            p = lv["price"]
+            if not (min_p <= p <= max_p):
+                continue
+            y = py(p)
+            if not (vp_min_y <= y <= vp_max_y):
+                continue
+            c = theme.get_chart_color("sr_support" if lv["is_support"] else "sr_resistance", "#00ff88")
+            painter.setPen(QPen(QColor(c), 1, Qt.DashLine))
+            painter.drawLine(draw_rect.left(), int(y), draw_rect.right(), int(y))
+            painter.setFont(small_font)
+            painter.drawText(draw_rect.right() - 110, int(y) - 4, f"S/R ${p:,.1f}")
+
+    def _render_order_blocks(self, painter, min_p, max_p, py, draw_rect, vp_max_y, vp_min_y, small_font):
+        if not self._flags.get("order_blocks") or not self._order_blocks:
+            return
+        theme = get_theme()
+        for ob in self._order_blocks:
+            hl, ll = ob["high"], ob["low"]
+            if hl < min_p or ll > max_p:
+                continue
+            yt, yb = py(hl), py(ll)
+            if yt < vp_min_y or yb > vp_max_y:
+                continue
+            k = "ob_bull" if ob["side"] == "BUY" else "ob_bear"
+            c = QColor(theme.get_chart_color(k, "rgba(0,170,255,40)"))
+            painter.fillRect(int(draw_rect.left()), int(yt), int(draw_rect.width()), int(yb - yt), c)
+            painter.setPen(QPen(c, 1))
+            painter.drawRect(int(draw_rect.left()), int(yt), int(draw_rect.width()), int(yb - yt))
+            painter.setFont(small_font)
+            painter.setPen(QColor(255, 255, 255, 180))
+            painter.drawText(int(draw_rect.left()) + 4, int((yt + yb) / 2) - 2, ob["side"])
+
+    def _render_fvg(self, painter, min_p, max_p, py, draw_rect, vp_max_y, vp_min_y, small_font):
+        if not self._flags.get("fvg") or not self._fvg_list:
+            return
+        for fvg in self._fvg_list:
+            gh, gl = fvg["gap_high"], fvg["gap_low"]
+            if gh < min_p or gl > max_p:
+                continue
+            yh, yl = py(gh), py(gl)
+            if yh < vp_min_y or yl > vp_max_y:
+                continue
+            alpha = min(int(80 * fvg["strength"] / 3.0), 120)
+            c = QColor(0, 255, 136, alpha) if fvg["side"] == "BUY" else QColor(255, 68, 68, alpha)
+            painter.fillRect(int(draw_rect.left()), int(yh), int(draw_rect.width()), int(yl - yh), c)
+            painter.setPen(QPen(c.lighter(120), 1))
+            painter.drawLine(int(draw_rect.left()), int(yh), int(draw_rect.right()), int(yh))
+            painter.drawLine(int(draw_rect.left()), int(yl), int(draw_rect.right()), int(yl))
+
+    def _render_swing_liquidity(self, painter, min_p, max_p, py, draw_rect, vp_max_y, vp_min_y):
+        if not self._flags.get("swing_liquidity"):
+            return
+        theme = get_theme()
+        sz = 8
+        for ts, p in self._swing_highs:
+            if not (min_p <= p <= max_p):
+                continue
+            y = py(p)
+            if not (vp_min_y <= y <= vp_max_y):
+                continue
+            c = QColor(theme.get_chart_color("swing_high", "#ff4444"))
+            painter.setPen(QPen(c, 2))
+            painter.drawLine(int(draw_rect.right()), int(y - sz), int(draw_rect.right() - sz), int(y))
+            painter.drawLine(int(draw_rect.right()), int(y + sz), int(draw_rect.right() - sz), int(y))
+        for ts, p in self._swing_lows:
+            if not (min_p <= p <= max_p):
+                continue
+            y = py(p)
+            if not (vp_min_y <= y <= vp_max_y):
+                continue
+            c = QColor(theme.get_chart_color("swing_low", "#00ff88"))
+            painter.setPen(QPen(c, 2))
+            painter.drawLine(int(draw_rect.right() - sz), int(y), int(draw_rect.right()), int(y))
+            painter.drawLine(int(draw_rect.right()), int(y), int(draw_rect.right() - sz), int(y + sz))
+
+    def _render_fibonacci(self, painter, min_p, max_p, py, draw_rect, vp_max_y, vp_min_y, small_font):
+        if not (self._flags.get("fib_retracement") or self._flags.get("fib_extension")):
+            return
+        if self._fib_start_price <= 0 or self._fib_end_price <= 0:
+            return
+        if abs(self._fib_start_price - self._fib_end_price) < 0.01:
+            return
+        theme = get_theme()
+        fc = QColor(theme.get_chart_color("fib_line", "#ffcc00"))
+        fz = QColor(theme.get_chart_color("fib_zone", "rgba(255,204,0,10)"))
+        diff = self._fib_start_price - self._fib_end_price
+        levels = []
+        if self._flags.get("fib_retracement"):
+            for ratio in [0.236, 0.382, 0.5, 0.618, 0.786]:
+                price = self._fib_start_price - diff * ratio
+                if min_p <= price <= max_p:
+                    y = py(price)
+                    if vp_min_y <= y <= vp_max_y:
+                        levels.append((y, price, f"{ratio:.3f}"))
+        if self._flags.get("fib_extension"):
+            for ratio in [1.272, 1.414, 1.618, 2.0, 2.272, 2.414, 2.618, 3.618]:
+                if diff > 0:
+                    price = self._fib_start_price + diff * (ratio - 1)
+                else:
+                    price = self._fib_end_price + diff * (1 - ratio)
+                if min_p <= price <= max_p:
+                    y = py(price)
+                    if vp_min_y <= y <= vp_max_y:
+                        levels.append((y, price, f"{ratio:.3f}"))
+        levels.sort(key=lambda x: x[0])
+        for i in range(len(levels) - 1):
+            painter.fillRect(int(draw_rect.left()), int(levels[i][0]),
+                             int(draw_rect.width()), int(levels[i+1][0] - levels[i][0]), fz)
+        for y, price, label in levels:
+            painter.setPen(QPen(fc, 1, Qt.DashLine))
+            painter.drawLine(draw_rect.left(), int(y), draw_rect.right(), int(y))
+            painter.setFont(small_font)
+            painter.setPen(fc)
+            painter.drawText(draw_rect.right() - 130, int(y) - 4, f"Fib {label} ${price:,.1f}")
+
+    def _render_entry_zones(self, painter, min_p, max_p, py, draw_rect, vp_max_y, vp_min_y, small_font):
+        if not self._flags.get("entry_zones") or not hasattr(self, 'order_state') or not self.order_state:
+            return
+        theme = get_theme()
+        ec = QColor(theme.get_chart_color("entry_zone", "rgba(0,255,136,15)"))
+        all_lines = []
+        for p, q in self.order_state.get('bids', []):
+            all_lines.append((float(p), 'BID', float(q)))
+        for p, q in self.order_state.get('asks', []):
+            all_lines.append((float(p), 'ASK', float(q)))
+        all_lines.sort(key=lambda x: x[0])
+        i = 0
+        while i < len(all_lines):
+            price, side, vol = all_lines[i]
+            cp, cs, cv = [price], vol, side
+            j = i + 1
+            while j < len(all_lines) and abs(all_lines[j][0] - price) / max(price, 1) < 0.003:
+                cp.append(all_lines[j][0]); cv += all_lines[j][2]
+                j += 1
+            if cv >= 3.0 and (min_p <= (sum(cp)/len(cp)) <= max_p):
+                ap = sum(cp) / len(cp)
+                y = py(ap)
+                half = max(int((max(cp) - min(cp)) / (max_p - min_p) * (vp_max_y - vp_min_y) / 2), 3)
+                if vp_min_y <= y - half <= vp_max_y:
+                    painter.fillRect(draw_rect.left(), int(y - half), draw_rect.width(), int(half * 2), ec)
+                    painter.setPen(QPen(QColor(255, 255, 255, 40), 1))
+                    painter.drawRect(draw_rect.left(), int(y - half), draw_rect.width(), int(half * 2))
+                    painter.setFont(small_font)
+                    painter.setPen(QColor(255, 255, 255, 150))
+                    painter.drawText(int(draw_rect.left()) + 4, int(y) - 2, f"{side} {cv:.1f}B")
+            i = j
+
+    def _render_ict_killzones(self, painter, klines, draw_rect, small_font):
+        if not self._flags.get("ict_killzones") or not klines:
+            return
+        theme = get_theme()
+        kc = QColor(theme.get_chart_color("ict_killzone", "rgba(255,170,0,8)"))
+        if not self._killzone_ranges:
+            self._init_killzones()
+        n = len(klines)
+        if n < 2:
+            return
+        cw = draw_rect.width() / n
+        for lo_s, hi_s, name in self._killzone_ranges:
+            xs = [i for i, c in enumerate(klines) if lo_s <= (float(c[0]) / 1000) % 86400 < hi_s]
+            if xs:
+                x0 = int(draw_rect.left() + max(0, xs[0] - 1) * cw)
+                x1 = int(draw_rect.left() + min(n, xs[-1] + 2) * cw)
+                if x0 >= draw_rect.right() or x1 <= draw_rect.left():
+                    continue
+                painter.fillRect(x0, int(draw_rect.top()), x1 - x0, int(draw_rect.height()), kc)
+                painter.setFont(small_font)
+                painter.setPen(QColor(255, 200, 100, 120))
+                painter.drawText(x0 + 2, int(draw_rect.top()) + 12, name)
+
+    def _render_orderflow_imbalance(self, painter, min_p, max_p, py, draw_rect, vp_max_y, vp_min_y):
+        if not self._flags.get("orderflow_imbalance"):
+            return
+        delta = (self.indicators.get('delta', 0) if hasattr(self, 'indicators') and self.indicators else 0)
+        if abs(delta) < 10:
+            return
+        y = py(self.current_price)
+        if not (vp_min_y <= y <= vp_max_y):
+            return
+        c = QColor(0, 255, 102) if delta > 0 else QColor(187, 0, 255)
+        painter.setPen(QPen(c, 2))
+        cx = int((draw_rect.left() + draw_rect.right()) / 2)
+        sz = 12
+        if delta > 0:
+            painter.drawLine(cx, int(y) + sz, cx, int(y) - sz)
+            painter.drawLine(cx, int(y) - sz, cx - 4, int(y) - sz + 4)
+            painter.drawLine(cx, int(y) - sz, cx + 4, int(y) - sz + 4)
+        else:
+            painter.drawLine(cx, int(y) - sz, cx, int(y) + sz)
+            painter.drawLine(cx, int(y) + sz, cx - 4, int(y) + sz - 4)
+            painter.drawLine(cx, int(y) + sz, cx + 4, int(y) + sz - 4)
+
+    def _render_premium_discount(self, painter, min_p, max_p, py, draw_rect, vp_max_y, vp_min_y, small_font):
+        if not self._flags.get("premium_discount"):
+            return
+        wh = self.vah if self.vah else max_p
+        wl = self.val if self.val else min_p
+        mid = (wh + wl) / 2
+        if wh <= wl:
+            return
+        ym, yh, yl = py(mid), py(wh), py(wl)
+        theme = get_theme()
+        pc = QColor(theme.get_chart_color("premium_fill", "rgba(255,68,68,8)"))
+        dc = QColor(theme.get_chart_color("discount_fill", "rgba(0,255,136,8)"))
+        if vp_min_y <= yh <= vp_max_y and vp_min_y <= ym <= vp_max_y:
+            painter.fillRect(draw_rect.left(), int(yh), draw_rect.width(), int(ym - yh), pc)
+        if vp_min_y <= ym <= vp_max_y and vp_min_y <= yl <= vp_max_y:
+            painter.fillRect(draw_rect.left(), int(ym), draw_rect.width(), int(yl - ym), dc)
+        painter.setPen(QPen(QColor(255, 255, 255, 40), 1, Qt.DashLine))
+        painter.drawLine(draw_rect.left(), int(ym), draw_rect.right(), int(ym))
+        painter.setFont(small_font)
+        painter.setPen(QColor(255, 255, 255, 80))
+        painter.drawText(draw_rect.left() + 4, int(ym) - 4, "50% EQ")
+
     def paintEvent(self, event):
         super().paintEvent(event)
         if not self.klines or len(self.klines) < 2: return
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         
-        vp_w = 0
-        draw_rect = self.rect().adjusted(50, 30, -10, -10)
+        vp_w = 40
+        draw_rect = self.rect().adjusted(70, 30, -10, -10)
         
         vp_min_x = draw_rect.left()
         vp_max_x = draw_rect.right()
@@ -1904,19 +2395,77 @@ class GalaxyOrderFlowChart(QOpenGLWidget):
         # Draw offscreen buffer
         painter.drawPixmap(0, 0, self.bg_buffer)
 
-        # ── PREMIUM OVERLAYS (pre-computed buffers, drawn every frame) ──
-        # 1. Micro-trend cloud (EMA 9/21 band)
-        self._render_ema_cloud(painter, draw_rect, min_p, max_p, ps, h, nc, cw)
+        # ── PREMIUM OVERLAYS (toggleable via flags) ──
+        if self._flags.get("ema_cloud", False):
+            self._render_ema_cloud(painter, draw_rect, min_p, max_p, ps, h, nc, cw)
 
-        # 2. Dynamic dPOC line with color shift + history trail
-        self._render_dpoc_dynamic(painter, draw_rect, min_p, max_p, ps, h)
+        if self._flags.get("dpoc", False):
+            self._render_dpoc_dynamic(painter, draw_rect, min_p, max_p, ps, h)
 
-        # 3. Imbalance circles (pre-computed in _precompute_imbalance_circles)
-        self._precompute_imbalance_circles(nc, cw, draw_rect, min_p, max_p, py)
-        self._render_imbalance_circles(painter, min_p, max_p, ps, h, draw_rect)
+        if self._flags.get("imbalance_circles", False):
+            self._precompute_imbalance_circles(nc, cw, draw_rect, min_p, max_p, py)
+            self._render_imbalance_circles(painter, min_p, max_p, ps, h, draw_rect)
 
-        # Draw volume bars ON TOP of candles
-        self._render_volume_bars_on_candles(painter, draw_rect, cw, min_p, max_p, ps, h, base_font_size, font)
+        if self._flags.get("signal_strip", False):
+            self._render_volume_bars_on_candles(painter, draw_rect, cw, min_p, max_p, ps, h, base_font_size, font)
+
+        # ── Current Price Line (always visible) ────────────────────────────────
+        if hasattr(self, 'current_price') and self.current_price:
+            cpy = py(self.current_price)
+            if draw_rect.top() <= cpy <= draw_rect.bottom():
+                cp_alpha = 200
+                painter.setPen(QPen(QColor(255, 255, 255, cp_alpha), 2))
+                painter.drawLine(draw_rect.left(), int(cpy), draw_rect.right(), int(cpy))
+                painter.setPen(QPen(QColor(0, 200, 255, int(cp_alpha * 0.4)), 6))
+                painter.drawLine(draw_rect.left(), int(cpy), draw_rect.right(), int(cpy))
+
+        # ── Key Levels (VAH/VAL/POC) ──────────────────────────────────────────
+        if self._flags.get("price_bar_extras", False) and hasattr(self, 'vah') and self.vah:
+            for level_name, level_price, level_color in [
+                ("VAH", self.vah, QColor(150, 100, 255, 100)),
+                ("VAL", self.val, QColor(150, 100, 255, 100)),
+                ("dPOC", self.poc_price, QColor(255, 150, 50, 120)),
+            ]:
+                if not level_price: continue
+                ly2 = py(level_price)
+                if draw_rect.top() <= ly2 <= draw_rect.bottom():
+                    painter.setPen(QPen(level_color, 1, Qt.DashLine))
+                    painter.drawLine(draw_rect.left(), int(ly2), draw_rect.right(), int(ly2))
+                    painter.setFont(QFont("Consolas", 7))
+                    painter.setPen(level_color)
+                    painter.drawText(draw_rect.right() - 40, int(ly2) - 2, level_name)
+
+        # ── NEW PROFESSIONAL INDICATORS ──────────────────────────
+        sf = QFont("Consolas", 7)
+        painter.save()
+        if self._flags.get("sr_levels", False):
+            self._render_sr_levels(painter, min_p, max_p, py, draw_rect, vp_max_y, vp_min_y, sf)
+
+        if self._flags.get("order_blocks", False):
+            self._render_order_blocks(painter, min_p, max_p, py, draw_rect, vp_max_y, vp_min_y, sf)
+
+        if self._flags.get("fvg", False):
+            self._render_fvg(painter, min_p, max_p, py, draw_rect, vp_max_y, vp_min_y, sf)
+
+        if self._flags.get("swing_liquidity", False):
+            self._render_swing_liquidity(painter, min_p, max_p, py, draw_rect, vp_max_y, vp_min_y)
+
+        if self._flags.get("fib_retracement", False) or self._flags.get("fib_extension", False):
+            self._render_fibonacci(painter, min_p, max_p, py, draw_rect, vp_max_y, vp_min_y, sf)
+
+        if self._flags.get("entry_zones", False):
+            self._render_entry_zones(painter, min_p, max_p, py, draw_rect, vp_max_y, vp_min_y, sf)
+
+        if self._flags.get("ict_killzones", False):
+            self._render_ict_killzones(painter, self.klines, draw_rect, sf)
+
+        if self._flags.get("orderflow_imbalance", False):
+            self._render_orderflow_imbalance(painter, min_p, max_p, py, draw_rect, vp_max_y, vp_min_y)
+
+        if self._flags.get("premium_discount", False):
+            self._render_premium_discount(painter, min_p, max_p, py, draw_rect, vp_max_y, vp_min_y, sf)
+
+        painter.restore()
 
         # LIVE CANDLE RENDER (nc - 1)
         idx = nc - 1
@@ -2094,11 +2643,12 @@ class GalaxyOrderFlowChart(QOpenGLWidget):
                     painter.restore()
                     painter.drawRect(int(xc - bw / 2), int(dy), int(bw), int(dbh))
 
-        # VOLUME PROFILE SIDEBAR — disabled, rendered in _render_right_panel
-        pass
+        # VOLUME PROFILE SIDEBAR — rendered in _render_right_panel
+        if self._flags.get("volume_profile", False):
+            pass  # enabled via _render_right_panel
 
-        # VOLATILITY CONE (replaces ghost candles)
-        if self.predicted_candles and len(self.klines) > 1:
+        # VOLATILITY CONE
+        if self._flags.get("volatility_cone", False) and self.predicted_candles and len(self.klines) > 1:
             last_close = float(self.klines[-1][4])
             atr = self.indicators.get('atr', 10)
             n_cells = len(self.predicted_candles)
@@ -2148,7 +2698,7 @@ class GalaxyOrderFlowChart(QOpenGLWidget):
             painter.drawText(int(sep_x + 3), draw_rect.top() + 10, "VOLATILITY CONE")
 
         # LIQUIDITY ARROW (from current price → nearest high-volume wall)
-        if self.order_state:
+        if self._flags.get("liquidity_arrow", False) and self.order_state:
             current_price = float(self.klines[-1][4]) if self.klines else 0
             bids = sorted([(float(b[0]), float(b[1])) for b in self.order_state.get('bids', [])],
                           key=lambda x: x[0], reverse=True)
@@ -2190,24 +2740,27 @@ class GalaxyOrderFlowChart(QOpenGLWidget):
         # PULSE ANIMATIONS (Radar Effect)
         import time
         current_time = time.time()
-        active_pulses = []
-        for p in self.visual_pulses:
-            elapsed = current_time - p['start']
-            if elapsed < 1.0:
-                progress = elapsed / 1.0
-                radius = progress * 50
-                alpha = int(255 * (1.0 - progress))
-                color = QColor(p['color'].red(), p['color'].green(), p['color'].blue(), alpha)
-                painter.setPen(QPen(color, 2))
-                painter.setBrush(QColor(color.red(), color.green(), color.blue(), int(alpha * 0.2)))
-                xc = draw_rect.left() + (p['idx'] * cw) + (candle_zone_w / 2)
-                yc = py(p['price'])
-                painter.drawEllipse(QPointF(xc, yc), radius, radius)
-                active_pulses.append(p)
-        self.visual_pulses = active_pulses
+        if not self._flags.get("pulse_entry", False):
+            self.visual_pulses = []
+        else:
+            active_pulses = []
+            for p in self.visual_pulses:
+                elapsed = current_time - p['start']
+                if elapsed < 1.0:
+                    progress = elapsed / 1.0
+                    radius = progress * 50
+                    alpha = int(255 * (1.0 - progress))
+                    color = QColor(p['color'].red(), p['color'].green(), p['color'].blue(), alpha)
+                    painter.setPen(QPen(color, 2))
+                    painter.setBrush(QColor(color.red(), color.green(), color.blue(), int(alpha * 0.2)))
+                    xc = draw_rect.left() + (p['idx'] * cw) + (candle_zone_w / 2)
+                    yc = py(p['price'])
+                    painter.drawEllipse(QPointF(xc, yc), radius, radius)
+                    active_pulses.append(p)
+            self.visual_pulses = active_pulses
         
         # ENTRY POINT INDICATOR
-        if self.entry_state:
+        if self._flags.get("pulse_entry", False) and self.entry_state:
             ep = self.entry_state['price']
             side = self.entry_state['type']
             if min_p <= ep <= max_p:
@@ -2229,6 +2782,169 @@ class GalaxyOrderFlowChart(QOpenGLWidget):
                     painter.setPen(color)
                     painter.drawText(box_x + 5, box_y + 14, f"{icon} ENTRY: ${ep:,.1f}")
 
+        # ── ⚙ SETTINGS BUTTON ──────────────────────────────────────────────
+        settings_rect = QRect(self.width() - 62, 4, 26, 26)
+        self._settings_btn_rect = settings_rect
+        painter.setBrush(QColor(255, 255, 255, 25) if not self._settings_btn_hover else QColor(255, 255, 255, 50))
+        painter.setPen(QPen(QColor(255, 255, 255, 60), 1))
+        painter.drawRoundedRect(settings_rect, 4, 4)
+        btn_color = get_theme().get_chart_color("text", "#ffffff") if self._settings_btn_hover else get_theme().get_chart_color("text_dim", "#aaaaaa")
+        painter.setPen(QColor(btn_color))
+        p_font = QFont(font); p_font.setPointSize(14); p_font.setBold(True)
+        painter.setFont(p_font)
+        painter.drawText(settings_rect, Qt.AlignCenter, "⚙")
+
+        # ── 🎛 ZOOM TOGGLE BUTTON ──────────────────────────────────────────
+        toggle_rect = QRect(self.width() - 32, 4, 26, 26)
+        self._toggle_btn_rect = toggle_rect
+        painter.setBrush(QColor(255, 255, 255, 25) if not self._toggle_btn_hover else QColor(255, 255, 255, 50))
+        painter.setPen(QPen(QColor(255, 255, 255, 60), 1))
+        painter.drawRoundedRect(toggle_rect, 4, 4)
+        toggle_color = (
+            get_theme().get_chart_color("text", "#ffffff") if self._toggle_btn_hover or self._show_zoom_controls
+            else get_theme().get_chart_color("text_dim", "#aaaaaa")
+        )
+        painter.setPen(QColor(toggle_color))
+        painter.setFont(p_font)
+        painter.drawText(toggle_rect, Qt.AlignCenter, "🎛")
+
+        # ── POSITION / SL / TP OVERLAY ────────────────────────────────────
+        if self._position_data:
+            pd = self._position_data
+            entry = float(pd.get('entry', 0) or 0)
+            sl = float(pd.get('sl', 0) or 0)
+            tp = float(pd.get('tp', 0) or 0)
+            direction = pd.get('direction', 'LONG')
+            qty = float(pd.get('qty', 0) or 0)
+            pnl_pct = float(pd.get('pnl_pct', 0) or 0)
+            mark = float(pd.get('mark', 0) or 0)
+
+            is_long = direction in ('LONG', 'BUY')
+            pnl_color = "#00ff88" if pnl_pct >= 0 else "#ff4444"
+            entry_color = "#ffffff"
+            sl_color = "#ff4444"
+            tp_color = "#00ff88"
+
+            def _py(p): return draw_rect.bottom() - ((p - min_p) / ps * h)
+
+            # Zona sombreada entry → SL
+            if entry and sl and min_p <= max(entry, sl) <= max_p:
+                ey2 = _py(entry)
+                sy2 = _py(sl)
+                y_top = min(ey2, sy2)
+                y_bot = max(ey2, sy2)
+                if y_bot > y_top:
+                    color = QColor(255, 68, 68, 20) if is_long else QColor(0, 255, 136, 20)
+                    painter.setPen(Qt.NoPen)
+                    painter.setBrush(color)
+                    painter.drawRect(draw_rect.left(), int(y_top),
+                                     draw_rect.width(), int(y_bot - y_top))
+
+            # Zona sombreada entry → TP
+            if entry and tp and min_p <= max(entry, tp) <= max_p:
+                ey2 = _py(entry)
+                ty2 = _py(tp)
+                y_top = min(ey2, ty2)
+                y_bot = max(ey2, ty2)
+                if y_bot > y_top:
+                    color = QColor(0, 255, 136, 20) if is_long else QColor(255, 68, 68, 20)
+                    painter.setPen(Qt.NoPen)
+                    painter.setBrush(color)
+                    painter.drawRect(draw_rect.left(), int(y_top),
+                                     draw_rect.width(), int(y_bot - y_top))
+
+            # Entry line
+            if entry and min_p <= entry <= max_p:
+                ey2 = _py(entry)
+                painter.setPen(QPen(QColor(entry_color), 2, Qt.SolidLine))
+                painter.drawLine(draw_rect.left(), int(ey2), draw_rect.right(), int(ey2))
+                lw = min(130, painter.fontMetrics().horizontalAdvance(
+                    f"ENTRY ${entry:,.2f} ↔ {qty:.4f} BTC") + 10)
+                painter.setBrush(QColor(0, 0, 0, 200))
+                painter.setPen(QPen(QColor(entry_color), 1))
+                painter.drawRoundedRect(draw_rect.left() + 5, int(ey2) - 22, lw, 18, 3, 3)
+                painter.setPen(QColor(entry_color))
+                p_font = QFont(font); p_font.setPointSize(7); p_font.setBold(True)
+                painter.setFont(p_font)
+                painter.drawText(draw_rect.left() + 8, int(ey2) - 9,
+                                 f"ENTRY ${entry:,.2f} ↔ {qty:.4f}")
+
+            # SL line (discontinua)
+            if sl and min_p <= sl <= max_p:
+                sy2 = _py(sl)
+                painter.setPen(QPen(QColor(sl_color), 2, Qt.DashLine))
+                painter.drawLine(draw_rect.left(), int(sy2), draw_rect.right(), int(sy2))
+                lw = min(100, painter.fontMetrics().horizontalAdvance(
+                    f"SL ${sl:,.2f}") + 10)
+                painter.setBrush(QColor(0, 0, 0, 200))
+                painter.setPen(QPen(QColor(sl_color), 1))
+                painter.drawRoundedRect(draw_rect.right() - lw - 5, int(sy2) - 22, lw, 18, 3, 3)
+                painter.setPen(QColor(sl_color))
+                painter.setFont(p_font)
+                painter.drawText(draw_rect.right() - lw - 2, int(sy2) - 9,
+                                 f"SL ${sl:,.2f}")
+
+            # TP line (discontinua)
+            if tp and min_p <= tp <= max_p:
+                ty2 = _py(tp)
+                painter.setPen(QPen(QColor(tp_color), 2, Qt.DashLine))
+                painter.drawLine(draw_rect.left(), int(ty2), draw_rect.right(), int(ty2))
+                lw = min(100, painter.fontMetrics().horizontalAdvance(
+                    f"TP ${tp:,.2f}") + 10)
+                painter.setBrush(QColor(0, 0, 0, 200))
+                painter.setPen(QPen(QColor(tp_color), 1))
+                painter.drawRoundedRect(draw_rect.right() - lw - 5, int(ty2) - 22, lw, 18, 3, 3)
+                painter.setPen(QColor(tp_color))
+                painter.setFont(p_font)
+                painter.drawText(draw_rect.right() - lw - 2, int(ty2) - 9,
+                                 f"TP ${tp:,.2f}")
+
+            # PnL flotante en esquina superior izquierda
+            pnl_text = f"{'🟢' if pnl_pct >= 0 else '🔴'} {direction} PnL: {pnl_pct:+.2f}% @ ${mark:,.2f}"
+            pnl_font = QFont(font); pnl_font.setPointSize(8); pnl_font.setBold(True)
+            painter.setFont(pnl_font)
+            pm = painter.fontMetrics()
+            tw = pm.horizontalAdvance(pnl_text)
+            painter.setBrush(QColor(0, 0, 0, 200))
+            painter.setPen(QPen(QColor(pnl_color), 1))
+            painter.drawRoundedRect(draw_rect.left() + 5, draw_rect.top() + 5,
+                                    tw + 12, 22, 4, 4)
+            painter.setPen(QColor(pnl_color))
+            painter.drawText(draw_rect.left() + 10, draw_rect.top() + 20, pnl_text)
+
+        # ── QUICK TOOLBAR ────────────────────────────────────────────────
+        tb_data = [
+            ("📐 S/R", "sr_levels"), ("📦 OB", "order_blocks"),
+            ("🔲 FVG", "fvg"), ("🌀 Fib", "fib_retracement"),
+            ("🎯 Entry", "entry_zones"), ("📊 Strip", "signal_strip"),
+        ]
+        tb_y = draw_rect.top() + 4
+        tb_x = draw_rect.left() + 4
+        tb_font = QFont("Consolas", 7); tb_font.setBold(True)
+        painter.setFont(tb_font)
+        self._toolbar_btns = []
+        for i, (lbl, key) in enumerate(tb_data):
+            tw = painter.fontMetrics().horizontalAdvance(lbl) + 10
+            btn_r = QRect(tb_x, tb_y, tw, 18)
+            self._toolbar_btns.append({"rect": btn_r, "key": key, "label": lbl})
+            active = self._flags.get(key, False)
+            hover = (self._toolbar_hover == i)
+            bg = QColor(255, 255, 255, 60 if active else 15)
+            if hover:
+                bg = QColor(255, 255, 255, 90)
+            painter.setBrush(bg)
+            painter.setPen(QPen(QColor(255, 255, 255, 60), 1))
+            painter.drawRoundedRect(btn_r, 3, 3)
+            tc = QColor(255, 255, 255, 200 if active else 120)
+            painter.setPen(tc)
+            painter.drawText(btn_r, Qt.AlignCenter, lbl)
+            tb_x += tw + 4
+        # Legend: active indicators count
+        active_count = sum(1 for k, v in self._flags.items() if v and k != "grid_lines")
+        legend_text = f"{active_count} indicators active"
+        painter.setFont(QFont("Consolas", 6))
+        painter.setPen(QColor(255, 255, 255, 60))
+        painter.drawText(tb_x + 8, tb_y + 14, legend_text)
 
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -7684,7 +8400,7 @@ class SignalMonitorTab(QFrame):
 
 
 class RiskManagementTab(QFrame):
-    """F4: BB-450 REELS MODE — Riesgo, Registro y Curva de Capital."""
+    """F4: BB-450 CHART OPPORTUNITY — Riesgo, Registro y Curva de Capital."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -8367,6 +9083,42 @@ class MainDashboard(QMainWindow):
             }) if hasattr(self, 'telegram_bot') else None
         )
 
+        # ── El Trader - Narrador IA ───────────────────────────────────────
+        self.trader_panel = TraderPanel(self)
+        self.addDockWidget(Qt.RightDockWidgetArea, self.trader_panel)
+        self.trader_panel.hide()  # oculto por defecto, F5 para alternar
+
+        def _trader_panel_callback(event, script):
+            """Callback para actualizar el panel desde el narrador."""
+            if hasattr(self, 'trader_panel') and self.trader_panel:
+                self.trader_panel.on_event(event, script)
+
+        trader_narrator.set_panel_callback(_trader_panel_callback)
+
+        QShortcut(QKeySequence("F5"), self).activated.connect(
+            lambda: self.trader_panel.setVisible(not self.trader_panel.isVisible())
+        )
+
+        # ── Trading Control Panel ──────────────────────────────────────────
+        self.trading_control = TradingControlPanel(self)
+        self.addDockWidget(Qt.RightDockWidgetArea, self.trading_control)
+        self.trading_control.show()
+        self.trading_control.signal_authorized.connect(self._on_trading_signal_authorized)
+        self.trading_control.manual_order.connect(self._on_trading_manual_order)
+        self.trading_control.close_position.connect(self._on_trading_close_position)
+
+        QShortcut(QKeySequence("F6"), self).activated.connect(
+            lambda: self.trading_control.setVisible(not self.trading_control.isVisible())
+        )
+
+        # ── Settings Window (F7) ───────────────────────────────────────────
+        QShortcut(QKeySequence("F7"), self).activated.connect(
+            lambda: self._open_chart_settings()
+        )
+
+        # ── Theme registration ─────────────────────────────────────────────
+        get_theme().register(self, self._apply_theme)
+
         # ── WebSocket Server for Mobile Terminal ───────────────────────────
         def _ws_data_provider() -> dict:
             pos = getattr(self.signal_tab, '_position', None)
@@ -8653,7 +9405,7 @@ class MainDashboard(QMainWindow):
 
     def init_ui(self):
         self.panels = {}
-        self.setWindowTitle("BB-450 REELS MODE")
+        self.setWindowTitle("BB-450 CHART OPPORTUNITY")
         
         # ── Adaptive screen sizing — full maximized ────────────────────
         self.setStyleSheet(f"background-color: #000000;")
@@ -8723,8 +9475,10 @@ class MainDashboard(QMainWindow):
         hbox.setContentsMargins(0,0,0,0)
         hbox.setSpacing(10)
         
-        # Galaxy Order Flow Chart (Center) - con velas japonesas y Order Flow
-        self.panels['HEATMAP'] = GalaxyOrderFlowChart("GALAXY ORDER FLOW")
+        # BB-450 CHART OPPORTUNITY — Chart principal con velas japonesas y Order Flow
+        self.panels['HEATMAP'] = BB450Chart("BB-450 CHART OPPORTUNITY")
+        self.panels['HEATMAP']._on_timeframe_changed = self._on_chart_timeframe_changed
+        self.panels['HEATMAP']._on_custom_indicators_changed = self._on_custom_indicators_changed
         hbox.addWidget(self.panels['HEATMAP'], stretch=1)
         
         # Narrative Panel (Right)
@@ -9995,16 +10749,38 @@ class MainDashboard(QMainWindow):
                       f"price=${self.data['price']:,.0f} | "
                       f"latency={self.stats['latency_ms']}ms")
 
-            # ── Feed trades to HeatMap chart (from shared cache) ──
+            # ── Feed trades to HeatMap chart + OrderFlowAnimation ──
             trades = ms.get('trades', [])
             trade_data_list = []
+            klines = self.data.get('klines', [])
             for t in trades[:20]:
+                trade_time = int(t['T'])
+                price = float(t['p'])
+                quantity = float(t['q'])
+                is_bm = t['m']
                 trade_data_list.append({
-                    'time': int(t['T']),
-                    'price': float(t['p']),
-                    'quantity': float(t['q']),
-                    'is_buyer_maker': t['m'],
+                    'time': trade_time,
+                    'price': price,
+                    'quantity': quantity,
+                    'is_buyer_maker': is_bm,
                 })
+                # Match trade to candle for whale annotations
+                candle_open = 0
+                for k in klines:
+                    k_open = int(k[0])
+                    k_close = int(k[6])
+                    if k_close > 0 and k_open <= trade_time <= k_close:
+                        candle_open = k_open
+                        break
+                else:
+                    # Trade might belong to current forming candle
+                    if klines and trade_time >= int(klines[-1][0]):
+                        candle_open = int(klines[-1][0])
+                order_flow_animation.add_trade_from_stream(
+                    {'price': price, 'quantity': quantity,
+                     'is_buyer_maker': is_bm, 'time': trade_time},
+                    candle_open_time=candle_open,
+                )
             self.panels['HEATMAP'].update_trades(trade_data_list)
 
             # ── AI prediction (inline, lightweight, no REST) ──
@@ -10034,10 +10810,130 @@ class MainDashboard(QMainWindow):
             except Exception:
                 pass
 
+            # ── El Trader - Narrador IA (procesar eventos de mercado) ──
+            try:
+                import asyncio
+                loop = asyncio.get_event_loop()
+                if loop.is_running() and not loop.is_closed():
+                    asyncio.ensure_future(
+                        trader_narrator.process_market_state(ms)
+                    )
+            except RuntimeError:
+                pass
+            except Exception as e:
+                log.warning(f"[TraderNarrator] Error: {e}")
+
             # ── Update Galaxy Order Flow Chart ──
             self.panels['HEATMAP'].update_indicators(self.data)
             self.panels['HEATMAP'].update_klines(self.data.get('klines', []))
             self.panels['HEATMAP'].update_data(self.data['order_book'], self.data['price'])
+
+            # ── Position overlay for chart ──
+            if hasattr(self, 'order_executor') and self.order_executor is not None:
+                live_pos = self.order_executor.get_position_with_pnl()
+                if live_pos:
+                    stop_loss = self.data.get('stop_loss') or getattr(self.order_executor, '_sl_price', 0)
+                    take_profit = self.data.get('take_profit') or getattr(self.order_executor, '_tp_price', 0)
+                    self.panels['HEATMAP'].update_position_data({
+                        'entry': float(live_pos.get('entry_price', 0)),
+                        'qty': float(live_pos.get('entry_qty', 0)),
+                        'sl': float(stop_loss or 0),
+                        'tp': float(take_profit or 0),
+                        'direction': live_pos.get('direction', 'LONG'),
+                        'pnl_pct': float(live_pos.get('pnl_pct', 0)),
+                        'mark': float(live_pos.get('mark_price', 0)),
+                    })
+                else:
+                    self.panels['HEATMAP'].update_position_data(None)
+
+            # ── Update Trading Control Panel ──
+            if hasattr(self, 'trading_control') and self.trading_control.isVisible():
+                price = float(self.data.get('price', 0) or 0)
+                atr = float(self.data.get('atr', price * 0.005) or price * 0.005)
+                signal = self.data.get('signal', 'WAIT')
+
+                # Compute entry/SL/TP from ATR for current signal
+                if signal in ('COMPRA', 'LONG', 'BUY'):
+                    entry_price = price - atr * 0.3
+                    stop_loss = price - atr * 1.5
+                    take_profit_1 = price + atr * 2.5
+                    take_profit_2 = price + atr * 4.0
+                elif signal in ('VENTA', 'SHORT', 'SELL'):
+                    entry_price = price + atr * 0.3
+                    stop_loss = price + atr * 1.5
+                    take_profit_1 = price - atr * 2.5
+                    take_profit_2 = price - atr * 4.0
+                else:
+                    entry_price = 0
+                    stop_loss = 0
+                    take_profit_1 = 0
+                    take_profit_2 = 0
+
+                risk_reward = round(
+                    abs(take_profit_1 - price) / max(abs(stop_loss - price), 0.01), 2
+                ) if stop_loss else 0
+
+                confidence = 0
+                if hasattr(self, 'battle_bar') and self.battle_bar.confidence:
+                    confidence = self.battle_bar.confidence
+                if not confidence:
+                    confidence = self.data.get('confidence', 0)
+                if not confidence:
+                    lc = sum([
+                        self.data.get('rsi', 50) < 30,
+                        self.data.get('bb_position', 50) < 20,
+                        self.data.get('macd', 0) > self.data.get('macd_signal', 0),
+                        self.data.get('macd_hist', 0) > 0,
+                        self.data.get('trend', 'NEUTRAL') == 'ALCISTA',
+                    ])
+                    sc = sum([
+                        self.data.get('rsi', 50) > 70,
+                        self.data.get('bb_position', 50) > 80,
+                        self.data.get('macd', 0) < self.data.get('macd_signal', 0),
+                        self.data.get('macd_hist', 0) < 0,
+                        self.data.get('trend', 'NEUTRAL') == 'BAJISTA',
+                    ])
+                    max_c = max(lc, sc)
+                    confidence = int(min(max_c / 5.0 * 100, 100))
+                if signal in ('WAIT', 'NINGUNA', ''):
+                    confidence = 0
+
+                sig_data = {
+                    'price': price,
+                    'bid': float(self.data.get('order_book', {}).get('bids', [[0]])[0][0] or 0) if self.data.get('order_book', {}).get('bids') else 0,
+                    'ask': float(self.data.get('order_book', {}).get('asks', [[0]])[0][0] or 0) if self.data.get('order_book', {}).get('asks') else 0,
+                    'signal': signal,
+                    'confidence': confidence,
+                    'entry_price': entry_price,
+                    'stop_loss': stop_loss,
+                    'take_profit_1': take_profit_1,
+                    'take_profit_2': take_profit_2,
+                    'risk_reward': risk_reward,
+                    'has_position': False,
+                }
+                # Override with projection indicator data if available
+                latest_ind = projection_indicator_manager.get_latest_active()
+                if latest_ind and latest_ind.entry_price > 0:
+                    sig_data.update({
+                        'entry_price': latest_ind.entry_price,
+                        'stop_loss': latest_ind.stop_loss,
+                        'take_profit_1': latest_ind.take_profit_1,
+                        'take_profit_2': latest_ind.take_profit_2,
+                        'risk_reward': latest_ind.risk_reward_1,
+                    })
+
+                # Read live position from OrderExecutor directly
+                if hasattr(self, 'order_executor') and self.order_executor is not None:
+                    live_pos = self.order_executor.get_position_with_pnl()
+                    if live_pos:
+                        sig_data.update({
+                            'has_position': True,
+                            'position_side': live_pos.get('direction', 'LONG'),
+                            'position_entry': float(live_pos.get('entry_price', 0)),
+                            'position_qty': float(live_pos.get('entry_qty', 0)),
+                            'position_pnl': float(live_pos.get('pnl_pct', 0)),
+                        })
+                self.trading_control.update_signal(sig_data)
 
             # ── Update all UI panels ──
             self.update_panels()
@@ -10709,6 +11605,121 @@ class MainDashboard(QMainWindow):
                 self.telegram_bot._queue.put_nowait(alert)
             except Exception:
                 pass
+
+    # ── Trading Control Panel handlers ────────────────────────────────────
+    def _get_balance_usdt(self) -> float:
+        """Obtiene el balance disponible del OrderExecutor."""
+        try:
+            bal = self.order_executor.get_balance()
+            if isinstance(bal, dict):
+                b = float(bal.get('balance', bal.get('total', bal.get('wallet_balance', 0))) or 0)
+                # Testnet fallback: si el balance es < 20 USDT, usa 100 simulados
+                if b < 20 and getattr(self.order_executor, 'is_testnet', False):
+                    return 100.0
+                return b
+            return float(bal or 0)
+        except Exception:
+            return 100.0
+
+    def _on_trading_signal_authorized(self, data: dict):
+        """Ejecuta una señal autorizada desde el TradingControlPanel."""
+        if not hasattr(self, 'order_executor') or self.order_executor is None:
+            self.trading_control.add_log("❌ OrderExecutor no disponible")
+            return
+        direction = data.get('direction', '')
+        entry = data.get('entry', 0)
+        sl = data.get('sl', 0)
+        tp1 = data.get('tp1', 0)
+        capital_pct = data.get('capital_pct', 50)
+        leverage = data.get('leverage', 3)
+        balance = self._get_balance_usdt()
+        capital = max(balance * capital_pct / 100.0, 10)
+        bdir = "ALZA" if direction in ("COMPRA", "LONG", "BUY") else "BAJA"
+        # No pasar confidence (usa -1 por defecto) para respetar
+        # el capital calculado desde el panel de control
+        success = self.order_executor.execute_trade_signal(
+            bdir, entry, sl, tp1, leverage, capital,
+        )
+        if success:
+            self.trading_control.add_log(
+                f"✅ Señal ejecutada: {bdir} {capital:.2f}USDT @ ${entry:,.2f}"
+            )
+        else:
+            reason = getattr(self.order_executor, '_last_reject_reason', 'desconocido')
+            self.trading_control.add_log(f"❌ Rechazado: {reason}")
+
+    def _on_trading_manual_order(self, side: str, capital_ratio: float):
+        """Ejecuta una orden manual LONG/SHORT a precio de mercado."""
+        if not hasattr(self, 'order_executor') or self.order_executor is None:
+            return
+        price = float(self.data.get('price', 0) or 0)
+        if price <= 0:
+            self.trading_control.add_log("❌ Precio inválido para orden manual")
+            return
+        balance = self._get_balance_usdt()
+        capital = max(balance * capital_ratio, 10)
+        atr = float(self.data.get('atr', price * 0.005) or price * 0.005)
+        bdir = "ALZA" if side == "BUY" else "BAJA"
+        if side == "BUY":
+            sl = price - atr * 1.5
+            tp1 = price + atr * 2.5
+        else:
+            sl = price + atr * 1.5
+            tp1 = price - atr * 2.5
+        success = self.order_executor.execute_trade_signal(
+            bdir, price, sl, tp1, 3, capital,
+        )
+        self.trading_control.add_log(
+            f"{'✅' if success else '❌'} {side} manual @ ${price:,.2f}"
+        )
+        if not success:
+            reason = getattr(self.order_executor, '_last_reject_reason', 'desconocido')
+            self.trading_control.add_log(f"  ↳ Razón: {reason}")
+
+    def _on_trading_close_position(self):
+        """Cierra la posición actual."""
+        if hasattr(self, 'order_executor') and self.order_executor is not None:
+            self.order_executor.close_all_positions()
+            self.trading_control.add_log("⏹ Órden de cierre enviada")
+
+    def _open_chart_settings(self):
+        """Abre la ventana de configuración del chart (F7)."""
+        chart = self.panels.get('HEATMAP')
+        if chart:
+            chart._open_settings()
+
+    def _on_chart_timeframe_changed(self, tf: str):
+        """Callback cuando el usuario cambia el timeframe desde settings."""
+        print(f"[⏱] Cambiando timeframe a {tf}...")
+        if hasattr(self, 'async_engine') and self.async_engine:
+            import threading
+            threading.Thread(
+                target=self.async_engine.set_timeframe,
+                args=(tf,),
+                daemon=True
+            ).start()
+
+    def _apply_theme(self):
+        """Aplica el tema activo al dashboard completo."""
+        tm = get_theme()
+        bg = tm.get_ui_color("panel_bg", "#000000")
+        txt = tm.get_ui_color("text_primary", "#ffffff")
+        self.setStyleSheet(f"background-color: {bg}; color: {txt};")
+
+    def _on_custom_indicators_changed(self, indicators: list):
+        """Callback cuando se modifican los indicadores personalizados."""
+        chart = self.panels.get('HEATMAP')
+        if chart:
+            from src.ui.indicator_engine import CustomIndicatorRenderer
+            if not hasattr(chart, '_custom_renderer') or chart._custom_renderer is None:
+                chart._custom_renderer = CustomIndicatorRenderer()
+            compiled = []
+            for d in indicators:
+                from src.ui.indicator_engine import CompiledIndicator
+                compiled.append(CompiledIndicator.from_dict(d))
+            chart._custom_renderer.set_indicators(compiled)
+
+    # ── Trading Control update in refresh_data ───────────────────────────
 
     def _clear_brain_worker(self):
         """Safely delete BrainInferenceWorker and nullify the reference."""
